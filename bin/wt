@@ -1,0 +1,889 @@
+#!/usr/bin/env bash
+# Git worktree manager: create, list, and remove provisioned worktrees.
+# Repo-specific provisioning comes from a JSON profile (see `wt --help`).
+set -euo pipefail
+
+WT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+fi
+
+die() { printf '%swt: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+warn() { printf '%swt: %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+# In porcelain mode all human output goes to stderr so stdout carries exactly one
+# machine-readable line: the worktree path. Callers must never parse prose.
+PORCELAIN=no
+info() { if [[ "$PORCELAIN" == "yes" ]]; then printf '%s\n' "$*" >&2; else printf '%s\n' "$*"; fi; }
+
+expand_home() {
+  case "$1" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Prints a scalar value, or one line per element for an array. Missing keys print nothing.
+json_get() {
+  local file="$1" key="$2"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$key" '.[$k] // empty | if type == "array" then .[] else . end' "$file" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" "$key" <<'PY' 2>/dev/null
+import json, sys
+v = json.load(open(sys.argv[1])).get(sys.argv[2])
+if isinstance(v, list):
+    for x in v: print(x)
+elif v not in (None, ""):
+    print(v)
+PY
+  else
+    die "reading profiles needs jq or python3"
+  fi
+}
+
+profile_dirs() {
+  if [[ -n "${WT_PROFILE_DIRS:-}" ]]; then
+    tr ':' '\n' <<<"$WT_PROFILE_DIRS"
+    return
+  fi
+  printf '%s\n' "$HOME/.pi/agent/worktree"
+  local d
+  for d in "$HOME"/.pi/*/worktree; do
+    [[ -d "$d" && "$d" != "$HOME/.pi/agent/worktree" ]] && printf '%s\n' "$d"
+  done
+  return 0
+}
+
+profile_candidates() {
+  local dir f
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    dir=$(expand_home "$dir")
+    for f in "$dir"/*.json; do
+      [[ -f "$f" ]] && printf '%s\n' "$f"
+    done
+  done < <(profile_dirs)
+  return 0
+}
+
+profile_for_repo() {
+  local repo="$1" url f m
+  if [[ -f "$repo/.pi/worktree.json" ]]; then
+    printf '%s' "$repo/.pi/worktree.json"
+    return
+  fi
+  url=$(git -C "$repo" remote get-url origin 2>/dev/null || true)
+  [[ -n "$url" ]] || return 0
+  while IFS= read -r f; do
+    m=$(json_get "$f" match)
+    if [[ -n "$m" && "$url" == *"$m"* ]]; then
+      printf '%s' "$f"
+      return
+    fi
+  done < <(profile_candidates)
+  return 0
+}
+
+# Resolves the main checkout even when invoked from inside a linked worktree.
+# Outside any repo, fall back to WT_MAIN, then to the first profile whose
+# "main" is a git checkout, so `wt ls` and `wt path` stay usable from anywhere.
+MAIN=""
+PROFILE_FILE=""
+PROFILE_RESOLVED=no
+init_repo() {
+  local common fallback f m
+  if common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    MAIN=$(dirname "$common")
+    return
+  fi
+
+  fallback="${WT_MAIN:-}"
+  if [[ -n "$fallback" ]]; then
+    fallback=$(expand_home "$fallback")
+    common=$(git -C "$fallback" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+      die "WT_MAIN='$fallback' is not a git repository"
+    MAIN=$(dirname "$common")
+    return
+  fi
+
+  while IFS= read -r f; do
+    m=$(json_get "$f" main)
+    [[ -n "$m" ]] || continue
+    m=$(expand_home "$m")
+    if [[ -d "$m" ]] && common=$(git -C "$m" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+      MAIN=$(dirname "$common")
+      PROFILE_FILE="$f"
+      PROFILE_RESOLVED=yes
+      return
+    fi
+  done < <(profile_candidates)
+
+  die "not inside a git repository and no profile 'main' checkout found (set WT_MAIN)"
+}
+
+main_checkout() { printf '%s\n' "$MAIN"; }
+
+ROOT_DIR=""
+BASE_REF=""
+CFG_PREFIX=""
+BRANCH_CHECK=""
+READY_HINT=""
+LINK_PATHS=()
+CLONE_PATHS=()
+HEAVY_PATHS=()
+MKDIR_PATHS=()
+
+read_list() {
+  local file="$1" key="$2" line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && printf '%s\n' "$line"
+  done < <(json_get "$file" "$key")
+  return 0
+}
+
+load_profile() {
+  if [[ "$PROFILE_RESOLVED" != "yes" ]]; then
+    PROFILE_FILE=$(profile_for_repo "$MAIN")
+    PROFILE_RESOLVED=yes
+  fi
+
+  local p_root="" p_base="" line
+  if [[ -n "$PROFILE_FILE" ]]; then
+    p_root=$(json_get "$PROFILE_FILE" root)
+    p_base=$(json_get "$PROFILE_FILE" base)
+    CFG_PREFIX=$(json_get "$PROFILE_FILE" prefix)
+    READY_HINT=$(json_get "$PROFILE_FILE" readyHint)
+    BRANCH_CHECK=$(json_get "$PROFILE_FILE" branchCheck)
+    if [[ -n "$BRANCH_CHECK" ]]; then
+      BRANCH_CHECK=$(expand_home "$BRANCH_CHECK")
+      [[ "$BRANCH_CHECK" == /* ]] || BRANCH_CHECK="$(cd "$(dirname "$PROFILE_FILE")" && pwd)/$BRANCH_CHECK"
+    fi
+    while IFS= read -r line; do LINK_PATHS+=("$line"); done < <(read_list "$PROFILE_FILE" link)
+    while IFS= read -r line; do CLONE_PATHS+=("$line"); done < <(read_list "$PROFILE_FILE" clone)
+    while IFS= read -r line; do HEAVY_PATHS+=("$line"); done < <(read_list "$PROFILE_FILE" heavy)
+    while IFS= read -r line; do MKDIR_PATHS+=("$line"); done < <(read_list "$PROFILE_FILE" mkdir)
+  fi
+
+  ROOT_DIR="${WT_ROOT:-}"
+  [[ -n "$ROOT_DIR" ]] || ROOT_DIR="$p_root"
+  [[ -n "$ROOT_DIR" ]] || ROOT_DIR="$(dirname "$MAIN")/$(basename "$MAIN")-worktrees"
+  ROOT_DIR=$(expand_home "$ROOT_DIR")
+
+  BASE_REF="${WT_BASE:-}"
+  [[ -n "$BASE_REF" ]] || BASE_REF="$p_base"
+  [[ -n "$BASE_REF" ]] || BASE_REF="origin/main"
+}
+
+# Branch namespace. Derived from the GitHub login so a shared checkout does not
+# put everyone's branches under one person's handle. Resolved lazily: `gh api`
+# is a network call, and most subcommands never need it.
+BRANCH_PREFIX=""
+branch_prefix() {
+  [[ -n "$BRANCH_PREFIX" ]] || BRANCH_PREFIX="${WT_PREFIX:-}"
+  [[ -n "$BRANCH_PREFIX" ]] || BRANCH_PREFIX="$CFG_PREFIX"
+  if [[ -z "$BRANCH_PREFIX" ]] && command -v gh >/dev/null 2>&1; then
+    BRANCH_PREFIX=$(gh api user --jq .login 2>/dev/null || true)
+  fi
+  if [[ -z "$BRANCH_PREFIX" ]]; then
+    BRANCH_PREFIX=$(git config --get user.email 2>/dev/null | cut -d@ -f1)
+  fi
+  [[ -n "$BRANCH_PREFIX" ]] ||
+    die "cannot determine a branch prefix - set WT_PREFIX, or authenticate gh, or set git user.email"
+  printf '%s' "$BRANCH_PREFIX"
+}
+
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//'
+}
+
+ticket_in_branch() {
+  printf '%s' "$1" | grep -oE '[a-zA-Z]+-[0-9]+' | head -1 || true
+}
+
+run_branch_check() {
+  local branch="$1" ticket="$2"
+  [[ -n "$BRANCH_CHECK" ]] || return 0
+  [[ -x "$BRANCH_CHECK" ]] || die "branchCheck '$BRANCH_CHECK' is not executable"
+  "$BRANCH_CHECK" "$branch" "$ticket" >&2 || die "branch check refused '$branch'"
+}
+
+branch_exists() { git -C "$1" show-ref --verify --quiet "refs/heads/$2"; }
+remote_branch_exists() { git -C "$1" show-ref --verify --quiet "refs/remotes/origin/$2"; }
+
+clone_path() {
+  local src="$1" dst="$2"
+  cp -c -R "$src" "$dst" 2>/dev/null || cp -R "$src" "$dst"
+}
+
+provision() {
+  local main="$1" dir="$2" want_heavy="$3" linked=0 cloned=0 rel
+
+  for rel in ${LINK_PATHS[@]+"${LINK_PATHS[@]}"}; do
+    [[ -e "$main/$rel" ]] || { warn "skipping missing $rel"; continue; }
+    mkdir -p "$(dirname "$dir/$rel")"
+    rm -rf "${dir:?}/$rel"
+    ln -s "$main/$rel" "$dir/$rel"
+    linked=$((linked + 1))
+  done
+
+  for rel in ${CLONE_PATHS[@]+"${CLONE_PATHS[@]}"}; do
+    [[ -e "$main/$rel" ]] || { warn "skipping missing $rel"; continue; }
+    mkdir -p "$(dirname "$dir/$rel")"
+    rm -rf "${dir:?}/$rel"
+    clone_path "$main/$rel" "$dir/$rel"
+    cloned=$((cloned + 1))
+  done
+
+  if [[ "$want_heavy" == "yes" ]]; then
+    for rel in ${HEAVY_PATHS[@]+"${HEAVY_PATHS[@]}"}; do
+      if [[ -e "$main/$rel" ]]; then
+        mkdir -p "$(dirname "$dir/$rel")"
+        rm -rf "${dir:?}/$rel"
+        clone_path "$main/$rel" "$dir/$rel"
+        cloned=$((cloned + 1))
+      else
+        warn "no $rel in main checkout; install it in the worktree"
+      fi
+    done
+  fi
+
+  for rel in ${MKDIR_PATHS[@]+"${MKDIR_PATHS[@]}"}; do
+    mkdir -p "$dir/$rel"
+  done
+
+  info "  ${C_DIM}linked ${linked} shared file(s), cloned ${cloned} path(s)${C_RESET}"
+
+  if [[ -e "$main/Gemfile.lock" ]] && ! diff -q "$main/Gemfile.lock" "$dir/Gemfile.lock" >/dev/null 2>&1; then
+    warn "Gemfile.lock differs from main checkout; run 'bundle install'"
+  fi
+}
+
+print_ready() {
+  local dir="$1" ticket="${2:-}"
+  printf '\n%s✓ ready%s  %s\n' "$C_GREEN" "$C_RESET" "$dir"
+  printf '  %scd %s%s\n' "$C_CYAN" "$dir" "$C_RESET"
+  if [[ -n "$ticket" && -n "$READY_HINT" ]]; then
+    printf '  %s%s%s\n' "$C_CYAN" "${READY_HINT//\{ticket\}/$(lc "$ticket")}" "$C_RESET"
+  fi
+}
+
+cmd_new() {
+  load_profile
+  local want_heavy=yes fetch=yes base="$BASE_REF"
+  local args=()
+  while (($#)); do
+    case "$1" in
+      --skip-heavy|--no-node) want_heavy=no; shift ;;
+      --base) base="${2:?--base needs a ref}"; shift 2 ;;
+      --no-fetch) fetch=no; shift ;;
+      --porcelain) PORCELAIN=yes; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown flag: $1" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  ((${#args[@]})) || die "usage: wt new <ticket|branch> [description...]"
+
+  local main branch ticket dir slug
+  main="$MAIN"
+
+  if [[ "${args[0]}" == */* ]]; then
+    branch="${args[0]}"
+    ticket=$(ticket_in_branch "$branch")
+  else
+    ticket="${args[0]}"
+    slug=$(slugify "${args[*]:1}")
+    branch="$(branch_prefix)/$(lc "$ticket")"
+    [[ -n "$slug" ]] && branch="$branch-$slug"
+  fi
+
+  run_branch_check "$branch" "$ticket"
+
+  dir="$ROOT_DIR/$(slugify "${ticket:-${branch##*/}}")"
+  [[ -e "$dir" ]] && die "$dir already exists"
+  mkdir -p "$ROOT_DIR"
+
+  info "${C_BOLD}Creating worktree${C_RESET} $branch"
+  if branch_exists "$main" "$branch"; then
+    git -C "$main" worktree add "$dir" "$branch" >&2
+  elif remote_branch_exists "$main" "$branch"; then
+    git -C "$main" worktree add --track -b "$branch" "$dir" "origin/$branch" >&2
+  else
+    # Always branch from an explicit base. Omitting it makes git use the main
+    # checkout's HEAD, so a new worktree would silently inherit whatever
+    # unrelated branch happened to be checked out there.
+    if [[ "$fetch" == "yes" && "$base" == origin/* ]]; then
+      git -C "$main" fetch --quiet origin "${base#origin/}" 2>/dev/null || \
+        warn "could not fetch $base; using the local ref"
+    fi
+    git -C "$main" rev-parse --verify --quiet "$base^{commit}" >/dev/null \
+      || die "base ref '$base' does not exist"
+    info "  ${C_DIM}base: $base ($(git -C "$main" rev-parse --short "$base"))${C_RESET}"
+    git -C "$main" worktree add -b "$branch" "$dir" "$base" >&2
+  fi
+
+  provision "$main" "$dir" "$want_heavy"
+
+  if [[ "$PORCELAIN" == "yes" ]]; then
+    printf '%s\n' "$dir"
+    return
+  fi
+  print_ready "$dir" "$ticket"
+}
+
+# Emits: path<TAB>branch<TAB>prunable
+worktree_rows() {
+  git -C "$MAIN" worktree list --porcelain | awk '
+    /^worktree /  { if (p) print p "\t" b "\t" pr; p=substr($0,10); b="(detached)"; pr="" }
+    /^branch /    { b=substr($0,8); sub(/^refs\/heads\//,"",b) }
+    /^prunable/   { pr="prunable" }
+    END           { if (p) print p "\t" b "\t" pr }
+  '
+}
+
+# Emits branch<TAB>number<TAB>state per line. Costs a network round trip, so
+# callers opt in rather than paying it on every list.
+pr_index() {
+  command -v gh >/dev/null 2>&1 || return 0
+  (cd "$MAIN" && gh pr list --author '@me' --state all --limit 100 \
+      --json number,headRefName,state,isDraft \
+      --template '{{range .}}{{.headRefName}}	{{.number}}	{{if .isDraft}}DRAFT{{else}}{{.state}}{{end}}
+{{end}}') 2>/dev/null || true
+}
+
+pr_lookup() {
+  local index="$1" branch="$2"
+  printf '%s' "$index" | awk -F'\t' -v b="$branch" '$1==b {print $2"\t"$3; exit}'
+}
+
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+cmd_ls() {
+  local as_json=no with_pr=no
+  while (($#)); do
+    case "$1" in
+      --json) as_json=yes; shift ;;
+      --pr) with_pr=yes; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local main here index=""
+  main="$MAIN"
+  here=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null || true)
+  [[ "$with_pr" == "yes" ]] && index=$(pr_index)
+
+  if [[ "$as_json" == "yes" ]]; then
+    local first=1
+    printf '['
+    while IFS=$'\t' read -r path branch prunable; do
+      local dirty=0 ahead=0 pr="" prnum="null" prstate="null"
+      if [[ -z "$prunable" ]]; then
+        dirty=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        ahead=$(git -C "$path" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+      fi
+      if [[ -n "$index" ]]; then
+        pr=$(pr_lookup "$index" "$branch")
+        if [[ -n "$pr" ]]; then
+          prnum=$(cut -f1 <<<"$pr")
+          prstate="\"$(cut -f2 <<<"$pr")\""
+        fi
+      fi
+      ((first)) || printf ','
+      first=0
+      printf '{"path":"%s","name":"%s","branch":"%s","dirty":%s,"ahead":%s,"prunable":%s,"current":%s,"main":%s,"pr":%s,"prState":%s}' \
+        "$(json_escape "$path")" "$(json_escape "$(basename "$path")")" "$(json_escape "$branch")" \
+        "${dirty:-0}" "${ahead:-0}" \
+        "$([[ -n "$prunable" ]] && echo true || echo false)" \
+        "$([[ "$path" == "$here" ]] && echo true || echo false)" \
+        "$([[ "$path" == "$main" ]] && echo true || echo false)" \
+        "$prnum" "$prstate"
+    done < <(worktree_rows)
+    printf ']\n'
+    return
+  fi
+
+  printf '%-28s %-38s %-9s %s\n' "WORKTREE" "BRANCH" "DIRTY" "STATE"
+  while IFS=$'\t' read -r path branch prunable; do
+    local mark=" " dirty state ahead pr
+    [[ "$path" == "$here" ]] && mark="*"
+    if [[ -n "$prunable" ]]; then
+      dirty="-"; state="${C_RED}prunable${C_RESET}"
+    else
+      dirty=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      [[ "$dirty" == "0" ]] && dirty="clean" || dirty="${dirty} file(s)"
+      state="${C_DIM}-${C_RESET}"
+      ahead=$(git -C "$path" rev-list --count '@{u}..HEAD' 2>/dev/null || true)
+      [[ -n "$ahead" && "$ahead" != "0" ]] && state="${C_YELLOW}${ahead} unpushed${C_RESET}"
+      [[ "$path" == "$main" ]] && state="${C_DIM}main checkout${C_RESET}"
+      if [[ -n "$index" ]]; then
+        pr=$(pr_lookup "$index" "$branch")
+        [[ -n "$pr" ]] && state="$state ${C_CYAN}#$(cut -f1 <<<"$pr") $(cut -f2 <<<"$pr")${C_RESET}"
+      fi
+    fi
+    printf '%s%-27s %-38s %-9s %b\n' "$mark" "$(basename "$path")" "$branch" "$dirty" "$state"
+  done < <(worktree_rows)
+}
+
+cmd_pr() {
+  load_profile
+  local want_heavy=yes num=""
+  while (($#)); do
+    case "$1" in
+      --skip-heavy|--no-node) want_heavy=no; shift ;;
+      --porcelain) PORCELAIN=yes; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) num="${1#\#}"; shift ;;
+    esac
+  done
+  [[ -n "$num" ]] || die "usage: wt pr [--skip-heavy] <number>"
+  command -v gh >/dev/null 2>&1 || die "gh CLI not found"
+  local main branch dir
+  main="$MAIN"
+
+  branch=$(cd "$main" && gh pr view "$num" --json headRefName --jq .headRefName 2>/dev/null) \
+    || die "could not read PR #$num"
+  [[ -n "$branch" ]] || die "PR #$num has no head branch"
+
+  dir="$ROOT_DIR/pr-$num"
+  [[ -e "$dir" ]] && die "$dir already exists"
+  mkdir -p "$ROOT_DIR"
+
+  info "${C_BOLD}Checking out PR #$num${C_RESET} ($branch)"
+  git -C "$main" fetch origin "pull/$num/head:$branch" 2>/dev/null \
+    || git -C "$main" fetch origin "$branch"
+  if branch_exists "$main" "$branch"; then
+    git -C "$main" worktree add "$dir" "$branch" >&2
+  else
+    git -C "$main" worktree add --track -b "$branch" "$dir" "origin/$branch" >&2
+  fi
+
+  provision "$main" "$dir" "$want_heavy"
+  if [[ "$PORCELAIN" == "yes" ]]; then
+    printf '%s\n' "$dir"
+    return
+  fi
+  print_ready "$dir"
+}
+
+resolve_worktree() {
+  local needle="$1" match=""
+  while IFS=$'\t' read -r path branch _; do
+    if [[ "$(basename "$path")" == "$needle" || "$path" == "$needle" || "$branch" == "$needle" ]]; then
+      match="$path"; break
+    fi
+  done < <(worktree_rows)
+  [[ -n "$match" ]] || die "no worktree matching '$needle'"
+  printf '%s' "$match"
+}
+
+cmd_path() {
+  (($#)) || die "usage: wt path <name>"
+  resolve_worktree "$1"
+}
+
+# Emits "<display>\t<path>" per worktree. Shared by both pickers, and re-run by
+# fzf on reload, so it must stay cheap and side-effect free.
+pick_rows() {
+  local main here p b pr mark dirty extra ahead disp
+  main="$MAIN"
+  here=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null || true)
+  while IFS=$'\t' read -r p b pr; do
+    mark=" "; [[ "$p" == "$here" ]] && mark="*"
+    if [[ -n "$pr" ]]; then
+      dirty="prunable"; extra=""
+    else
+      dirty=$(git -C "$p" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      if [[ "$dirty" == "0" ]]; then dirty="clean"; else dirty="${dirty} dirty"; fi
+      extra=""
+      ahead=$(git -C "$p" rev-list --count '@{u}..HEAD' 2>/dev/null || true)
+      if [[ -n "$ahead" && "$ahead" != "0" ]]; then extra="${ahead} unpushed"; fi
+      if [[ "$p" == "$main" ]]; then extra="main checkout"; fi
+    fi
+    disp=$(printf '%s%-26s %-44s %-10s %s' "$mark" "$(basename "$p")" "$b" "$dirty" "$extra")
+    printf '%s\t%s\n' "$disp" "$p"
+  done < <(worktree_rows)
+}
+
+# fzf front end. Only the chosen path reaches stdout; fzf keeps its UI on the tty.
+# ctrl-d shells back into `wt rm`, which owns the dirty/branch prompts, so the
+# confirmation rules live in exactly one place.
+pick_fzf() {
+  local sel self
+  self=$(printf '%q' "$WT_SELF")
+  sel=$(pick_rows | fzf \
+    --ansi --delimiter=$'\t' --with-nth=1 --no-multi --reverse --height=100% \
+    --header='enter cd | ctrl-d delete | ctrl-r reload | esc cancel' \
+    --preview='git -C {2} log --oneline -8 2>/dev/null; echo; git -C {2} status --short 2>/dev/null | head -15' \
+    --preview-window='right,55%,border-left' \
+    --bind="ctrl-r:reload($self _rows)" \
+    --bind="ctrl-d:execute($self rm {2} </dev/tty >/dev/tty 2>&1)+reload($self _rows)") || return 1
+  [[ -n "$sel" ]] || return 1
+  printf '%s\n' "${sel#*$'\t'}"
+}
+
+cmd_pick() {
+  if [[ -z "${WT_NO_FZF:-}" ]] && [[ "${1:-}" != "--render-once" ]] && command -v fzf >/dev/null 2>&1; then
+    pick_fzf
+    return $?
+  fi
+  pick_tui "$@"
+}
+
+# Fallback picker for machines without fzf, and the --render-once test hook.
+pick_tui() {
+  local render_once=no
+  [[ "${1:-}" == "--render-once" ]] && render_once=yes
+
+  local main here
+  main="$MAIN"
+  here=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null || true)
+
+  local -a paths=() labels=()
+  collect_rows() {
+    paths=(); labels=()
+    local p b pr mark dirty extra ahead
+    while IFS=$'\t' read -r p b pr; do
+      mark=" "; [[ "$p" == "$here" ]] && mark="*"
+      if [[ -n "$pr" ]]; then
+        dirty="prunable"; extra=""
+      else
+        dirty=$(git -C "$p" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        [[ "$dirty" == "0" ]] && dirty="clean" || dirty="${dirty} dirty"
+        extra=""
+        ahead=$(git -C "$p" rev-list --count '@{u}..HEAD' 2>/dev/null || true)
+        [[ -n "$ahead" && "$ahead" != "0" ]] && extra="${ahead} unpushed"
+        [[ "$p" == "$main" ]] && extra="main checkout"
+      fi
+      paths+=("$p")
+      labels+=("$(printf '%s%-26s %-42s %-10s %s' "$mark" "$(basename "$p")" "$b" "$dirty" "$extra")")
+    done < <(worktree_rows)
+  }
+
+  clamp_sel() {
+    if ((${#paths[@]} == 0)); then sel=0; return 0; fi
+    if ((sel >= ${#paths[@]})); then sel=$((${#paths[@]} - 1)); fi
+    if ((sel < 0)); then sel=0; fi
+    return 0
+  }
+
+  collect_rows
+  ((${#paths[@]})) || die "no worktrees found"
+
+  local sel=0 i msg=""
+  for i in "${!paths[@]}"; do [[ "${paths[$i]}" == "$here" ]] && sel=$i; done
+
+  render() {
+    local out=""
+    out+=$'\e[H\e[2J'
+    out+="${C_BOLD}worktrees${C_RESET}  ${C_DIM}↑↓/jk move · enter cd · d delete · r refresh · q quit${C_RESET}"$'\n\n'
+    for i in "${!labels[@]}"; do
+      if [[ $i -eq $sel ]]; then
+        out+=$'\e[7m'"${labels[$i]}"$'\e[0m\n'
+      else
+        out+="${labels[$i]}"$'\n'
+      fi
+    done
+    [[ -n "$msg" ]] && out+=$'\n'"$msg"$'\n'
+    printf '%s' "$out"
+  }
+
+  if [[ "$render_once" == "yes" ]]; then
+    render
+    return 0
+  fi
+
+  [[ -e /dev/tty ]] || die "pick needs a terminal (no /dev/tty)"
+  exec 3<>/dev/tty
+
+  local saved_stty
+  saved_stty=$(stty -g <&3 2>/dev/null || true)
+  cleanup_pick() {
+    printf '\e[?25h\e[?1049l' >&3 2>/dev/null || true
+    if [[ -n "${saved_stty:-}" ]]; then
+      stty "${saved_stty}" <&3 2>/dev/null || true
+    fi
+    exec 3<&- 2>/dev/null || true
+  }
+  trap cleanup_pick EXIT INT TERM
+  stty -echo -icanon <&3 2>/dev/null || true
+  printf '\e[?1049h\e[?25l' >&3
+
+  local key rest
+  while :; do
+    render >&3
+    IFS= read -rsn1 key <&3 || break
+    if [[ "$key" == $'\e' ]]; then
+      rest=""
+      IFS= read -rsn2 -t 0.05 rest <&3 2>/dev/null || true
+      case "$rest" in
+        '[A') key=up ;;
+        '[B') key=down ;;
+        '')   key=quit ;;
+        *)    key="" ;;
+      esac
+    elif [[ -z "$key" ]]; then
+      key=enter
+    fi
+
+    msg=""
+    # Every branch must end on a zero status: `((x++))` returns the *old* value
+    # as its exit code, which under `set -e` would kill the picker.
+    case "$key" in
+      up|k)    if ((sel > 0)); then sel=$((sel - 1)); fi ;;
+      down|j)  if ((sel < ${#paths[@]} - 1)); then sel=$((sel + 1)); fi ;;
+      g)       sel=0 ;;
+      G)       sel=$((${#paths[@]} - 1)) ;;
+      r)       collect_rows; clamp_sel ;;
+      q|quit)  cleanup_pick; trap - EXIT INT TERM; return 1 ;;
+      enter)   cleanup_pick; trap - EXIT INT TERM; printf '%s\n' "${paths[$sel]}"; return 0 ;;
+      d)       pick_delete "$sel" ;;
+      *)       : ;;
+    esac
+  done
+
+  cleanup_pick
+  trap - EXIT INT TERM
+  return 1
+}
+
+# Delete the highlighted worktree from inside the picker. Confirmation is a
+# keypress on the same tty the picker already owns.
+pick_delete() {
+  # Split declarations: bash makes every name in one `local` local-and-unset
+  # before running the assignments, so "${paths[$idx]}" here would see idx unset.
+  local idx="$1"
+  local path="${paths[$idx]}"
+  local main branch dirty reply
+  main="$MAIN"
+
+  if [[ "$path" == "$main" ]]; then
+    msg="${C_RED}refusing to remove the main checkout${C_RESET}"
+    return
+  fi
+
+  branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  dirty=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+  local prompt="delete $(basename "$path")?"
+  [[ "$dirty" != "0" ]] && prompt="${C_RED}$dirty uncommitted change(s)!${C_RESET} delete $(basename "$path") anyway?"
+  printf '\n%s [y/N] ' "$prompt" >&3
+  IFS= read -rsn1 reply <&3 || reply=""
+  [[ "$reply" == [yY] ]] || { msg="cancelled"; return; }
+
+  if ! git -C "$main" worktree remove --force "$path" >/dev/null 2>&1; then
+    msg="${C_RED}failed to remove $path${C_RESET}"
+    return
+  fi
+  git -C "$main" worktree prune >/dev/null 2>&1 || true
+  msg="${C_GREEN}removed${C_RESET} $(basename "$path")"
+
+  if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+    printf '\ndelete branch %s too? [y/N] ' "$branch" >&3
+    IFS= read -rsn1 reply <&3 || reply=""
+    if [[ "$reply" == [yY] ]]; then
+      if git -C "$main" branch -D "$branch" >/dev/null 2>&1; then
+        msg="$msg ${C_DIM}+ branch${C_RESET}"
+      else
+        msg="$msg ${C_YELLOW}(branch not deleted: unmerged or checked out)${C_RESET}"
+      fi
+    else
+      msg="$msg ${C_DIM}(branch kept)${C_RESET}"
+    fi
+  fi
+
+  collect_rows
+  clamp_sel
+}
+
+cmd_rm() {
+  local assume_yes=no del_branch=ask target=""
+  while (($#)); do
+    case "$1" in
+      -y|--yes) assume_yes=yes; shift ;;
+      --delete-branch) del_branch=yes; shift ;;
+      --keep-branch) del_branch=no; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "usage: wt rm [-y] [--delete-branch|--keep-branch] <name>"
+
+  local main dir branch dirty reply
+  main="$MAIN"
+  dir=$(resolve_worktree "$target")
+  [[ "$dir" == "$main" ]] && die "refusing to remove the main checkout"
+
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(detached)")
+  dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$dirty" != "0" && "$assume_yes" != "yes" ]]; then
+    warn "$dir has $dirty uncommitted change(s)"
+    [[ -t 0 ]] || die "refusing to remove a dirty worktree without -y"
+    read -r -p "Remove anyway? [y/N] " reply
+    [[ "$reply" == [yY] ]] || die "aborted"
+  fi
+
+  git -C "$main" worktree remove --force "$dir"
+  git -C "$main" worktree prune
+  info "${C_GREEN}removed${C_RESET} $dir"
+
+  if [[ "$branch" != "(detached)" ]]; then
+    if [[ "$del_branch" == "ask" ]]; then
+      if [[ -t 0 ]]; then
+        read -r -p "Delete branch '$branch'? [y/N] " reply
+        [[ "$reply" == [yY] ]] && del_branch=yes || del_branch=no
+      else
+        del_branch=no
+      fi
+    fi
+    if [[ "$del_branch" == "yes" ]]; then
+      git -C "$main" branch -D "$branch" && info "${C_GREEN}deleted branch${C_RESET} $branch"
+    else
+      info "${C_DIM}kept branch${C_RESET} $branch"
+    fi
+  fi
+}
+
+cmd_clean() {
+  load_profile
+  local main
+  main="$MAIN"
+  git -C "$main" worktree prune
+  info "pruned stale worktree metadata"
+
+  local index found=0 reason pr
+  index=$(pr_index)
+  while IFS=$'\t' read -r path branch _; do
+    [[ "$path" == "$main" ]] && continue
+    [[ "$branch" == "(detached)" ]] && continue
+    reason=""
+    if git -C "$main" branch --merged "$BASE_REF" --format='%(refname:short)' 2>/dev/null \
+        | grep -qx "$branch"; then
+      reason="merged into $BASE_REF"
+    elif [[ -n "$index" ]]; then
+      pr=$(pr_lookup "$index" "$branch")
+      case "$(cut -f2 <<<"$pr")" in
+        MERGED) reason="PR #$(cut -f1 <<<"$pr") merged" ;;
+        CLOSED) reason="PR #$(cut -f1 <<<"$pr") closed" ;;
+      esac
+    fi
+    [[ -n "$reason" ]] || continue
+    found=1
+    printf '%s%s%s  %s (%s)\n' "$C_YELLOW" "$reason" "$C_RESET" "$(basename "$path")" "$branch"
+  done < <(worktree_rows)
+  if ((found)); then
+    info "${C_DIM}remove with: wt rm <name>, or 'd' in wt pick${C_RESET}"
+  else
+    info "no merged worktrees to clean up"
+  fi
+}
+
+cmd_profile() {
+  load_profile
+  printf 'repo:     %s\n' "$MAIN"
+  printf 'profile:  %s\n' "${PROFILE_FILE:-(none)}"
+  printf 'root:     %s\n' "$ROOT_DIR"
+  printf 'base:     %s\n' "$BASE_REF"
+  printf 'link:     %s\n' "${LINK_PATHS[*]-}"
+  printf 'clone:    %s\n' "${CLONE_PATHS[*]-}"
+  printf 'heavy:    %s\n' "${HEAVY_PATHS[*]-}"
+  printf 'mkdir:    %s\n' "${MKDIR_PATHS[*]-}"
+  printf 'check:    %s\n' "${BRANCH_CHECK:-(none)}"
+}
+
+usage() {
+  cat <<'EOF'
+wt - git worktree manager
+
+Usage:
+  wt new <ticket|branch> [description...]   Create + provision a worktree
+        --skip-heavy                        Skip cloning the profile's heavy paths
+                                            (--no-node is an alias)
+        --base <ref>                        Branch from <ref> (default: profile base or origin/main)
+        --no-fetch                          Skip refreshing the base from origin
+        --porcelain                         Print only the path (progress to stderr)
+  wt ls [--pr] [--json]                     List worktrees with status
+  wt pr [--skip-heavy] <number>             Check out a PR into a worktree
+  wt pick                                   Interactive picker (prints chosen path)
+                                            Uses fzf when installed, with a
+                                            built-in fallback. WT_NO_FZF=1
+                                            forces the fallback.
+  wt path <name>                            Print a worktree path
+  wt rm [-y] [--delete-branch] <name>       Remove worktree (and optionally branch)
+  wt clean                                  Prune stale, report merged/closed worktrees
+  wt profile                                Show the resolved profile for this repo
+
+Examples:
+  wt new PROJ-123 "fix login form"          -> <login>/proj-123-fix-login-form
+  wt new PROJ-123                           -> <login>/proj-123
+  wt new me/PROJ-45-existing-branch         -> checks out an existing branch
+
+Profiles (JSON), first match wins:
+  1. <repo>/.pi/worktree.json
+  2. *.json in each dir of $WT_PROFILE_DIRS (colon-separated; default
+     ~/.pi/agent/worktree, then every ~/.pi/*/worktree) whose "match"
+     is a substring of the origin remote URL.
+  Keys: match, root, base, prefix, main (checkout used outside any repo),
+        link[] (symlinked from main), clone[] (copy-on-write cloned),
+        heavy[] (cloned unless --skip-heavy), mkdir[] (created empty),
+        branchCheck (executable run as <check> <branch> <ticket>; non-zero refuses;
+        relative paths resolve from the profile's dir),
+        readyHint (printed after `new`; {ticket} is replaced).
+  No profile: plain git worktree under <repo-parent>/<repo-name>-worktrees.
+
+Environment:
+  WT_ROOT          worktree parent dir (overrides profile root)
+  WT_PREFIX        branch namespace (default: profile prefix, else your GitHub login)
+  WT_MAIN          main checkout used when run outside any git repo
+  WT_BASE          default base ref for new branches (overrides profile base)
+  WT_NO_FZF        set to 1 to use the built-in picker even when fzf is installed
+  WT_PROFILE_DIRS  profile search path
+
+Changing directory:
+  A child process cannot cd its parent shell, so add a function to ~/.zshrc:
+  wtcd() {
+    local d
+    if [ $# -eq 0 ]; then d=$(wt pick) || return 1
+    else d=$(wt path "$1") || return 1; fi
+    [ -n "$d" ] && cd "$d"
+  }
+EOF
+}
+
+case "${1:-}" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  cd) shift; die "use 'wtcd ${1:-<name>}' - a child process cannot cd its parent shell (see 'wt --help')" ;;
+esac
+
+init_repo
+
+case "${1:-}" in
+  new)          shift; cmd_new "$@" ;;
+  ls|list)      shift; cmd_ls "$@" ;;
+  pr)           shift; cmd_pr "$@" ;;
+  path)         shift; cmd_path "$@" ;;
+  pick)         shift; cmd_pick "$@" ;;
+  profile)      shift; cmd_profile ;;
+  _rows)        shift; pick_rows ;;
+  # Local heads plus the default remote base. Listing refs/remotes would emit
+  # thousands of entries in a large monorepo, which makes completion useless.
+  _refs)        shift
+                git -C "$MAIN" for-each-ref --format='%(refname:short)' refs/heads
+                for _refs_r in origin/main origin/master; do
+                  git -C "$MAIN" rev-parse --verify --quiet "$_refs_r" >/dev/null 2>&1 \
+                    && printf '%s\n' "$_refs_r"
+                done
+                ;;
+  rm|remove)    shift; cmd_rm "$@" ;;
+  clean|prune)  shift; cmd_clean "$@" ;;
+  *)            die "unknown command: $1 (try 'wt --help')" ;;
+esac

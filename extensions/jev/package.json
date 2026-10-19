@@ -1,0 +1,18 @@
+{
+  "name": "pi-extension-jev",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types tests/builtin.test.ts && node --experimental-strip-types tests/smoke.ts && node --experimental-strip-types tests/classify.test.ts"
+  }
+}

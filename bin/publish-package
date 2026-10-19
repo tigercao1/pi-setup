@@ -1,0 +1,254 @@
+#!/bin/bash
+# Stage one local skill or extension in the company registry's hosted-package layout, diff it
+# against the registry's latest published copy, then hand it to the registry CLI.
+#
+#   publish-package skill/<name> [--dry-run] [--yes]
+#   publish-package extension/<name> [--dry-run] [--yes]
+#
+# Metadata comes from <skill|extension dir>/registry.json:
+#   { "name": "...", "version": "x.y.z", "author": "...", "description": "...", "tags": [...],
+#     "license": "UNLICENSED", "requires": "markdown for the README's Requires section",
+#     "readme": "relative path to a README to publish instead of the generated one",
+#     "exclude": ["rsync patterns left out of the package"] }
+# Registry coordinates (COMPANY_REGISTRY_REPO, COMPANY_REGISTRY_CLI, COMPANY_REGISTRY_MANIFEST) come
+# from company.env here, then ../homebase/company.env; environment variables override both. PUBLISH_CLI overrides the CLI.
+set -euo pipefail
+
+AGENT_DIR="${PI_AGENT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+HOST_PACKAGES='["@earendil-works/pi-ai","@earendil-works/pi-agent-core","@earendil-works/pi-coding-agent","@earendil-works/pi-tui","typebox"]'
+
+usage() { sed -n '5,6p' "$0" | sed 's/^# *//' >&2; exit 2; }
+die() { echo "publish-package: $*" >&2; exit 1; }
+heading() { printf '\n== %s\n' "$*"; }
+
+TARGET=""
+DRY_RUN=0
+ASSUME_YES=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --yes) ASSUME_YES=1 ;;
+    -h | --help) usage ;;
+    -*) die "unknown flag $arg" ;;
+    *) [ -z "$TARGET" ] && TARGET="$arg" || usage ;;
+  esac
+done
+[ -n "$TARGET" ] || usage
+
+KIND="${TARGET%%/*}"
+LOCAL_NAME="${TARGET#*/}"
+case "$KIND" in
+  skill | skills) KIND=skill; SRC="$AGENT_DIR/skills/$LOCAL_NAME"; TYPE_DIR="registry/pi/skills" ;;
+  extension | extensions) KIND=extension; SRC="$AGENT_DIR/extensions/$LOCAL_NAME"; TYPE_DIR="registry/pi/extensions" ;;
+  *) usage ;;
+esac
+[ -d "$SRC" ] || die "$SRC does not exist"
+SIDECAR="$SRC/registry.json"
+[ -f "$SIDECAR" ] || die "$SIDECAR missing; it holds name, version, author, description, tags"
+
+COMPANY_KEYS=(COMPANY_LAYER_REPO COMPANY_REGISTRY_REPO COMPANY_REGISTRY_CLI COMPANY_REGISTRY_INSTALL COMPANY_REGISTRY_MANIFEST)
+COMPANY_ENV_OVERRIDES=()
+for key in "${COMPANY_KEYS[@]}"; do
+  if [ -n "${!key+x}" ]; then COMPANY_ENV_OVERRIDES+=("$key=${!key}"); fi
+done
+load_company_env() {
+  local file pair key
+  for file in "$AGENT_DIR/company.env" "$AGENT_DIR/../homebase/company.env"; do
+    if [ -f "$file" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$file"
+      set +a
+    fi
+  done
+  for pair in "${COMPANY_ENV_OVERRIDES[@]+"${COMPANY_ENV_OVERRIDES[@]}"}"; do
+    printf -v "${pair%%=*}" '%s' "${pair#*=}"
+  done
+  for key in "${COMPANY_KEYS[@]}"; do
+    printf -v "$key" '%s' "${!key-}"
+  done
+}
+load_company_env
+REPO="${COMPANY_REGISTRY_REPO:-}"
+CLI="${PUBLISH_CLI:-${COMPANY_REGISTRY_CLI:-}}"
+[ -n "$REPO" ] || die "COMPANY_REGISTRY_REPO is not set (../homebase/company.env or environment)"
+[ -n "$CLI" ] || die "COMPANY_REGISTRY_CLI is not set (../homebase/company.env or environment)"
+MANIFEST="${COMPANY_REGISTRY_MANIFEST:-}"
+[ -n "$MANIFEST" ] || die "COMPANY_REGISTRY_MANIFEST is not set (../homebase/company.env or environment)"
+for tool in jq gh rsync diff tar; do command -v "$tool" >/dev/null || die "needs $tool"; done
+
+meta() { jq -r --arg k "$1" '.[$k] // empty' "$SIDECAR"; }
+NAME="$(meta name)"
+VERSION="$(meta version)"
+AUTHOR="$(meta author)"
+DESCRIPTION="$(meta description)"
+LICENSE="$(meta license)"
+LICENSE="${LICENSE:-UNLICENSED}"
+REQUIRES="$(meta requires)"
+README_SRC="$(meta readme)"
+
+PROBLEMS=()
+[[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] && [ "${#NAME}" -le 64 ] || PROBLEMS+=("name '$NAME' must be lowercase kebab-case, at most 64 chars")
+[ "$KIND" = extension ] && [[ "$NAME" != pi-* ]] && PROBLEMS+=("extension registry names start with pi- (got '$NAME')")
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || PROBLEMS+=("version '$VERSION' is not semver")
+[ -n "$AUTHOR" ] || PROBLEMS+=("author is required")
+[ -n "$DESCRIPTION" ] && [ "${#DESCRIPTION}" -le 300 ] || PROBLEMS+=("description is required, at most 300 chars")
+jq -e '.tags as $t | ($t | type == "array") and ($t | length >= 1 and length <= 10) and (($t | unique | length) == ($t | length))
+  and all($t[]; test("^[a-z0-9]+(-[a-z0-9]+)*$") and length <= 32)' "$SIDECAR" >/dev/null ||
+  PROBLEMS+=("tags must be 1-10 unique lowercase kebab-case strings of at most 32 chars")
+LINKS="$(cd "$SRC" && find . -type l -not -path './node_modules*' | sed 's|^\./||')"
+[ -z "$LINKS" ] || PROBLEMS+=("symlinks are not allowed in a hosted package: $LINKS")
+if [ "${#PROBLEMS[@]}" -gt 0 ]; then
+  printf 'publish-package: %s\n' "${PROBLEMS[@]}" >&2
+  exit 1
+fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/publish-package.XXXXXX")"
+STAGE="$WORK/staged"
+PUBLISHED="$WORK/published"
+mkdir -p "$STAGE"
+
+EXCLUDES=(--exclude registry.json --exclude node_modules/ --exclude .git/ --exclude .DS_Store
+  --exclude __pycache__/ --exclude '*.pyc' --exclude dist/)
+while IFS= read -r pattern; do
+  [ -n "$pattern" ] && EXCLUDES+=(--exclude "$pattern")
+done < <(jq -r '(.exclude // [])[]' "$SIDECAR")
+[ -n "$README_SRC" ] && EXCLUDES+=(--exclude "/$README_SRC")
+
+if [ "$KIND" = skill ]; then
+  mkdir -p "$STAGE/skills/$LOCAL_NAME"
+  rsync -a "${EXCLUDES[@]}" "$SRC/" "$STAGE/skills/$LOCAL_NAME/"
+  PI_FIELD='{"skills": ["./skills"]}'
+  LOCAL_PKG='{}'
+else
+  rsync -a "${EXCLUDES[@]}" --exclude /package.json "$SRC/" "$STAGE/"
+  if [ -f "$SRC/package.json" ]; then LOCAL_PKG="$(cat "$SRC/package.json")"; else LOCAL_PKG='{}'; fi
+  PI_FIELD="$(jq -c '.pi // {"extensions": ["./index.ts"]}' <<<"$LOCAL_PKG")"
+fi
+
+jq -n --arg name "$NAME" --arg version "$VERSION" --arg description "$DESCRIPTION" \
+  --arg license "$LICENSE" --arg kind "$KIND" --argjson pi "$PI_FIELD" \
+  --argjson local "$LOCAL_PKG" --argjson host "$HOST_PACKAGES" --slurpfile meta "$SIDECAR" '
+  ($local.dependencies // {}) as $deps
+  | ($deps | with_entries(select(.key as $k | $host | index($k)))) as $hostDeps
+  | ($deps | with_entries(select(.key as $k | $host | index($k) | not))) as $ownDeps
+  | {name: $name, version: $version, description: $description, type: "module",
+     keywords: (["pi-package"] + $meta[0].tags), license: $license, pi: $pi}
+  + (if ($ownDeps | length) > 0 then {dependencies: $ownDeps} else {} end)
+  + (if $kind == "extension" then
+       {peerDependencies: ({"@earendil-works/pi-coding-agent": "*"} + ($hostDeps | map_values("*")) + ($local.peerDependencies // {})),
+        devDependencies: ({"@earendil-works/pi-coding-agent": "*"} + ($local.devDependencies // {}))}
+     else {} end)
+' >"$STAGE/package.json"
+
+jq -n --arg type "$KIND" --arg license "$LICENSE" --slurpfile meta "$SIDECAR" '
+  $meta[0] as $m
+  | {name: $m.name, version: $m.version, author: $m.author, description: $m.description,
+     type: $type, tags: $m.tags, license: $license, hosted: true}
+' >"$STAGE/$MANIFEST"
+
+printf 'node_modules/\ndist/\n' >"$STAGE/.gitignore"
+
+if [ -n "$README_SRC" ]; then
+  [ -f "$SRC/$README_SRC" ] || die "readme $SRC/$README_SRC not found"
+  cp "$SRC/$README_SRC" "$STAGE/README.md"
+elif [ ! -f "$STAGE/README.md" ]; then
+  {
+    printf '# %s\n\n%s\n\n## Install\n\n```bash\n%s add %s\n```\n\n' "$NAME" "$DESCRIPTION" "${COMPANY_REGISTRY_CLI:-$CLI}" "$NAME"
+    if [ "$KIND" = skill ]; then
+      printf 'Restart pi, or run `/reload`. The agent loads the skill when a task matches its description, or run\n`/skill:%s` to load it yourself.\n' "$LOCAL_NAME"
+    else
+      printf 'Restart pi, or run `/reload`.\n'
+    fi
+    [ -n "$REQUIRES" ] && printf '\n## Requires\n\n%s\n' "$REQUIRES"
+  } >"$STAGE/README.md"
+fi
+
+heading "staged $KIND $LOCAL_NAME as $NAME@$VERSION in $STAGE"
+(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort | while IFS= read -r f; do
+  printf '  %7s  %s\n' "$(wc -c <"$f" | tr -d ' ')" "$f"
+done)
+
+heading "registry: $REPO"
+LATEST_TAG="$(gh api "repos/$REPO/git/matching-refs/tags/$NAME@" --jq '.[].ref' 2>/dev/null |
+  sed 's|^refs/tags/||' | grep -E "^$NAME@[0-9]" | sort -t@ -k2 -V | tail -1 || true)"
+DEFAULT_BRANCH="$(gh api "repos/$REPO" --jq .default_branch)"
+MAIN_TREE="$(gh api "repos/$REPO/git/trees/$DEFAULT_BRANCH:$TYPE_DIR/$NAME" --jq .sha 2>/dev/null || true)"
+TAG_TREE=""
+[ -n "$LATEST_TAG" ] && TAG_TREE="$(gh api "repos/$REPO/git/trees/$LATEST_TAG:$TYPE_DIR/$NAME" --jq .sha 2>/dev/null || true)"
+
+COMPARE_REF=""
+if [ -n "$LATEST_TAG" ]; then
+  echo "  latest release tag: $LATEST_TAG"
+  COMPARE_REF="$LATEST_TAG"
+  if [ -n "$MAIN_TREE" ] && [ "$MAIN_TREE" != "$TAG_TREE" ]; then
+    echo "  WARNING: $DEFAULT_BRANCH differs from $LATEST_TAG for this package; diffing against $DEFAULT_BRANCH"
+    COMPARE_REF="$DEFAULT_BRANCH"
+  fi
+elif [ -n "$MAIN_TREE" ]; then
+  echo "  no release tag yet; diffing against $DEFAULT_BRANCH"
+  COMPARE_REF="$DEFAULT_BRANCH"
+else
+  echo "  not in the registry yet: this publish adds it"
+fi
+
+OPEN_PRS="$(gh pr list -R "$REPO" --state open --search "$NAME in:title" \
+  --json number,title,author,headRefName --jq '.[] | "  #\(.number) \(.title) (\(.author.login), \(.headRefName))"' 2>/dev/null || true)"
+if [ -n "$OPEN_PRS" ]; then
+  echo "  open pull requests mentioning $NAME (someone else may be changing it):"
+  echo "$OPEN_PRS"
+fi
+
+PUBLISHED_VERSION=""
+DIFF_STATUS=1
+if [ -n "$COMPARE_REF" ]; then
+  mkdir -p "$WORK/tarball" "$PUBLISHED"
+  gh api "repos/$REPO/tarball/$COMPARE_REF" >"$WORK/tarball.tgz"
+  tar -xzf "$WORK/tarball.tgz" -C "$WORK/tarball" --strip-components=1 "*/$TYPE_DIR/$NAME"
+  rsync -a "$WORK/tarball/$TYPE_DIR/$NAME/" "$PUBLISHED/"
+  [ -f "$PUBLISHED/manifest.json" ] && mv "$PUBLISHED/manifest.json" "$PUBLISHED/$MANIFEST"
+  PUBLISHED_VERSION="$(jq -r '.version // empty' "$PUBLISHED/$MANIFEST" 2>/dev/null || true)"
+
+  heading "diff: registry $COMPARE_REF (published/) -> local (staged/)"
+  set +e
+  (cd "$WORK" && diff -ruN published staged)
+  DIFF_STATUS=$?
+  set -e
+  [ "$DIFF_STATUS" -eq 0 ] && echo "  (no differences)"
+fi
+
+if [ -n "$PUBLISHED_VERSION" ] && [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
+  if [ "$DIFF_STATUS" -eq 0 ]; then
+    echo
+    echo "$NAME $VERSION is already published with identical files; nothing to publish."
+    [ "$DRY_RUN" -eq 1 ] || exit 0
+  else
+    echo
+    echo "WARNING: files differ but version $VERSION is already published; bump \"version\" in $SIDECAR."
+  fi
+fi
+
+read -r -a CLI_CMD <<<"$CLI"
+if ! command -v "${CLI_CMD[0]}" >/dev/null 2>&1; then
+  echo
+  echo "publish-package: registry CLI '${CLI_CMD[0]}' not installed (bootstrap.sh installs it on a machine with the company layer)." >&2
+  echo "Staged files left in $WORK" >&2
+  exit 1
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  heading "$CLI publish --dry-run"
+  (cd "$STAGE" && "${CLI_CMD[@]}" publish --dry-run --repo "$REPO")
+  echo
+  echo "Dry run only; nothing was published. Staged files left in $WORK"
+  exit 0
+fi
+
+if [ "$ASSUME_YES" -ne 1 ]; then
+  [ -t 0 ] || die "refusing to publish without a terminal; re-run with --yes to confirm"
+  printf '\nPublish %s %s to %s (opens a pull request)? [y/N] ' "$NAME" "$VERSION" "$REPO"
+  read -r answer
+  [[ "$answer" =~ ^[Yy]$ ]] || { echo "Not published. Staged files left in $WORK"; exit 0; }
+fi
+heading "$CLI publish"
+(cd "$STAGE" && "${CLI_CMD[@]}" publish --repo "$REPO")

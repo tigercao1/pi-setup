@@ -1,0 +1,980 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { spawn, execFileSync } from "node:child_process";
+
+const HOME = os.homedir();
+const CONFIG = {
+  timeZone: "America/New_York",
+  dayStartHour: 4,
+  sessionsDir: path.join(HOME, ".pi/agent/sessions"),
+  ledgerDir: path.join(HOME, ".pi/agent/daily-ledger"),
+  outDir: path.join(HOME, "Documents/knowledge-base-remote/Daily"),
+  provider: process.env.PI_TODAY_PROVIDER || "vercel-ai-gateway",
+  digestModel: process.env.PI_TODAY_DIGEST_MODEL || "anthropic/claude-haiku-4.5",
+  rollupModel: process.env.PI_TODAY_ROLLUP_MODEL || "anthropic/claude-sonnet-5",
+  concurrency: 6,
+  chunkChars: 240_000,
+  workName: "work",
+  workDescription: "",
+  workOrg: "",
+  workRepoPrefixes: ["~/.pi/agent"],
+  ticketPrefixes: [],
+  ticketUrl: "",
+  worktreeDirPattern: "",
+  standupTeam: "team",
+  standupRules: "Be direct. Say blockers plainly, without hedging. Report outcomes: the state of the world after the work lands, not the work itself.",
+};
+
+for (const file of [process.env.PI_TODAY_CONFIG, path.join(HOME, ".pi/homebase/work-report.json"), path.join(HOME, ".pi/agent/work-report.json")]) {
+  if (!file || !fs.existsSync(file)) continue;
+  Object.assign(CONFIG, JSON.parse(fs.readFileSync(file, "utf8")));
+  break;
+}
+CONFIG.workRepoPrefixes = CONFIG.workRepoPrefixes.map((p) => p.replace(/^~(?=\/|$)/, HOME));
+
+const remoteCache = new Map();
+function gitRemote(cwd) {
+  if (remoteCache.has(cwd)) return remoteCache.get(cwd);
+  let url = null;
+  try {
+    url = execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch { /* directory gone or not a repo */ }
+  remoteCache.set(cwd, url);
+  return url;
+}
+
+function scopeOf(cwd) {
+  if (cwd === HOME) return "home";
+  if (CONFIG.workRepoPrefixes.some((p) => cwd === p || cwd.startsWith(`${p}/`) || cwd.startsWith(`${p}-`))) return "repo";
+  const url = gitRemote(cwd);
+  if (url && CONFIG.workOrg && new RegExp(`github\\.com[:/]${CONFIG.workOrg}/`).test(url)) return "repo";
+  return null;
+}
+
+const USAGE = `usage:
+  pi-today [note] [today|yesterday|YYYY-MM-DD] [--dry-run] [--refresh] [--force] [--session <id>]
+  pi-today standup [--since YYYY-MM-DD] [--prev <file>]
+  pi-today week [--since YYYY-MM-DD] [--until YYYY-MM-DD]
+  pi-today html [YYYY-MM-DD|all]
+
+  note         default; full daily note + HTML view, rewritten on every run
+  standup      short Slack post (Yesterday / Today / Blockers / Feeling) from the notes
+               since --since (default: previous working day); --prev is your last posted
+               standup (default ~/.pi/agent/daily-ledger/standups/last-post.md)
+  week         one summary across daily notes (default: Monday of this week to today)
+  html         re-render HTML views from existing notes, no model calls
+
+  today        default day; yesterday = previous working day (Monday -> Friday)
+  --dry-run    list selected and excluded sessions, no model calls
+  --refresh    ignore cached digests
+  --force      allow weekend dates
+  --session    digest one session only, no note`;
+
+function parseArgs(argv) {
+  const opts = { mode: "note", day: "today", dryRun: false, refresh: false, force: false, session: null, since: null, until: null, prev: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (i === 0 && ["note", "standup", "week", "html"].includes(a)) opts.mode = a;
+    else if (a === "all" && opts.mode === "html") opts.day = "all";
+    else if (a === "--since") opts.since = argv[++i];
+    else if (a === "--until") opts.until = argv[++i];
+    else if (a === "--prev") opts.prev = argv[++i];
+    else if (a === "--dry-run") opts.dryRun = true;
+    else if (a === "--refresh") opts.refresh = true;
+    else if (a === "--force") opts.force = true;
+    else if (a === "--session") opts.session = argv[++i];
+    else if (a === "-h" || a === "--help") { console.log(USAGE); process.exit(0); }
+    else if (/^(today|yesterday|\d{4}-\d{2}-\d{2})$/.test(a)) opts.day = a;
+    else { console.error(`unknown argument: ${a}\n${USAGE}`); process.exit(2); }
+  }
+  return opts;
+}
+
+function zonedParts(date, timeZone = CONFIG.timeZone) {
+  const f = new Intl.DateTimeFormat("en-CA", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short",
+  });
+  const p = Object.fromEntries(f.formatToParts(date).map((x) => [x.type, x.value]));
+  return { ymd: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour) % 24, minute: Number(p.minute), weekday: p.weekday };
+}
+
+function zonedToUtc(ymd, hour, timeZone = CONFIG.timeZone) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  let guess = Date.UTC(y, m - 1, d, hour);
+  for (let i = 0; i < 2; i++) {
+    const p = zonedParts(new Date(guess), timeZone);
+    const [py, pm, pd] = p.ymd.split("-").map(Number);
+    const asUtc = Date.UTC(py, pm - 1, pd, p.hour, p.minute);
+    guess += Date.UTC(y, m - 1, d, hour) - asUtc;
+  }
+  return new Date(guess);
+}
+
+function addDays(ymd, n) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+}
+
+function weekdayOf(ymd) {
+  const [y, m, d] = ymd.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+function resolveDay(spec) {
+  const now = new Date();
+  const p = zonedParts(now);
+  let today = p.hour < CONFIG.dayStartHour ? addDays(p.ymd, -1) : p.ymd;
+  if (spec === "today") return today;
+  if (spec === "yesterday") {
+    let d = addDays(today, -1);
+    while ([0, 6].includes(weekdayOf(d))) d = addDays(d, -1);
+    return d;
+  }
+  return spec;
+}
+
+function windowFor(ymd) {
+  return { start: zonedToUtc(ymd, CONFIG.dayStartHour), end: zonedToUtc(addDays(ymd, 1), CONFIG.dayStartHour) };
+}
+
+function listSessionFiles(dir) {
+  const out = [];
+  for (const sub of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!sub.isDirectory()) continue;
+    const p = path.join(dir, sub.name);
+    for (const f of fs.readdirSync(p)) if (f.endsWith(".jsonl")) out.push(path.join(p, f));
+  }
+  return out;
+}
+
+function readEntries(file) {
+  const entries = [];
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line) continue;
+    try { entries.push(JSON.parse(line)); } catch { /* partial trailing line while a session is writing */ }
+  }
+  return entries;
+}
+
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+}
+
+function clip(s, max, tail = 0) {
+  if (!s || s.length <= max) return s || "";
+  return `${s.slice(0, max - tail)}\n[… ${s.length - max} chars cut …]\n${tail ? s.slice(-tail) : ""}`;
+}
+
+function fmtTime(ts) {
+  const p = zonedParts(new Date(ts));
+  return `${String(p.hour).padStart(2, "0")}:${String(p.minute).padStart(2, "0")}`;
+}
+
+const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const TICKET_RE = CONFIG.ticketPrefixes.length
+  ? new RegExp(`\\b(?:${CONFIG.ticketPrefixes.map(escapeRe).join("|")})-\\d{2,6}\\b`, "gi")
+  : /(?!)/g;
+const URL_RE = /https:\/\/(?:github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+|linear\.app\/[\w-]+\/(?:issue|project|document)\/[\w-]+|[\w-]+\.atlassian\.net\/wiki\/[^\s"')\]>`]+|docs\.google\.com\/[^\s"')\]>`]+)/g;
+
+function toolLine(call) {
+  const a = call.arguments || {};
+  const name = call.name;
+  if (name === "bash") return `bash: ${clip(String(a.command || "").replace(/\s+/g, " "), 220)}`;
+  if (["read", "edit", "write"].includes(name)) return `${name}: ${a.path || ""}`;
+  if (name === "team_spawn") return `team_spawn: ${a.name} — ${clip(String(a.task || "").replace(/\s+/g, " "), 200)}`;
+  const summary = clip(JSON.stringify(a).replace(/\s+/g, " "), 200);
+  return `${name}: ${summary}`;
+}
+
+function analyzeSession(file, win) {
+  const entries = readEntries(file);
+  const header = entries.find((e) => e.type === "session");
+  if (!header) return null;
+  const ownFrom = Math.max(win.start.getTime(), header.parentSession ? Date.parse(header.timestamp) : 0);
+  const inWin = (e) => {
+    const t = Date.parse(e.timestamp);
+    return t >= ownFrom && t < win.end.getTime();
+  };
+  const names = entries.filter((e) => e.type === "session_info" && e.name).map((e) => e.name);
+  const before = entries.filter((e) => Date.parse(e.timestamp) < ownFrom);
+  const day = entries.filter(inWin);
+  const userMsgs = day.filter((e) => e.type === "message" && e.message?.role === "user");
+  const segments = [];
+  for (const e of day) {
+    const t = Date.parse(e.timestamp);
+    const last = segments.at(-1);
+    if (last && t - last[1] <= 20 * 60 * 1000) last[1] = t;
+    else segments.push([t, t]);
+  }
+  return {
+    segments,
+    id: header.id,
+    short: header.id.slice(0, 13),
+    file,
+    cwd: header.cwd,
+    name: names.at(-1) || null,
+    entries,
+    before,
+    day,
+    userCount: userMsgs.length,
+    first: day[0]?.timestamp,
+    last: day.at(-1)?.timestamp,
+  };
+}
+
+function workerStatus(name) {
+  const m = name.match(/^(team-[\w-]+):(.+)$/);
+  if (!m) return null;
+  const file = path.join(HOME, ".pi/orchestrator-teams", m[1], "status", `${m[2]}.json`);
+  try {
+    const st = JSON.parse(fs.readFileSync(file, "utf8"));
+    return { team: m[1], agent: m[2], state: st.state, note: st.note || "", output: st.output || "" };
+  } catch {
+    return { team: m[1], agent: m[2], state: "unknown", note: "", output: "" };
+  }
+}
+
+function discoveryAudit(sessions, win) {
+  const issues = [];
+  let ps = "";
+  try { ps = execFileSync("ps", ["-axo", "pid=,command="]).toString(); } catch { return issues; }
+  for (const line of ps.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!m || !/(^|\/)pi(\s|$)/.test(m[2])) continue;
+    const cmd = m[2];
+    if (/\s-p(\s|$)|--print/.test(cmd)) continue;
+    if (/--no-session/.test(cmd)) issues.push(`pid ${m[1]} runs with --no-session; nothing it does is recorded`);
+    const dir = cmd.match(/--session-dir\s+(\S+)/);
+    if (dir && !path.resolve(dir[1]).startsWith(CONFIG.sessionsDir)) issues.push(`pid ${m[1]} writes sessions to ${dir[1]}, which is not scanned`);
+  }
+  const regDir = path.join(HOME, ".pi/agent/session-bus/registry");
+  if (fs.existsSync(regDir)) {
+    const known = new Set(sessions.map((s) => s.id));
+    for (const f of fs.readdirSync(regDir)) {
+      try {
+        const r = JSON.parse(fs.readFileSync(path.join(regDir, f), "utf8"));
+        const alive = (() => { try { process.kill(r.pid, 0); return true; } catch { return false; } })();
+        if (alive && Date.parse(r.lastSeen) >= win.start.getTime() && !known.has(r.key)) {
+          const file = listSessionFiles(CONFIG.sessionsDir).find((x) => x.includes(r.key));
+          if (!file) issues.push(`live session ${r.key.slice(0, 13)} (${r.alias}, ${r.cwd.replace(HOME, "~")}) has no session file on disk`);
+        }
+      } catch { /* registry entry being rewritten */ }
+    }
+  }
+  return issues;
+}
+
+function classify(s) {
+  if (!s.day.length) return { include: false, reason: "no activity in window" };
+  if (s.name && /^team-[\w-]+:/.test(s.name)) return { include: false, reason: "orchestrator worker", worker: workerStatus(s.name) };
+  if (!s.userCount) return { include: false, reason: "no user message in window" };
+  const kind = scopeOf(s.cwd);
+  if (!kind) return { include: false, reason: `outside ${CONFIG.workName} scope` };
+  return { include: true, kind };
+}
+
+function extractArtifacts(entries, cwd) {
+  const files = new Set();
+  const docs = new Set();
+  const urls = new Set();
+  const tickets = new Set();
+  const userTickets = new Set();
+  const created = new Set();
+  const createCalls = new Set();
+  const addText = (t, { withTickets = true } = {}) => {
+    for (const m of t.matchAll(URL_RE)) urls.add(m[0].replace(/[.,;:]+$/, ""));
+    if (withTickets) for (const m of t.matchAll(TICKET_RE)) tickets.add(m[0].toUpperCase());
+  };
+  const wt = CONFIG.worktreeDirPattern ? cwd.match(new RegExp(CONFIG.worktreeDirPattern, "i")) : null;
+  if (wt) { tickets.add(wt[1].toUpperCase()); userTickets.add(wt[1].toUpperCase()); }
+  for (const e of entries) {
+    if (e.type !== "message") continue;
+    const m = e.message;
+    if (m.role === "user") {
+      const t = textOf(m.content);
+      addText(t);
+      for (const x of t.matchAll(TICKET_RE)) userTickets.add(x[0].toUpperCase());
+    }
+    if (m.role === "assistant" && Array.isArray(m.content)) {
+      for (const c of m.content) {
+        if (c.type === "text") addText(c.text);
+        if (c.type !== "toolCall") continue;
+        const a = c.arguments || {};
+        if ((c.name === "edit" || c.name === "write") && a.path) {
+          const p = a.path.startsWith("/") ? a.path : path.join(cwd, a.path);
+          (p.includes("/knowledge-base-remote/") ? docs : files).add(p.replace(HOME, "~"));
+        }
+        if (c.name === "bash" && a.command) {
+          addText(a.command);
+          if (/\bgh pr create\b/.test(a.command)) createCalls.add(c.id);
+        }
+      }
+    }
+    if (m.role === "toolResult") {
+      const t = textOf(m.content);
+      if (createCalls.has(m.toolCallId) && !m.isError) {
+        for (const u of t.matchAll(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g)) created.add(u[0]);
+      }
+      addText(clip(t, 4000), { withTickets: false });
+    }
+  }
+  return {
+    files: [...files].sort(),
+    docs: [...docs].sort(),
+    prs: [...urls].filter((u) => u.includes("/pull/")).sort(),
+    prsCreated: [...created].sort(),
+    links: [...urls].filter((u) => !u.includes("/pull/")).sort(),
+    tickets: [...tickets].sort(),
+    userTickets: [...userTickets].sort(),
+  };
+}
+
+function renderEntries(entries) {
+  const lines = [];
+  for (const e of entries) {
+    const t = fmtTime(e.timestamp);
+    if (e.type === "compaction" && e.summary) lines.push(`[${t}] (compaction summary) ${clip(e.summary, 1500)}`);
+    if (e.type === "branch_summary" && e.summary) lines.push(`[${t}] (branch summary) ${clip(e.summary, 800)}`);
+    if (e.type === "custom_message") lines.push(`[${t}] (${e.customType}) ${clip(textOf(e.content), 800)}`);
+    if (e.type !== "message") continue;
+    const m = e.message;
+    if (m.role === "user") lines.push(`[${t}] USER: ${clip(textOf(m.content), 3500, 500)}`);
+    else if (m.role === "assistant" && Array.isArray(m.content)) {
+      const text = m.content.filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+      if (text) lines.push(`[${t}] ASSISTANT: ${clip(text, 2500, 300)}`);
+      for (const c of m.content) if (c.type === "toolCall") lines.push(`[${t}]   → ${toolLine(c)}`);
+    } else if (m.role === "toolResult" && m.isError) {
+      lines.push(`[${t}]   ✗ ${m.toolName} error: ${clip(textOf(m.content).replace(/\s+/g, " "), 300)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function background(s) {
+  if (!s.before.length) return "";
+  const firstUser = s.before.find((e) => e.type === "message" && e.message?.role === "user");
+  const lastCompaction = s.before.filter((e) => e.type === "compaction").at(-1);
+  const parts = [`This session started ${zonedParts(new Date(s.before[0].timestamp)).ymd}, before the day being reported.`];
+  if (firstUser) parts.push(`Its first request was: ${clip(textOf(firstUser.message.content), 800)}`);
+  if (lastCompaction?.summary) parts.push(`Summary of its history so far: ${clip(lastCompaction.summary, 2000)}`);
+  return parts.join("\n");
+}
+
+function chunk(text, size) {
+  const out = [];
+  let cur = "";
+  for (const line of text.split("\n")) {
+    if (cur.length + line.length + 1 > size && cur) { out.push(cur); cur = ""; }
+    cur += `${line}\n`;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+function runPi({ model, system, prompt }) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-p", "--provider", CONFIG.provider, "--model", model, "--thinking", "off",
+      "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-context-files",
+      "--no-prompt-templates", "--offline", "--system-prompt", system,
+    ];
+    const child = spawn("pi", args, { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0 || !out.trim()) reject(new Error(`pi exited ${code}: ${clip(err || out, 600)}`));
+      else resolve(out.trim());
+    });
+    child.stdin.end(prompt);
+  });
+}
+
+const DIGEST_SYSTEM = () => `You summarize one working session between a software engineer and a coding agent, for the engineer's own daily work log. Use only what is in the transcript. Do not invent outcomes; if something was attempted but not confirmed done, say so.
+
+${CONFIG.workDescription || `The engineer's ${CONFIG.workName} sessions.`} Sessions also include scoping tickets, research, reviewing PRs, and improving the engineer's own agent tooling and workflows (pi extensions, skills). All of that is real work.
+
+Write exactly this markdown, nothing before or after:
+
+TITLE: <one line, what the session was about>
+KIND: <one of: implementation, scoping, review, research, workflow, other>
+WORK: <yes if the work is for ${CONFIG.workName} or for the engineer's work tooling; no if clearly personal or another project>
+- Goal: <what the engineer was trying to do>
+- Done: <what changed or was produced; concrete>
+- Decisions / findings: <anything worth remembering; "none" if none>
+- Artifacts: <files, docs, tickets, PRs that matter; "none" if none>
+- Open: <unfinished threads or next step; "none" if none>
+
+Status words need proof in the transcript: say a PR was "merged" only if a tool result shows it merged (gh pr merge output, state MERGED, or the user saying so). Merging main into a branch, pushing, or opening a PR is not merging it. Say "opened", "pushed", or "draft" instead.
+
+Keep it under 200 words. Lines marked (background) describe earlier days; never report them as work done today.`;
+
+async function digestSession(s, artifacts, opts) {
+  const dir = path.join(CONFIG.ledgerDir, opts.ymd, "digests");
+  fs.mkdirSync(dir, { recursive: true });
+  const cacheFile = path.join(dir, `${s.id}.json`);
+  const lastId = s.day.at(-1).id;
+  let cached = null;
+  if (!opts.refresh && fs.existsSync(cacheFile)) cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+  if (cached?.lastEntryId === lastId) return cached.digest;
+
+  let entries = s.day;
+  let previous = "";
+  if (cached?.lastEntryId) {
+    const idx = s.day.findIndex((e) => e.id === cached.lastEntryId);
+    if (idx >= 0) { entries = s.day.slice(idx + 1); previous = cached.digest; }
+  }
+  const header = [
+    `Session: ${s.name || "(unnamed)"} · cwd ${s.cwd.replace(HOME, "~")} · ${fmtTime(s.first)}–${fmtTime(s.last)} ET`,
+    `Artifacts found by code: ${JSON.stringify(artifacts)}`,
+  ].join("\n");
+  const bg = background(s);
+  const chunks = chunk(renderEntries(entries), CONFIG.chunkChars);
+  let digest = previous;
+  for (const [i, body] of chunks.entries()) {
+    const prompt = [
+      header,
+      bg && !previous && i === 0 ? `\n(background)\n${bg}\n` : "",
+      digest ? `\nSummary of the earlier part of this session today (update it with the new part; keep what is still true):\n${digest}\n` : "",
+      `\nTranscript${chunks.length > 1 ? ` part ${i + 1}/${chunks.length}` : ""}:\n${body}`,
+    ].join("");
+    digest = await runPi({ model: CONFIG.digestModel, system: DIGEST_SYSTEM(), prompt });
+  }
+  fs.writeFileSync(cacheFile, JSON.stringify({ id: s.id, lastEntryId: lastId, digest, updatedAt: new Date().toISOString() }, null, 2));
+  return digest;
+}
+
+function parseDigest(d) {
+  const get = (k) => (d.match(new RegExp(`^${k}:\\s*(.+)$`, "m")) || [])[1]?.trim();
+  return { title: get("TITLE") || "(untitled)", kind: get("KIND") || "other", work: (get("WORK") || "yes").toLowerCase().startsWith("y") };
+}
+
+const ROLLUP_SYSTEM = `You write a software engineer's private daily work log from per-session summaries. It is a reference the engineer later turns into standup posts, so be concrete and factual. Use only the summaries given.
+
+Output markdown with exactly these sections and nothing else:
+
+## Summary
+3 to 5 lines: the day in plain sentences.
+
+## Threads
+One "### <thread title>" per piece of work. Merge sessions about the same ticket, PR or subject into one thread. Under each heading:
+- a line "Sessions: [s:xxxxxxxx-xxxx], ..." citing every session id that fed it, in that exact bracket form
+- Time: rough span, from the session times
+- Done, Decisions / findings, Artifacts, Open, as bullets (omit a bullet when empty)
+Meetings are given as "=== meeting [m:slug]" blocks. Fold each meeting into the thread it belongs to (cite it on the Sessions line as [m:slug], e.g. "Sessions: [s:01a0f2db-bbaf], [m:granola-greenhouse-sensor-review]"); a meeting with no matching session becomes its own thread. Treat a meeting marked TIGER_ATTENDED: unclear as context, and say so. Action items assigned to Tiger in meetings belong in Done or Open; others' action items only when they block Tiger's work. "Manual log" lines are work the engineer recorded by hand; include them.
+Order threads by importance, not time. Mention every PR URL, ticket ID and knowledge-base doc that appears in the summaries.
+
+## Carry-over
+Bullets of open items to pick up next, each tagged with its thread. "None" if nothing is open.`;
+
+function loadManual(ymd) {
+  const dir = path.join(CONFIG.ledgerDir, ymd);
+  const meetings = [];
+  const mdir = path.join(dir, "meetings");
+  if (fs.existsSync(mdir)) {
+    for (const f of fs.readdirSync(mdir).filter((x) => x.endsWith(".md")).sort()) {
+      const text = fs.readFileSync(path.join(mdir, f), "utf8").trim();
+      const field = (k) => (text.match(new RegExp(`^${k}:\\s*(.+)$`, "m")) || [])[1]?.trim() || "";
+      const attended = field("TIGER_ATTENDED").toLowerCase();
+      meetings.push({ slug: f.replace(/\.md$/, ""), text, title: field("TITLE"), time: field("TIME"), url: field("URL"), source: field("SOURCE"), attended });
+    }
+  }
+  const logFile = path.join(dir, "log.md");
+  const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").trim() : "";
+  return { meetings, log };
+}
+
+async function pool(items, n, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }));
+  return results;
+}
+
+function meetingManifest(meetings) {
+  if (!meetings.length) return "";
+  return [
+    "## Meetings",
+    "",
+    "| time (ET) | meeting | source | attended |",
+    "|---|---|---|---|",
+    ...meetings.map((m) => `| ${m.time} | [${m.title.replace(/\|/g, "/")}](${m.url}) \`${m.slug}\` | ${m.source} | ${m.attended.split(/\s/)[0] || "?"} |`),
+    "",
+  ].join("\n");
+}
+
+function manifest(included, excluded) {
+  const rows = included.map((s) =>
+    `| \`${s.short}\` | ${s.name ? s.name.replace(/\|/g, "/") : "(unnamed)"} | ${s.cwd.replace(HOME, "~")} | ${fmtTime(s.first)}–${fmtTime(s.last)} | ${s.userCount} |`);
+  const ex = Object.entries(excluded.reduce((acc, x) => ((acc[x.reason] ||= []).push(x), acc), {}))
+    .map(([reason, xs]) => `- ${reason}: ${xs.length}${xs.length <= 8 ? ` (${xs.map((x) => `\`${x.short}\` ${x.name || x.cwd.replace(HOME, "~")}`).join(", ")})` : ""}`);
+  return [
+    "## Sessions",
+    "Reopen with `pi --session <id>`.",
+    "",
+    "| id | name | cwd | time (ET) | prompts |",
+    "|---|---|---|---|---|",
+    ...rows,
+    "",
+    "Excluded:",
+    ...(ex.length ? ex : ["- none"]),
+  ].join("\n");
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  if (opts.mode === "standup") return standupMain(opts);
+  if (opts.mode === "week") return weekMain(opts);
+  if (opts.mode === "html") return htmlMain(opts);
+  return noteMain(opts);
+}
+
+async function noteMain(opts) {
+  const ymd = resolveDay(opts.day);
+  opts.ymd = ymd;
+  if ([0, 6].includes(weekdayOf(ymd)) && !opts.force && !opts.session) {
+    console.error(`${ymd} is a weekend; pass --force to report it anyway.`);
+    process.exit(1);
+  }
+  const win = windowFor(ymd);
+  const files = listSessionFiles(CONFIG.sessionsDir).filter((f) => fs.statSync(f).mtime >= win.start);
+  const sessions = files.map((f) => analyzeSession(f, win)).filter(Boolean);
+
+  const included = [];
+  const excluded = [];
+  for (const s of sessions) {
+    if (opts.session && !s.id.startsWith(opts.session)) continue;
+    if (!s.day.length) continue;
+    const c = classify(s);
+    if (c.include) included.push(Object.assign(s, { scope: c.kind }));
+    else excluded.push(Object.assign(s, { reason: c.reason, worker: c.worker, inScope: !!scopeOf(s.cwd) }));
+  }
+  included.sort((a, b) => Date.parse(a.first) - Date.parse(b.first));
+  console.error(`${ymd}: window ${win.start.toISOString()} → ${win.end.toISOString()}; ${included.length} included, ${excluded.length} excluded`);
+
+  if (opts.dryRun) {
+    console.log(manifest(included, excluded));
+    return;
+  }
+
+  for (const s of included) s.artifacts = extractArtifacts(s.day, s.cwd);
+  const digests = await pool(included, CONFIG.concurrency, async (s) => {
+    try {
+      const d = await digestSession(s, s.artifacts, opts);
+      console.error(`  digested ${s.short} ${s.name || ""}`);
+      return d;
+    } catch (e) {
+      console.error(`  FAILED ${s.short}: ${e.message}`);
+      return null;
+    }
+  });
+  if (opts.session) { console.log(digests.filter(Boolean).join("\n\n")); return; }
+
+  const kept = [];
+  for (const [i, s] of included.entries()) {
+    const d = digests[i];
+    if (!d) { excluded.push(Object.assign(s, { reason: "digest failed (rerun to retry)" })); continue; }
+    const meta = parseDigest(d);
+    if (s.scope === "home" && !meta.work) { excluded.push(Object.assign(s, { reason: `home-directory session classified as non-${CONFIG.workName}` })); continue; }
+    kept.push(Object.assign(s, { digest: d, meta }));
+  }
+  const manual = loadManual(ymd);
+  const workers = excluded.filter((x) => x.worker && x.inScope);
+  const audit = discoveryAudit(sessions, win);
+  const meetings = manual.meetings.filter((m) => !m.attended.startsWith("no"));
+  if (!kept.length && !meetings.length && !manual.log) { console.error(`No ${CONFIG.workName} sessions or meetings to report.`); return; }
+
+  const rollupInput = kept.map((s) => [
+    `=== session [s:${s.short}] · ${s.name || "(unnamed)"} · ${s.cwd.replace(HOME, "~")} · ${fmtTime(s.first)}–${fmtTime(s.last)} ET`,
+    s.digest,
+    `Artifacts found by code: ${JSON.stringify({ tickets: s.artifacts.tickets, prsCreated: s.artifacts.prsCreated, prs: s.artifacts.prs.slice(0, 10), docs: s.artifacts.docs, links: s.artifacts.links.slice(0, 10) })}`,
+  ].join("\n")).concat(
+    meetings.map((m) => `=== meeting [m:${m.slug}]\n${m.text}`),
+    manual.log ? [`=== Manual log\n${manual.log}`] : [],
+    workers.length ? [`=== Delegated agents (spawned by the engineer's sessions; fold into the matching thread, do not make threads of their own unless nothing matches)\n${workers.map((w) => `- ${w.worker.agent} (${w.worker.team}, ${fmtTime(w.first)}–${fmtTime(w.last)} ET, ${w.worker.state}): ${clip(w.worker.note, 400)}${w.worker.output ? ` → ${w.worker.output.replace(HOME, "~")}` : ""}`).join("\n")}`] : [],
+  ).join("\n\n");
+  const body = await runPi({ model: CONFIG.rollupModel, system: ROLLUP_SYSTEM, prompt: `Day: ${ymd} (${weekdayName(ymd)})\n${corrections()}\n${rollupInput}` });
+
+  const missingSessions = kept.filter((s) => !body.includes(s.short));
+  const allTickets = new Set(kept.flatMap((s) => s.artifacts.userTickets));
+  const allDocs = new Set(kept.flatMap((s) => s.artifacts.docs));
+  const allCreated = new Set(kept.flatMap((s) => s.artifacts.prsCreated));
+  const missing = [
+    ...missingSessions.map((s) => `- session \`${s.short}\`: ${s.meta.title}`),
+    ...meetings.filter((m) => !body.includes(m.slug)).map((m) => `- meeting: ${m.title} (${m.time})`),
+    ...[...allCreated].filter((u) => !body.includes(u)).map((u) => `- PR opened: ${u}`),
+    ...[...allTickets].filter((t) => !body.toUpperCase().includes(t)).map((t) => `- ticket you mentioned: ${t}`),
+    ...[...allDocs].filter((d) => !body.includes(path.basename(d))).map((d) => `- doc written: ${d}`),
+  ];
+
+  const weekday = new Date(`${ymd}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+  const note = [
+    `# ${ymd} (${weekday})`,
+    "",
+    `_Generated ${new Date().toLocaleString("en-US", { timeZone: CONFIG.timeZone })} ET by pi-today from ${kept.length} sessions and ${meetings.length} meetings._`,
+    "",
+    body,
+    "",
+    missing.length ? ["## Not covered by summary", "Found by code but absent from the summary above:", ...missing, ""].join("\n") : "",
+    audit.length ? ["## Discovery warnings", ...audit.map((x) => `- ${x}`), ""].join("\n") : "",
+    meetingManifest(meetings),
+    manifest(kept, excluded),
+    "",
+  ].join("\n");
+
+  fs.mkdirSync(CONFIG.outDir, { recursive: true });
+  const outFile = path.join(CONFIG.outDir, `${ymd}.md`);
+  fs.writeFileSync(outFile, note);
+  const dayData = {
+    ymd,
+    generatedAt: new Date().toISOString(),
+    sessions: kept.map((s) => ({ short: s.short, name: s.name, title: s.meta.title, kind: s.meta.kind, cwd: s.cwd.replace(HOME, "~"), segments: s.segments.map(([a, b]) => [new Date(a).toISOString(), new Date(b).toISOString()]) })),
+    meetings: meetings.map((m) => ({ slug: m.slug, title: m.title, time: m.time, url: m.url, attended: m.attended.split(/\s/)[0] })),
+  };
+  fs.mkdirSync(path.join(CONFIG.ledgerDir, ymd), { recursive: true });
+  fs.writeFileSync(path.join(CONFIG.ledgerDir, ymd, "day.json"), JSON.stringify(dayData, null, 2));
+  console.log(outFile);
+  console.log(renderDayHtml(ymd));
+}
+
+function workingDays(from, to) {
+  const out = [];
+  for (let d = from; d <= to; d = addDays(d, 1)) if (![0, 6].includes(weekdayOf(d))) out.push(d);
+  return out;
+}
+
+function weekdayName(ymd) {
+  return new Date(`${ymd}T12:00:00Z`).toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+}
+
+function readNote(ymd) {
+  const f = path.join(CONFIG.outDir, `${ymd}.md`);
+  return fs.existsSync(f) ? fs.readFileSync(f, "utf8") : null;
+}
+
+function noteCore(md) {
+  return md.split(/\n## Sessions\n/)[0].replace(/\n## Meetings\n[\s\S]*$/, "").replace(/\n## Discovery warnings\n[\s\S]*?(?=\n## |$)/, "");
+}
+
+function corrections() {
+  const f = path.join(CONFIG.ledgerDir, "corrections.md");
+  return fs.existsSync(f) ? `\n=== Verified facts (each was true when checked; it overrides older notes, but a later dated fact in the notes or session evidence wins)\n${fs.readFileSync(f, "utf8").trim()}\n` : "";
+}
+
+function mondayOf(ymd) {
+  let d = ymd;
+  while (weekdayOf(d) !== 1) d = addDays(d, -1);
+  return d;
+}
+
+const STANDUP_SYSTEM = `You draft a software engineer's post for the ${CONFIG.standupTeam} async standup in Slack. The team's rules, verbatim:
+"${CONFIG.standupRules}"
+
+Write exactly this, in Slack mrkdwn, nothing before or after:
+
+*Yesterday:* <Yes | No | Partial> — <one sentence: which stated goal landed or did not, and why>
+<optional: up to 4 short bullets "• <outcome>" for the most important outcomes, only when covering more than one day>
+*Today:* <the outcome to reach by EOD, one or two short clauses>
+*Blockers:* <who must act, what is needed, by when>   (omit this line entirely if there are none)
+*Feeling:* <:large_green_circle: On Track | :large_yellow_circle: Cautious | :red_circle: Worried> <optional short reason>
+
+Rules:
+- Judge Yesterday against the goals in the previous post when one is given; quote nothing, just say what happened to each goal.
+- When the period covers more than one working day, write "*Since <Weekday>:*" instead of "*Yesterday:*".
+- Outcomes, not activity: "Greenhouse sensor dashboard shows live humidity for all 6 beds" beats "worked on the sensor dashboard".
+- Today is a proposal from the open items; the engineer will edit it.
+- No session ids, local file paths, or knowledge-base links. Ticket IDs and PR/Linear URLs are fine.
+- Match the length and tone of the engineer's posted examples when given; they override these rules.`;
+
+function standupStyle() {
+  const dir = path.join(CONFIG.ledgerDir, "standups");
+  const style = fs.existsSync(path.join(dir, "style.md")) ? fs.readFileSync(path.join(dir, "style.md"), "utf8").trim() : "";
+  const pdir = path.join(dir, "posted");
+  const posted = fs.existsSync(pdir) ? fs.readdirSync(pdir).filter((f) => f.endsWith(".md")).sort().slice(-3) : [];
+  const examples = posted.map((f) => `--- posted ${f.replace(/\.md$/, "")}\n${fs.readFileSync(path.join(pdir, f), "utf8").trim()}`).join("\n\n");
+  return [style && `\n${style}`, examples && `\nPosts the engineer actually sent (match this voice, length and selection):\n${examples}`].filter(Boolean).join("\n");
+}
+
+async function standupMain(opts) {
+  const today = resolveDay("today");
+  const since = opts.since || resolveDay("yesterday");
+  const days = workingDays(since, today);
+  const notes = days.map((d) => [d, readNote(d)]).filter(([, n]) => n);
+  if (!notes.length) { console.error(`No daily notes between ${since} and ${today}; run pi-today first.`); process.exit(1); }
+  const prevFile = opts.prev || path.join(CONFIG.ledgerDir, "standups", "last-post.md");
+  const prev = fs.existsSync(prevFile) ? fs.readFileSync(prevFile, "utf8").trim() : "";
+  const prompt = [
+    `Today is ${today} (${weekdayName(today)}). The post covers ${since} through now.`,
+    days.filter((d) => d !== today).length <= 1
+      ? `Label the first line exactly "${weekdayName(today) === "Monday" ? "Friday" : "Yesterday"}:" — the period is one working day, never write "Since".`
+      : `Label the first line "Since ${weekdayName(since).slice(0, 3)}:".`,
+    corrections(),
+    prev ? `\nPrevious standup post by the engineer:\n${prev}\n` : "\nNo previous post given; judge against what the notes say was planned.\n",
+    ...notes.map(([d, n]) => `\n=== daily note ${d} (${weekdayName(d)})${d === today ? " (today, so far)" : ""}\n${noteCore(n)}`),
+  ].join("\n");
+  const post = await runPi({ model: CONFIG.rollupModel, system: STANDUP_SYSTEM + standupStyle(), prompt });
+  const dir = path.join(CONFIG.ledgerDir, "standups");
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, `${today}.md`);
+  fs.writeFileSync(out, `${post}\n`);
+  console.log(post);
+  console.error(`\nsaved: ${out}`);
+}
+
+const WEEK_SYSTEM = `You write a software engineer's weekly summary from daily work notes. It is a private reference and the source for posts, so be concrete. Use only the notes.
+
+Output markdown with exactly these sections:
+
+## Week in one paragraph
+3 to 5 sentences.
+
+## Outcomes
+Grouped by workstream ("### <workstream>"), each a few bullets of outcomes (state of the world after the work), with ticket IDs and PR/Linear URLs. Include scoping, planning, reviews and tooling work; they are real outcomes.
+
+## Decisions
+Bullets: decision, who made it or where (meeting name), day.
+
+## Still open
+Bullets of what is unfinished or blocked, with owner when known.
+
+## By day
+One line per day, "**<Weekday> M/D**: ...", using the weekday names given in the input: the most important thing that happened.
+
+## Post
+A Slack-ready version for the team standup thread, in Slack mrkdwn, under 150 words: "*Since <Weekday>:*" with 3-6 outcome bullets "• ", then "*Next:*" one line, "*Blockers:*" one line (omit if none), "*Feeling:*" with :large_green_circle: / :large_yellow_circle: / :red_circle: and a reason. No session ids or local paths.`;
+
+async function weekMain(opts) {
+  const today = resolveDay("today");
+  const since = opts.since || mondayOf(today);
+  const until = opts.until || today;
+  const days = workingDays(since, until);
+  const notes = days.map((d) => [d, readNote(d)]).filter(([, n]) => n);
+  const missing = days.filter((d) => !readNote(d));
+  if (!notes.length) { console.error(`No daily notes between ${since} and ${until}.`); process.exit(1); }
+  const body = await runPi({ model: CONFIG.rollupModel, system: WEEK_SYSTEM, prompt: `Days covered: ${notes.map(([d]) => `${d} is ${weekdayName(d)}`).join("; ")}. Use these weekday names exactly.\n${corrections()}\n${notes.map(([d, n]) => `=== daily note ${d} (${weekdayName(d)})\n${noteCore(n)}`).join("\n\n")}` });
+  const md = [
+    `# Week ${since} → ${until}`,
+    "",
+    `_Generated ${new Date().toLocaleString("en-US", { timeZone: CONFIG.timeZone })} ET by pi-today from daily notes: ${notes.map(([d]) => d).join(", ")}._${missing.length ? ` Missing notes: ${missing.join(", ")}.` : ""}`,
+    "",
+    body,
+    "",
+    "## Daily notes",
+    ...notes.map(([d]) => `- [${d}](${d}.md)`),
+    "",
+  ].join("\n");
+  const out = path.join(CONFIG.outDir, `week-${since}_${until}.md`);
+  fs.writeFileSync(out, md);
+  console.log(out);
+  console.log(renderWeekHtml(out, notes.map(([d]) => d)));
+}
+
+function htmlMain(opts) {
+  if (opts.day === "all") {
+    for (const f of fs.readdirSync(CONFIG.outDir).filter((x) => /^\d{4}-\d{2}-\d{2}\.md$/.test(x)).sort()) console.log(renderDayHtml(f.slice(0, 10)));
+  } else console.log(renderDayHtml(resolveDay(opts.day)));
+  console.log(renderIndexHtml());
+}
+
+function esc(t) {
+  return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function inline(t) {
+  let h = esc(t);
+  h = h.replace(/`([^`]+)`/g, "<code>$1</code>");
+  h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  h = h.replace(/\[([^\]]+)\]\((https?:[^)\s]+|[\w.-]+\.md)\)/g, (_, a, u) => `<a href="${u.endsWith(".md") ? u.replace(/\.md$/, ".html") : u}">${a}</a>`);
+  h = h.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, u) => `${pre}<a href="${u}">${u.replace(/^https?:\/\/(www\.)?/, "").slice(0, 60)}</a>`);
+  h = h.replace(/\[s:([0-9a-f-]{13})\]/g, '<span class="tag s" title="pi --session $1">$1</span>');
+  h = h.replace(/\[m:([\w-]+)\]/g, '<span class="tag m" data-m="$1">meeting</span>');
+  h = h.replace(/(^|\s)_([^_]+)_(?=\s|$|[.,])/g, "$1<em>$2</em>");
+  if (CONFIG.ticketPrefixes.length && CONFIG.ticketUrl) {
+    const re = new RegExp(`\\b((?:${CONFIG.ticketPrefixes.join("|")})-\\d{2,6})\\b(?![^<]*<\\/a>)`, "g");
+    h = h.replace(re, (id) => `<a class="tk" href="${CONFIG.ticketUrl.replace("{id}", id)}">${id}</a>`);
+  }
+  return h;
+}
+
+function mdToHtml(md) {
+  const lines = md.split("\n");
+  const out = [];
+  let list = 0;
+  let table = null;
+  const closeList = () => { while (list > 0) { out.push("</ul>"); list--; } };
+  const flushTable = () => {
+    if (!table) return;
+    const rows = table.filter((r) => !/^\|\s*-/.test(r)).map((r) => r.replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+    out.push("<table><thead><tr>" + rows[0].map((c) => `<th>${inline(c)}</th>`).join("") + "</tr></thead><tbody>" +
+      rows.slice(1).map((r) => "<tr>" + r.map((c) => `<td>${inline(c)}</td>`).join("") + "</tr>").join("") + "</tbody></table>");
+    table = null;
+  };
+  for (const raw of lines) {
+    if (/^\|/.test(raw)) { closeList(); (table ||= []).push(raw); continue; }
+    flushTable();
+    const h = raw.match(/^(#{1,4})\s+(.*)$/);
+    const li = raw.match(/^(\s*)[-*•]\s+(.*)$/);
+    if (h) { closeList(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); }
+    else if (li) {
+      const depth = Math.floor(li[1].length / 2) + 1;
+      while (list < depth) { out.push("<ul>"); list++; }
+      while (list > depth) { out.push("</ul>"); list--; }
+      out.push(`<li>${inline(li[2])}</li>`);
+    } else if (!raw.trim()) closeList();
+    else { closeList(); out.push(`<p>${inline(raw)}</p>`); }
+  }
+  closeList();
+  flushTable();
+  return out.join("\n");
+}
+
+function sections(md) {
+  const parts = {};
+  let cur = "_head";
+  for (const line of md.split("\n")) {
+    const m = line.match(/^## (.+)$/);
+    if (m) { cur = m[1].trim(); parts[cur] = []; continue; }
+    (parts[cur] ||= []).push(line);
+  }
+  return Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, v.join("\n").trim()]));
+}
+
+const CSS = `
+:root{--bg:#f7f7f9;--card:#fff;--ink:#1d1d24;--mute:#6b6b78;--line:#e4e4ea;--accent:#7c3aed;--s:#2563eb;--m:#d97706}
+@media (prefers-color-scheme:dark){:root{--bg:#141418;--card:#1d1d23;--ink:#ececf1;--mute:#9a9aa8;--line:#2e2e37}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:18px;margin:28px 0 10px}h3{font-size:16px;margin:0 0 6px}h4{margin:10px 0 4px}
+.sub{color:var(--mute);font-size:13px;margin-bottom:16px}.sub a{color:var(--mute)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:10px 0}
+.summary{border-left:4px solid var(--accent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.grid .card{margin:0}
+ul{margin:4px 0;padding-left:20px}li{margin:2px 0}p{margin:6px 0}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}a.tk{font-weight:600}
+code{background:rgba(127,127,127,.15);padding:1px 5px;border-radius:4px;font-size:12.5px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+.tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:9px;margin-right:4px;color:#fff}.tag.s{background:var(--s)}.tag.m{background:var(--m)}
+details{margin:10px 0}summary{cursor:pointer;color:var(--mute)}
+.tl{position:relative;margin:8px 0 4px}.tl .row{position:relative;height:22px;margin:3px 0}.tl .lab{position:absolute;left:0;width:210px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mute);line-height:22px}
+.tl .track{position:absolute;left:220px;right:0;top:0;bottom:0;border-left:1px solid var(--line)}
+.tl .bar{position:absolute;top:4px;height:14px;border-radius:4px;background:var(--s);opacity:.85}.tl .bar.m{background:var(--m)}
+.tl .axis{position:relative;height:18px;margin-left:220px;font-size:11px;color:var(--mute)}.tl .axis span{position:absolute;transform:translateX(-50%)}
+@media (max-width:640px){.tl .lab{width:110px}.tl .track,.tl .axis{left:120px;margin-left:120px}.tl .track{margin-left:0}}
+.days{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.post{white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;font-size:13px}`;
+
+function page(title, body) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${CSS}</style></head><body><main>${body}</main></body></html>\n`;
+}
+
+function timelineHtml(day) {
+  const items = [];
+  for (const s of day.sessions || []) for (const [a, b] of s.segments) items.push({ label: s.title || s.name, a: Date.parse(a), b: Math.max(Date.parse(b), Date.parse(a) + 5 * 60000), kind: "s" });
+  const base = zonedToUtc(day.ymd, 0).getTime();
+  for (const m of day.meetings || []) {
+    const [hh, mm] = (m.time.match(/(\d{1,2}):(\d{2})/) || []).slice(1).map(Number);
+    if (Number.isNaN(hh) || hh === undefined) continue;
+    const a = base + (hh * 60 + mm) * 60000;
+    items.push({ label: `📅 ${m.title}`, a, b: a + 30 * 60000, kind: "m" });
+  }
+  if (!items.length) return "";
+  const startH = Math.min(8, ...items.map((i) => Math.floor((i.a - base) / 3600000)));
+  const endH = Math.max(18, ...items.map((i) => Math.ceil((i.b - base) / 3600000)));
+  const t0 = base + startH * 3600000;
+  const span = (endH - startH) * 3600000;
+  const pct = (t) => ((t - t0) / span) * 100;
+  const rows = new Map();
+  for (const i of items) (rows.get(i.label) || rows.set(i.label, []).get(i.label)).push(i);
+  const axis = [];
+  for (let h = startH; h <= endH; h += 2) axis.push(`<span style="left:${pct(base + h * 3600000)}%">${h}:00</span>`);
+  return `<div class="tl">${[...rows.entries()].map(([label, bars]) => `<div class="row"><div class="lab" title="${esc(label)}">${esc(label)}</div><div class="track">${bars.map((i) => `<div class="bar ${i.kind}" style="left:${pct(i.a)}%;width:${Math.max(pct(i.b) - pct(i.a), 0.6)}%" title="${esc(label)} ${fmtTime(i.a)}–${fmtTime(i.b)}"></div>`).join("")}</div></div>`).join("")}<div class="axis">${axis.join("")}</div></div>`;
+}
+
+function renderDayHtml(ymd) {
+  const md = readNote(ymd);
+  if (!md) return `(no note for ${ymd})`;
+  const dj = path.join(CONFIG.ledgerDir, ymd, "day.json");
+  const day = fs.existsSync(dj) ? JSON.parse(fs.readFileSync(dj, "utf8")) : { ymd, sessions: [], meetings: [] };
+  const sec = sections(md);
+  const head = sec._head || "";
+  const title = (head.match(/^# (.+)$/m) || [])[1] || ymd;
+  const gen = (head.match(/^_(.+)_$/m) || [])[1] || "";
+  const threads = (sec.Threads || "").split(/\n(?=### )/).filter((t) => t.trim().startsWith("###"));
+  const prev = workingDays(addDays(ymd, -4), addDays(ymd, -1)).reverse().find((d) => readNote(d));
+  const next = workingDays(addDays(ymd, 1), addDays(ymd, 4)).find((d) => readNote(d));
+  const nav = [prev ? `<a href="${prev}.html">← ${prev}</a>` : "", `<a href="index.html">all days</a>`, next ? `<a href="${next}.html">${next} →</a>` : ""].filter(Boolean).join(" · ");
+  const body = [
+    `<h1>${esc(title)}</h1><div class="sub">${esc(gen)} · ${nav}</div>`,
+    sec.Summary ? `<div class="card summary">${mdToHtml(sec.Summary)}</div>` : "",
+    `<h2>Timeline (ET)</h2><div class="card">${timelineHtml(day) || "<p>No timing data; rerun pi-today for this day.</p>"}</div>`,
+    `<h2>Threads</h2><div class="grid">${threads.map((t) => `<div class="card">${mdToHtml(t)}</div>`).join("")}</div>`,
+    sec["Carry-over"] ? `<h2>Carry-over</h2><div class="card">${mdToHtml(sec["Carry-over"])}</div>` : "",
+    sec["Not covered by summary"] ? `<h2>Not covered by summary</h2><div class="card">${mdToHtml(sec["Not covered by summary"])}</div>` : "",
+    sec["Discovery warnings"] ? `<h2>Discovery warnings</h2><div class="card">${mdToHtml(sec["Discovery warnings"])}</div>` : "",
+    sec.Meetings ? `<details><summary>Meetings</summary><div class="card">${mdToHtml(sec.Meetings)}</div></details>` : "",
+    sec.Sessions ? `<details><summary>Sessions and exclusions</summary><div class="card">${mdToHtml(sec.Sessions)}</div></details>` : "",
+  ].join("\n");
+  const titled = (day.meetings || []).reduce((h, m) => h.split(`data-m="${m.slug}">meeting<`).join(`data-m="${m.slug}">📅 ${esc(m.title)}<`), body);
+  const out = path.join(CONFIG.outDir, `${ymd}.html`);
+  fs.writeFileSync(out, page(title, titled));
+  return out;
+}
+
+function renderWeekHtml(mdFile, days) {
+  const md = fs.readFileSync(mdFile, "utf8");
+  const sec = sections(md);
+  const head = sec._head || "";
+  const title = (head.match(/^# (.+)$/m) || [])[1] || "Week";
+  const post = sec.Post || "";
+  const dayCards = days.map((d) => {
+    const s = sections(readNote(d) || "");
+    const first = (s.Summary || "").split("\n").slice(0, 2).join(" ");
+    return `<div class="card"><h3><a href="${d}.html">${d}</a></h3><p>${inline(first.slice(0, 320))}${first.length > 320 ? "…" : ""}</p></div>`;
+  }).join("");
+  const body = [
+    `<h1>${esc(title)}</h1><div class="sub">${esc((head.match(/^_(.+)_$/m) || [])[1] || "")} · <a href="index.html">all days</a></div>`,
+    sec["Week in one paragraph"] ? `<div class="card summary">${mdToHtml(sec["Week in one paragraph"])}</div>` : "",
+    `<h2>Days</h2><div class="days">${dayCards}</div>`,
+    sec.Outcomes ? `<h2>Outcomes</h2><div class="grid">${sec.Outcomes.split(/\n(?=### )/).filter((t) => t.trim()).map((t) => `<div class="card">${mdToHtml(t)}</div>`).join("")}</div>` : "",
+    sec.Decisions ? `<h2>Decisions</h2><div class="card">${mdToHtml(sec.Decisions)}</div>` : "",
+    sec["Still open"] ? `<h2>Still open</h2><div class="card">${mdToHtml(sec["Still open"])}</div>` : "",
+    post ? `<h2>Post (copy into Slack)</h2><div class="card post">${esc(post)}</div>` : "",
+  ].join("\n");
+  const out = mdFile.replace(/\.md$/, ".html");
+  fs.writeFileSync(out, page(title, body));
+  renderIndexHtml();
+  return out;
+}
+
+function renderIndexHtml() {
+  const files = fs.readdirSync(CONFIG.outDir);
+  const days = files.filter((x) => /^\d{4}-\d{2}-\d{2}\.md$/.test(x)).map((x) => x.slice(0, 10)).sort().reverse();
+  const weeks = files.filter((x) => /^week-.*\.md$/.test(x)).sort().reverse();
+  const body = [
+    `<h1>Daily work notes</h1><div class="sub">${days.length} days</div>`,
+    weeks.length ? `<h2>Weeks</h2><div class="card"><ul>${weeks.map((w) => `<li><a href="${w.replace(/\.md$/, ".html")}">${esc(w.replace(/^week-|\.md$/g, "").replace("_", " → "))}</a></li>`).join("")}</ul></div>` : "",
+    `<h2>Days</h2><div class="days">${days.map((d) => {
+      const s = sections(readNote(d) || "");
+      const first = (s.Summary || "").split("\n")[0] || "";
+      return `<div class="card"><h3><a href="${d}.html">${d}</a></h3><p>${inline(first.slice(0, 220))}${first.length > 220 ? "…" : ""}</p></div>`;
+    }).join("")}</div>`,
+  ].join("\n");
+  const out = path.join(CONFIG.outDir, "index.html");
+  fs.writeFileSync(out, page("Daily work notes", body));
+  return out;
+}
+
+main().catch((e) => { console.error(e.stack || e.message); process.exit(1); });

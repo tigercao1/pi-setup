@@ -1,0 +1,167 @@
+#!/bin/bash
+# Read-only health check for this pi setup. Exits non-zero if any check fails.
+set -uo pipefail
+
+AGENT_DIR="${PI_AGENT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SETTINGS="$AGENT_DIR/settings.json"
+LAYER_DIR="$AGENT_DIR/../homebase"
+LAYER_NAME="$(basename "$LAYER_DIR")"
+PLIST_LABEL="com.ycao.pi-agent-caffeinate"
+FAILURES=0
+
+pass() { printf '  ok    %s\n' "$*"; }
+fail() { printf '  FAIL  %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
+warn() { printf '  warn  %s\n' "$*"; }
+section() { printf '\n%s\n' "$*"; }
+
+for tool in jq rg perl; do
+  command -v "$tool" >/dev/null 2>&1 || PATH="$AGENT_DIR/bin:$PATH"
+  command -v "$tool" >/dev/null 2>&1 || { echo "pi-doctor needs $tool" >&2; exit 2; }
+done
+
+settings_entries() {
+  jq -r --arg k "$1" '(.[$k] // [])[] | select(type == "string")' "$SETTINGS" | sed -E 's/^[+!-]//'
+}
+
+section "pi version"
+WANTED="$(tr -d '[:space:]' <"$AGENT_DIR/pi-version" 2>/dev/null)"
+HAVE="$(pi --version 2>/dev/null)"
+if [ -z "$WANTED" ]; then
+  fail "pi-version file missing or empty"
+elif [ "$HAVE" = "$WANTED" ]; then
+  pass "pi $HAVE matches pi-version"
+else
+  fail "pi ${HAVE:-not found} does not match pi-version $WANTED"
+fi
+
+section "skills resolve exactly once"
+SKILL_DIRS=("$AGENT_DIR/skills")
+while IFS= read -r entry; do
+  [ -n "$entry" ] && SKILL_DIRS+=("$AGENT_DIR/$entry")
+done < <(settings_entries skills)
+SKILL_DIRS+=("$HOME/.agents/skills")
+SKILL_LIST="$(mktemp)"
+for dir in "${SKILL_DIRS[@]}"; do
+  [ -d "$dir" ] || continue
+  for skill_md in "$dir"/*/SKILL.md; do
+    [ -f "$skill_md" ] || continue
+    name="$(awk '/^---/{n++; next} n==1 && /^name:/{sub(/^name:[ \t]*/, ""); gsub(/["\047]/, ""); print; exit}' "$skill_md")"
+    [ -n "$name" ] || name="$(basename "$(dirname "$skill_md")")"
+    printf '%s\t%s\n' "$name" "$(dirname "$skill_md")" >>"$SKILL_LIST"
+  done
+done
+DUPES="$(cut -f1 "$SKILL_LIST" | sort | uniq -d)"
+if [ -n "$DUPES" ]; then
+  while IFS= read -r dup; do
+    fail "skill '$dup' found more than once: $(awk -F'\t' -v n="$dup" '$1==n{printf "%s ", $2}' "$SKILL_LIST")"
+  done <<<"$DUPES"
+else
+  pass "$(wc -l <"$SKILL_LIST" | tr -d ' ') skills, no duplicates"
+fi
+rm -f "$SKILL_LIST"
+
+section "extension dependencies"
+for pkg in "$AGENT_DIR"/extensions/*/package.json; do
+  ext="$(dirname "$pkg")"
+  name="$(basename "$ext")"
+  if [ -d "$ext/node_modules" ]; then
+    pass "$name has node_modules"
+  elif jq -e '(.dependencies // {}) | length > 0' "$pkg" >/dev/null; then
+    fail "$name declares dependencies but has no node_modules (run bootstrap.sh)"
+  else
+    pass "$name has no runtime dependencies"
+  fi
+done
+if [ -d "$AGENT_DIR/extensions/ext-manager" ]; then
+  if [ -L "$AGENT_DIR/extensions/ext-manager/node_modules" ] && [ -d "$AGENT_DIR/extensions/ext-manager/node_modules" ]; then
+    pass "ext-manager node_modules symlink resolves"
+  else
+    fail "ext-manager/node_modules symlink missing or dangling"
+  fi
+fi
+
+section "settings.json entries exist"
+for key in skills extensions prompts themes; do
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in npm:* | git:* | http*://*) continue ;; esac
+    case "$entry" in /*) path="$entry" ;; "~/"*) path="$HOME/${entry#\~/}" ;; *) path="$AGENT_DIR/$entry" ;; esac
+    if [ -e "$path" ]; then
+      pass "$key: $entry"
+    else
+      fail "$key: $entry does not exist"
+    fi
+  done < <(settings_entries "$key")
+done
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  if [ -e "$AGENT_DIR/$entry" ]; then
+    pass "agentOrchestrator.contextExtensions: $entry"
+  else
+    fail "agentOrchestrator.contextExtensions: $entry does not exist"
+  fi
+done < <(jq -r '(.agentOrchestrator.contextExtensions // [])[] | select(type == "string")' "$SETTINGS")
+
+section "separation (no company content in the personal tree)"
+TERMS_FILE="$LAYER_DIR/separation-terms.txt"
+TERMS='/(?:Users|home)/(?!(?:user|you|me|example|someone)/)[A-Za-z0-9._-]+/'
+if [ -f "$TERMS_FILE" ]; then
+  while IFS= read -r term; do
+    case "$term" in "" | "#"*) continue ;; esac
+    TERMS="$TERMS|$term"
+  done <"$TERMS_FILE"
+else
+  warn "no company term list ($TERMS_FILE); only checking for home-directory paths"
+fi
+HITS="$(cd "$AGENT_DIR" && rg -n --no-heading --hidden --no-require-git -P "$TERMS" \
+  -g '!/.git/' -g '!/sessions/' -g '!/run/' -g '!/logs/' -g '!node_modules/' -g '!/session-bus/' \
+  -g '!/daily-ledger' -g '!/settings.json' -g '!/models.json' -g '!/company.env' -g '!/mcp.json*' \
+  -g '!/auth.json' -g '!/mcp-auth.json' -g '!/models-store.json' -g '!/trust.json' . 2>/dev/null |
+  TERMS="$TERMS" LAYER_NAME="$LAYER_NAME" perl -ne '
+    my ($loc, $text) = /^(.*?:\d+:)(.*)$/s or next;
+    (my $rest = $text) =~ s{(?:\.\.|\.pi)/\Q$ENV{LAYER_NAME}\E[\w./-]*}{}g;
+    print if $rest =~ m{$ENV{TERMS}};
+  ')"
+if [ -z "$HITS" ]; then
+  pass "no listed company terms or /Users/<name> paths (a pattern check, not a review: read new examples and narratives yourself)"
+else
+  COUNT="$(printf '%s\n' "$HITS" | wc -l | tr -d ' ')"
+  FILES="$(printf '%s\n' "$HITS" | cut -d: -f1 | sort | uniq -c | sort -rn)"
+  fail "$COUNT matching lines in:"
+  printf '%s\n' "$FILES" | sed 's/^/          /'
+  if [ "${PI_DOCTOR_VERBOSE:-0}" = 1 ]; then
+    printf '%s\n' "$HITS" | cut -c1-200 | sed 's/^/          /'
+  else
+    printf '          (PI_DOCTOR_VERBOSE=1 to list the lines)\n'
+  fi
+fi
+
+section "settings.json vs settings.base.json"
+FRAGMENT="$LAYER_DIR/settings-fragment.json"
+if [ ! -f "$AGENT_DIR/settings.base.json" ]; then
+  fail "settings.base.json missing"
+else
+  MERGE='def merge($a; $b): if ($a|type)=="object" and ($b|type)=="object" then reduce ($b|keys_unsorted[]) as $k ($a; .[$k] = merge($a[$k]; $b[$k])) elif ($a|type)=="array" and ($b|type)=="array" then $a + ($b - $a) elif $b == null then $a else $b end; merge(.[0]; .[1])'
+  if [ -f "$FRAGMENT" ]; then EXPECTED="$(jq -s "$MERGE" "$AGENT_DIR/settings.base.json" "$FRAGMENT" | jq -S .)"; else EXPECTED="$(jq -S . "$AGENT_DIR/settings.base.json")"; fi
+  if [ "$EXPECTED" = "$(jq -S . "$SETTINGS")" ]; then
+    pass "settings.json = settings.base.json + company fragment"
+  else
+    warn "settings.json has changes not in settings.base.json (or the fragment); copy personal ones into settings.base.json:"
+    diff <(printf '%s\n' "$EXPECTED") <(jq -S . "$SETTINGS") | sed 's/^/          /' | head -20
+  fi
+fi
+
+section "sleep guard"
+if launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
+  pass "launchd agent $PLIST_LABEL loaded"
+else
+  fail "launchd agent $PLIST_LABEL not loaded (run bootstrap.sh)"
+fi
+
+echo
+if [ "$FAILURES" -eq 0 ]; then
+  echo "pi-doctor: all checks passed"
+else
+  echo "pi-doctor: $FAILURES check(s) failed"
+  exit 1
+fi

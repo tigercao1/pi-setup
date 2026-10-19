@@ -1,0 +1,15 @@
+{
+  "lastChangelogVersion": "1.2.0",
+  "theme": "dark",
+  "defaultProvider": "vercel-ai-gateway",
+  "defaultModel": "anthropic/claude-opus-5.5",
+  "defaultThinkingLevel": "medium",
+  "extensions": [
+    "+extensions/ding/index.ts"
+  ],
+  "defaultTools": [
+    "+codemode",
+    "+tool_search"
+  ],
+  "hideThinkingBlock": true
+}

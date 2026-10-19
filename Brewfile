@@ -1,0 +1,11 @@
+tap "databricks/tap"
+
+brew "nvm"
+brew "gh"
+brew "circleci"
+brew "databricks/tap/databricks"
+brew "jq"
+brew "fzf"
+brew "ripgrep"
+brew "fd"
+brew "python"
