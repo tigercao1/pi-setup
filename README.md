@@ -123,16 +123,22 @@ published.
 
 The script:
 
-1. stages the hosted-package layout in a temp dir: `package.json`, the registry manifest
-   (file name from `COMPANY_REGISTRY_MANIFEST`), `.gitignore`,
-   `README.md`, and the files (`skills/<name>/…` for a skill, the extension's files at the root)
-2. finds the package's latest release tag `<name>@<version>` in the registry, warns if the default
+1. finds the source in `skills/` or `extensions/` here, then in the `skills`/`extensions`
+   directories listed in `settings.json` (so company-layer skills publish the same way)
+2. stages the hosted-package layout in a temp dir: `package.json`, the registry manifest
+   (file name from `COMPANY_REGISTRY_MANIFEST`), `.gitignore`, `README.md` (given the registry's
+   title and Install block), and the files (`skills/<name>/…` for a skill, the extension's files at
+   the root). For a skill, the company layer's `rules/skill-overlays.md` section for that skill is
+   appended as "Company specifics", so the registry copy is self-contained. For an extension,
+   `../_shared` imports are copied into the package and their import paths rewritten. Staging fails
+   if a file still references a path that only exists on this machine.
+3. finds the package's latest release tag `<name>@<version>` in the registry, warns if the default
    branch has unreleased changes to it or open PRs mention it, and prints `diff -ruN` from the
    published copy to the staged one, so changes others made are visible before overwriting them
-3. warns when the files differ but the version is already published
-4. runs the registry CLI's `publish --dry-run`, or `publish` without `--dry-run`
+4. warns when the files differ but the version is already published
+5. runs the registry CLI's `publish --dry-run`, or `publish` without `--dry-run`
 
-The registry and its CLI come from the company layer's `company.env`. `PUBLISH_CLI` overrides the CLI command (for example a source checkout run with `bun`).
+Registry consumers do not have this setup, so a published package must not depend on personal skills or paths. The registry and its CLI come from the company layer's `company.env`. `PUBLISH_CLI` overrides the CLI command (for example a source checkout run with `bun`).
 
 ## Sleep protection
 

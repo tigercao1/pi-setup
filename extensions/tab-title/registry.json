@@ -1,0 +1,15 @@
+{
+  "name": "pi-tab-title",
+  "version": "0.1.1",
+  "author": "Tiger Cao",
+  "description": "Names each pi session with a short emoji-prefixed summary of the task, generated once after the first prompt, and shows it in the terminal tab and above the prompt box. A name set with /name always wins.",
+  "tags": [
+    "terminal",
+    "session-name",
+    "tabs"
+  ],
+  "license": "UNLICENSED",
+  "exclude": [
+    "tsconfig.json"
+  ]
+}

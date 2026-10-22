@@ -1,0 +1,12 @@
+{
+  "name": "pi-notify",
+  "version": "0.1.1",
+  "author": "Tiger Cao",
+  "description": "Desktop notification when pi finishes a turn and is waiting for you. Uses OSC 9 (iTerm2), OSC 99 (Kitty) or OSC 777 (Ghostty, WezTerm), and falls back to osascript on macOS and a PowerShell toast on Windows Terminal.",
+  "tags": [
+    "notifications",
+    "terminal",
+    "macos"
+  ],
+  "license": "UNLICENSED"
+}

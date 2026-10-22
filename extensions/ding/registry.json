@@ -1,0 +1,12 @@
+{
+  "name": "pi-ding",
+  "version": "0.1.1",
+  "author": "Tiger Cao",
+  "description": "Plays a short tick when pi finishes a turn. Each pi process gets its own pitch, so you can tell several sessions apart by ear. macOS only (afplay); does nothing elsewhere.",
+  "tags": [
+    "sound",
+    "notifications",
+    "macos"
+  ],
+  "license": "UNLICENSED"
+}

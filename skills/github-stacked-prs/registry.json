@@ -1,9 +1,13 @@
 {
   "name": "github-stacked-prs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Tiger Cao",
   "description": "Manage GitHub's native stacked pull requests with the gh stack extension: cascade a rebase after changing a lower PR, insert, reorder or drop a PR mid-stack, and sync a stack onto a moved trunk without hand-rebasing each branch.",
-  "tags": ["github", "stacked-prs", "git"],
+  "tags": [
+    "github",
+    "stacked-prs",
+    "git"
+  ],
   "license": "UNLICENSED",
   "requires": "The `gh stack` extension: `gh ext install github/gh-stack`."
 }

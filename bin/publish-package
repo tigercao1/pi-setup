@@ -5,11 +5,18 @@
 #   publish-package skill/<name> [--dry-run] [--yes]
 #   publish-package extension/<name> [--dry-run] [--yes]
 #
+# The source is <agent dir>/<skills|extensions>/<name>, else <dir>/<name> for each directory listed
+# under "skills" / "extensions" in settings.json (relative to the agent dir).
 # Metadata comes from <skill|extension dir>/registry.json:
 #   { "name": "...", "version": "x.y.z", "author": "...", "description": "...", "tags": [...],
 #     "license": "UNLICENSED", "requires": "markdown for the README's Requires section",
 #     "readme": "relative path to a README to publish instead of the generated one",
-#     "exclude": ["rsync patterns left out of the package"] }
+#     "exclude": ["rsync patterns left out of the package"],
+#     "scripts": { "package.json scripts, merged over the local package.json's" } }
+# A skill whose "## <name>" section exists in the company layer's rules/skill-overlays.md gets that
+# section appended to the staged SKILL.md under "## Company specifics". An extension's imports of
+# ../_shared/* are vendored into the package as _shared/*, transitively, with specifiers rewritten.
+# A local README gets the registry title and Install section; without one, a README is generated.
 # Registry coordinates (COMPANY_REGISTRY_REPO, COMPANY_REGISTRY_CLI, COMPANY_REGISTRY_MANIFEST) come
 # from company.env here, then ../homebase/company.env; environment variables override both. PUBLISH_CLI overrides the CLI.
 set -euo pipefail
@@ -38,11 +45,52 @@ done
 KIND="${TARGET%%/*}"
 LOCAL_NAME="${TARGET#*/}"
 case "$KIND" in
-  skill | skills) KIND=skill; SRC="$AGENT_DIR/skills/$LOCAL_NAME"; TYPE_DIR="registry/pi/skills" ;;
-  extension | extensions) KIND=extension; SRC="$AGENT_DIR/extensions/$LOCAL_NAME"; TYPE_DIR="registry/pi/extensions" ;;
+  skill | skills) KIND=skill; KIND_DIR=skills; TYPE_DIR="registry/pi/skills" ;;
+  extension | extensions) KIND=extension; KIND_DIR=extensions; TYPE_DIR="registry/pi/extensions" ;;
   *) usage ;;
 esac
-[ -d "$SRC" ] || die "$SRC does not exist"
+command -v jq >/dev/null || die "needs jq"
+
+settings_dirs() {
+  local entry
+  [ -f "$AGENT_DIR/settings.json" ] || return 0
+  while IFS= read -r entry; do
+    case "$entry" in "" | -* | '!'*) continue ;; esac
+    entry="${entry#+}"
+    case "$entry" in
+      "~/"*) entry="$HOME/${entry#\~/}" ;;
+      /*) ;;
+      *) entry="$AGENT_DIR/$entry" ;;
+    esac
+    [ -d "$entry" ] && (cd "$entry" && pwd)
+  done < <(jq -r --arg k "$1" '(.[$k] // [])[] | select(type == "string")' "$AGENT_DIR/settings.json")
+  return 0
+}
+
+SEARCH_DIRS=("$AGENT_DIR/$KIND_DIR")
+while IFS= read -r dir; do SEARCH_DIRS+=("$dir"); done < <(settings_dirs "$KIND_DIR")
+SRC=""
+SRC_ROOT=""
+for dir in "${SEARCH_DIRS[@]}"; do
+  if [ -d "$dir/$LOCAL_NAME" ]; then
+    SRC="$(cd "$dir/$LOCAL_NAME" && pwd)"
+    SRC_ROOT="$dir"
+    break
+  fi
+done
+[ -n "$SRC" ] || die "$LOCAL_NAME not found in: ${SEARCH_DIRS[*]}"
+
+COMPANY_DIR=""
+LAYER_CANDIDATES=()
+[ "$SRC_ROOT" != "$AGENT_DIR/$KIND_DIR" ] && LAYER_CANDIDATES+=("$SRC_ROOT/..")
+while IFS= read -r dir; do LAYER_CANDIDATES+=("$dir/.."); done < <(settings_dirs skills)
+LAYER_CANDIDATES+=("$AGENT_DIR/../homebase")
+for dir in "${LAYER_CANDIDATES[@]}"; do
+  if [ -f "$dir/rules/skill-overlays.md" ]; then
+    COMPANY_DIR="$(cd "$dir" && pwd)"
+    break
+  fi
+done
 SIDECAR="$SRC/registry.json"
 [ -f "$SIDECAR" ] || die "$SIDECAR missing; it holds name, version, author, description, tags"
 
@@ -75,7 +123,7 @@ CLI="${PUBLISH_CLI:-${COMPANY_REGISTRY_CLI:-}}"
 [ -n "$CLI" ] || die "COMPANY_REGISTRY_CLI is not set (../homebase/company.env or environment)"
 MANIFEST="${COMPANY_REGISTRY_MANIFEST:-}"
 [ -n "$MANIFEST" ] || die "COMPANY_REGISTRY_MANIFEST is not set (../homebase/company.env or environment)"
-for tool in jq gh rsync diff tar; do command -v "$tool" >/dev/null || die "needs $tool"; done
+for tool in jq gh rsync diff tar python3; do command -v "$tool" >/dev/null || die "needs $tool"; done
 
 meta() { jq -r --arg k "$1" '.[$k] // empty' "$SIDECAR"; }
 NAME="$(meta name)"
@@ -103,43 +151,176 @@ if [ "${#PROBLEMS[@]}" -gt 0 ]; then
   exit 1
 fi
 
+append_overlay() {
+  python3 - "$@" <<'PY'
+import sys
+overlays, name, skill = sys.argv[1:4]
+section, inside, fence = [], False, False
+for line in open(overlays, encoding="utf-8").read().splitlines():
+    if line.startswith("```"):
+        fence = not fence
+    if not fence and line.startswith("## "):
+        inside = line[3:].strip() == name
+        continue
+    if inside:
+        section.append(line)
+body = "\n".join(section).strip("\n")
+if body.strip():
+    text = open(skill, encoding="utf-8").read().rstrip("\n")
+    open(skill, "w", encoding="utf-8").write(f"{text}\n\n## Company specifics\n\n{body}\n")
+    print(f"publish-package: appended '## {name}' from {overlays} to SKILL.md as '## Company specifics'")
+PY
+}
+
+vendor_shared() {
+  python3 - "$@" <<'PY'
+import json, os, re, shutil, sys
+src, stage, shared, builtins = sys.argv[1], sys.argv[2], os.path.realpath(sys.argv[3]), set(json.loads(sys.argv[4]))
+src = os.path.realpath(src)
+spec_re = re.compile(r"""(\b(?:from|import)\s*\(?\s*)(["'])([^"'\n]+)\2""")
+code_ext = (".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".tsx", ".jsx")
+vendor = os.path.join(stage, "_shared")
+if os.path.exists(vendor):
+    sys.exit(f"publish-package: {src} already has a _shared/ entry; cannot vendor ../_shared into it")
+
+def within(path, root):
+    return path == root or path.startswith(root + os.sep)
+
+queue = []
+for root, dirs, files in os.walk(stage):
+    dirs[:] = [d for d in dirs if d != "node_modules"]
+    for f in files:
+        if f.endswith(code_ext):
+            staged = os.path.join(root, f)
+            queue.append((staged, os.path.join(src, os.path.relpath(staged, stage))))
+
+bare, seen = set(), set()
+while queue:
+    staged, origin = queue.pop()
+    if staged in seen:
+        continue
+    seen.add(staged)
+    text = open(staged, encoding="utf-8").read()
+
+    def rewrite(m):
+        spec = m.group(3)
+        if not spec.startswith("."):
+            if not spec.startswith("node:") and spec.split("/")[0] not in builtins:
+                parts = spec.split("/")
+                bare.add("/".join(parts[:2]) if spec.startswith("@") else parts[0])
+            return m.group(0)
+        target = os.path.realpath(os.path.join(os.path.dirname(origin), spec))
+        if within(target, src):
+            return m.group(0)
+        if not within(target, shared):
+            sys.exit(f"publish-package: {origin} imports {spec}, outside the extension and ../_shared")
+        if not os.path.isfile(target):
+            sys.exit(f"publish-package: {origin} imports {spec}, which does not exist")
+        dest = os.path.join(vendor, os.path.relpath(target, shared))
+        if not os.path.exists(dest):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(target, dest)
+            print(f"publish-package: vendored ../_shared/{os.path.relpath(target, shared)}", file=sys.stderr)
+        queue.append((dest, target))
+        new = os.path.relpath(dest, os.path.dirname(staged))
+        if not new.startswith("."):
+            new = "./" + new
+        return f"{m.group(1)}{m.group(2)}{new}{m.group(2)}"
+
+    out = spec_re.sub(rewrite, text)
+    if out != text:
+        open(staged, "w", encoding="utf-8").write(out)
+print(json.dumps(sorted(bare)))
+PY
+}
+
+registry_readme() {
+  python3 - "$@" <<'PY'
+import sys
+path, name, install = sys.argv[1:4]
+lines = open(path, encoding="utf-8").read().rstrip("\n").split("\n")
+fence, title, first_h2, has_install = False, None, None, False
+for i, line in enumerate(lines):
+    if line.startswith("```"):
+        fence = not fence
+    if fence:
+        continue
+    if title is None and line.startswith("# "):
+        title = i
+    elif line.startswith("## "):
+        first_h2 = i if first_h2 is None else first_h2
+        has_install = has_install or line.strip() == "## Install"
+if title is None:
+    lines[:0] = [f"# {name}", ""]
+    first_h2 = None if first_h2 is None else first_h2 + 2
+else:
+    lines[title] = f"# {name}"
+if not has_install:
+    block = ["## Install", ""] + install.rstrip("\n").split("\n") + [""]
+    if first_h2 is None:
+        lines += [""] + block[:-1]
+    else:
+        lines[first_h2:first_h2] = block
+open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
+}
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/publish-package.XXXXXX")"
 STAGE="$WORK/staged"
 PUBLISHED="$WORK/published"
 mkdir -p "$STAGE"
 
-EXCLUDES=(--exclude registry.json --exclude node_modules/ --exclude .git/ --exclude .DS_Store
+EXCLUDES=(--exclude registry.json --exclude node_modules --exclude .git/ --exclude .DS_Store
   --exclude __pycache__/ --exclude '*.pyc' --exclude dist/)
 while IFS= read -r pattern; do
   [ -n "$pattern" ] && EXCLUDES+=(--exclude "$pattern")
 done < <(jq -r '(.exclude // [])[]' "$SIDECAR")
 [ -n "$README_SRC" ] && EXCLUDES+=(--exclude "/$README_SRC")
 
+SHARED_DIR="$(dirname "$SRC")/_shared"
+SHARED_PKG='{}'
+IMPORTS='[]'
 if [ "$KIND" = skill ]; then
   mkdir -p "$STAGE/skills/$LOCAL_NAME"
   rsync -a "${EXCLUDES[@]}" "$SRC/" "$STAGE/skills/$LOCAL_NAME/"
   PI_FIELD='{"skills": ["./skills"]}'
   LOCAL_PKG='{}'
+  if [ -n "$COMPANY_DIR" ]; then
+    append_overlay "$COMPANY_DIR/rules/skill-overlays.md" "$LOCAL_NAME" "$STAGE/skills/$LOCAL_NAME/SKILL.md"
+  fi
 else
   rsync -a "${EXCLUDES[@]}" --exclude /package.json "$SRC/" "$STAGE/"
   if [ -f "$SRC/package.json" ]; then LOCAL_PKG="$(cat "$SRC/package.json")"; else LOCAL_PKG='{}'; fi
+  [ -f "$SHARED_DIR/package.json" ] && SHARED_PKG="$(cat "$SHARED_DIR/package.json")"
   PI_FIELD="$(jq -c '.pi // {"extensions": ["./index.ts"]}' <<<"$LOCAL_PKG")"
+  IMPORTS="$(vendor_shared "$SRC" "$STAGE" "$SHARED_DIR" "$(node -p 'JSON.stringify(require("module").builtinModules)' 2>/dev/null || echo '[]')")"
 fi
 
 jq -n --arg name "$NAME" --arg version "$VERSION" --arg description "$DESCRIPTION" \
   --arg license "$LICENSE" --arg kind "$KIND" --argjson pi "$PI_FIELD" \
-  --argjson local "$LOCAL_PKG" --argjson host "$HOST_PACKAGES" --slurpfile meta "$SIDECAR" '
-  ($local.dependencies // {}) as $deps
+  --argjson local "$LOCAL_PKG" --argjson shared "$SHARED_PKG" --argjson imports "$IMPORTS" \
+  --argjson host "$HOST_PACKAGES" --slurpfile meta "$SIDECAR" '
+  def sorted: to_entries | sort_by(.key) | from_entries;
+  (($shared.dependencies // {}) + ($local.dependencies // {})) as $known
+  | ($local.dependencies // {}) as $deps
   | ($deps | with_entries(select(.key as $k | $host | index($k)))) as $hostDeps
-  | ($deps | with_entries(select(.key as $k | $host | index($k) | not))) as $ownDeps
+  | (($deps | with_entries(select(.key as $k | $host | index($k) | not)))
+     + ([$imports[] | select(. as $k | $host | index($k) | not) | {key: ., value: $known[.]}]
+        | map(select(.value != null)) | from_entries)) as $ownDeps
+  | ([$imports[] | select(. as $k | $host | index($k)) | {key: ., value: "*"}] | from_entries) as $hostImports
+  | (($local.scripts // {}) + ($meta[0].scripts // {})) as $scripts
   | {name: $name, version: $version, description: $description, type: "module",
      keywords: (["pi-package"] + $meta[0].tags), license: $license, pi: $pi}
-  + (if ($ownDeps | length) > 0 then {dependencies: $ownDeps} else {} end)
+  + (if ($scripts | length) > 0 then {scripts: $scripts} else {} end)
+  + (if ($ownDeps | length) > 0 then {dependencies: ($ownDeps | sorted)} else {} end)
   + (if $kind == "extension" then
-       {peerDependencies: ({"@earendil-works/pi-coding-agent": "*"} + ($hostDeps | map_values("*")) + ($local.peerDependencies // {})),
-        devDependencies: ({"@earendil-works/pi-coding-agent": "*"} + ($local.devDependencies // {}))}
+       {peerDependencies: ({"@earendil-works/pi-coding-agent": "*"} + $hostImports + ($hostDeps | map_values("*")) + ($local.peerDependencies // {}) | sorted),
+        devDependencies: ({"@earendil-works/pi-coding-agent": "*"} + $hostImports + ($hostDeps | map_values("*")) + ($local.devDependencies // {}) | sorted)}
      else {} end)
 ' >"$STAGE/package.json"
+UNDECLARED="$(jq -r --argjson imports "$IMPORTS" --argjson host "$HOST_PACKAGES" \
+  '$imports - $host - ((.dependencies // {}) | keys) | .[]' "$STAGE/package.json")"
+[ -z "$UNDECLARED" ] || die "imports with no version in $SRC/package.json or $SHARED_DIR/package.json: $UNDECLARED"
 
 jq -n --arg type "$KIND" --arg license "$LICENSE" --slurpfile meta "$SIDECAR" '
   $meta[0] as $m
@@ -149,23 +330,39 @@ jq -n --arg type "$KIND" --arg license "$LICENSE" --slurpfile meta "$SIDECAR" '
 
 printf 'node_modules/\ndist/\n' >"$STAGE/.gitignore"
 
+install_text() {
+  printf '```bash\n%s add %s\n```\n\n' "${COMPANY_REGISTRY_CLI:-$CLI}" "$NAME"
+  if [ "$KIND" = skill ]; then
+    printf 'Restart pi, or run `/reload`. The agent loads the skill when a task matches its description, or run\n`/skill:%s` to load it yourself.\n' "$LOCAL_NAME"
+  else
+    printf 'Restart pi, or run `/reload`.\n'
+  fi
+}
+
 if [ -n "$README_SRC" ]; then
   [ -f "$SRC/$README_SRC" ] || die "readme $SRC/$README_SRC not found"
   cp "$SRC/$README_SRC" "$STAGE/README.md"
-elif [ ! -f "$STAGE/README.md" ]; then
+fi
+if [ -f "$STAGE/README.md" ]; then
+  INSTALL_TEXT="$(install_text)"
+  registry_readme "$STAGE/README.md" "$NAME" "$INSTALL_TEXT"
+else
   {
-    printf '# %s\n\n%s\n\n## Install\n\n```bash\n%s add %s\n```\n\n' "$NAME" "$DESCRIPTION" "${COMPANY_REGISTRY_CLI:-$CLI}" "$NAME"
-    if [ "$KIND" = skill ]; then
-      printf 'Restart pi, or run `/reload`. The agent loads the skill when a task matches its description, or run\n`/skill:%s` to load it yourself.\n' "$LOCAL_NAME"
-    else
-      printf 'Restart pi, or run `/reload`.\n'
-    fi
+    printf '# %s\n\n%s\n\n## Install\n\n' "$NAME" "$DESCRIPTION"
+    install_text
     [ -n "$REQUIRES" ] && printf '\n## Requires\n\n%s\n' "$REQUIRES"
   } >"$STAGE/README.md"
 fi
 
+LAYER_NAME="$(basename "${COMPANY_DIR:-$AGENT_DIR/../homebase}")"
+LEAKS="$(cd "$STAGE" && grep -rnE "\.pi/$LAYER_NAME|\.pi/agent/skills/|tiger-voice|/Users/[A-Za-z0-9._-]+/" . || true)"
+if [ -n "$LEAKS" ]; then
+  printf '%s\n' "$LEAKS" | sed 's/^/  /' >&2
+  die "staged files reference paths only this machine has (listed above); registry users do not have them. Staged files left in $WORK"
+fi
+
 heading "staged $KIND $LOCAL_NAME as $NAME@$VERSION in $STAGE"
-(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort | while IFS= read -r f; do
+(cd "$STAGE" && find . -not -type d | sed 's|^\./||' | sort | while IFS= read -r f; do
   printf '  %7s  %s\n' "$(wc -c <"$f" | tr -d ' ')" "$f"
 done)
 

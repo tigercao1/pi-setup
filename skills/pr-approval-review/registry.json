@@ -1,0 +1,11 @@
+{
+  "name": "pr-approval-review",
+  "version": "0.1.1",
+  "author": "Tiger Cao",
+  "description": "Review a pull request to answer one question: what must happen before it can be approved? Returns an approve, comment, or request-changes verdict with copy-paste review comments, and keeps out-of-scope suggestions in a separate follow-ups list.",
+  "tags": [
+    "code-review",
+    "pull-requests"
+  ],
+  "license": "UNLICENSED"
+}

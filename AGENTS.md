@@ -87,7 +87,7 @@ When asked to copy a Slack message to the clipboard, always use the `slack-copy`
 
 When I ask for a review of a PR or diff ("review this PR", a PR URL, "review this as well"), do not
 review it inline on the lead's model. Spawn one worker with `profile: "code-review"` (pinned to
-`openai/gpt-6.1-sol`), `skills: ["pr-approval-review", "github-cli"]`, `extensions: ["mcp"]` so it can
+`openai/gpt-6.1-sol`), `skills: ["pr-approval-review", "github-cli", "tiger-voice", "clear-message"]`, `extensions: ["mcp"]` so it can
 reach Linear, Datadog and Sentry, and `contextFiles: true`. Give it the PR URL, the head SHA, and
 the instruction to follow `pr-approval-review` and write its verdict to a file. Do not add your own
 reading of the PR to the brief. Then end the turn. When its report arrives, relay the verdict and

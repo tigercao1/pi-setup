@@ -147,7 +147,7 @@ If the PR is not review-ready because required UI evidence, tests, or domain val
 
 ## Comment style
 
-The comments under **Comments to post** are pasted by Tiger under his own name, so write them in his voice: read `~/.pi/agent/skills/tiger-voice/SKILL.md` and its `examples.md` first. Where they conflict with the template below, the voice skill wins (for example: no `:warning:` prefix, no bold title, observation or question instead of an instruction). The verdict and **To approve** list keep this skill's shape; only the comment wording follows the voice skill.
+If the person who will post the comments under **Comments to post** has a writing-voice skill or rule, its wording rules win over this template's wording (for example, it may drop the `:warning:` prefix or turn an instruction into an observation or question). The verdict and **To approve** list keep this skill's shape; only the comment wording follows the voice rule.
 
 The template below describes what a comment must establish, not its wording:
 
