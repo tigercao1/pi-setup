@@ -19,8 +19,12 @@ input available and the most persuasive.
 5. **Coverage** (the expensive one, use a strong model, fresh context): do the children's
    `DONE WHEN` bullets *together* satisfy the parent's? This is the only thing standing between
    you and several tidy PRs that do not add up.
+6. Touch test: every unit names the curl command or browser step that shows its behaviour once
+   merged. A unit that names only specs is a layer, not a slice. Re-split it.
+7. Contract ownership: every endpoint in the design's architecture section is created by exactly
+   one unit, and that unit lands no later than the first unit whose FE calls it.
 
-> **Run checks 1–4 as a script, never by eye.** Set operations are only free if a machine computes
+> **Run checks 1–4, 6 and 7 as a script, never by eye.** Set operations are only free if a machine computes
 > them. An LLM asserting "allowlists are disjoint ✅" without computing the intersection is how two
 > contradictory units get scheduled into the same wave. Emit a `check-overlap.py` beside `tree.md`
 > and paste its real output.
@@ -54,7 +58,8 @@ spurious, because you sampled after the worker already fixed it.
 
 Before any unit gate:
 
-1. Record the SHA under review. Put it in the ledger.
+1. Record the SHA under review. Put it in the ledger as a verdict row keyed
+   `verdict · PR# · head SHA` (format in `ledger.md`). A new head voids the row; gate again.
 2. Read that SHA, not the tree: `git show <sha>:<path>`, `git diff <sha>^..<sha>`.
 3. Re-check `team_status` after gating. If the worker advanced past your SHA, your verdict is
    stale — re-gate against the new head.
@@ -71,20 +76,29 @@ the tree as it is *now*, not against the commit you believe you are reviewing.
 
 A unit is NOT done when the draft PR opens. Opening the PR starts the gate.
 
-1. Spawn an independent reviewer: `profile: code-review` (a different model from the
-   implementer — currently `openai/gpt-6.1-sol`) with skills `["pr-approval-review", "github-cli"]`.
-2. Give it the **explicit SHA range**, never `HEAD^..HEAD`, and the unit's scope boundary, so it
-   does not block on work that later units own.
-3. It reviews the **code and the description** (see the description standard in `lanes.md`).
-   It must never post to GitHub — verdict and copy-paste text come back to the human.
-4. **Blocking items go back to the implementing worker** as new commits, not as a rewrite of the
+1. Run the `pr-review-gate` skill's procedure ("Running the gate"), not a reviewer spawn of your
+   own. Its lane script picks approval, convention, necessity and blast-radius; its spawn script
+   clears each reviewer, records each verdict against the spawn it cleared, and enforces 3 rounds
+   and 12 spawns. Point it at the mission with `--dir <mission> --pr <n>`, so the state file is
+   `<mission>/gate/<pr>.json`. That file is the authority for lanes, verdicts, rounds and
+   escalations; the ledger row points at it and does not keep its own count.
+2. Give each reviewer the unit's scope boundary, so it does not block on work that later units
+   own. Every lane reviews the whole PR at its head, code and description (see the description
+   standard in `lanes.md`). Reviewers never post to GitHub; verdicts and copy-paste text come back
+   to the human.
+3. **Blocking items go back to the implementing worker** as new commits, not as a rewrite of the
    commits a reviewer already read. Force-push is not itself forbidden: rebasing a **stale** branch
    onto `origin/main` with `--force-with-lease` is expected, and if no review is recorded on the PR
    yet there is no reviewer diff to preserve, so rebase freely. Always rebase a stale branch rather
-   than merging `main` into it.
-   Then re-review. **Max 3 rounds**, then escalate with the unresolved item.
-5. Non-blocking suggestions are recorded as follow-ups, not actioned. A review loop that
+   than merging `main` into it. After each push, the gate's delta script decides which lanes
+   re-run. At the budget, or on an escalation the gate raises, stop and escalate with the
+   unresolved items it lists.
+4. Non-blocking suggestions are recorded as follow-ups, not actioned. A review loop that
    implements every optional suggestion is scope creep with a second opinion attached.
+
+The unit gate and the PR gate keep separate state. A new head voids a unit gate row (above). PR
+lane verdicts are carried to a new head only when the gate's delta script says so, and only in the
+gate's state file; never copy a carried PR verdict into a unit gate row.
 
 Distinguish the two checks and run both — they fail differently:
 

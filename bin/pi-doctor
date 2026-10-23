@@ -34,6 +34,25 @@ else
   fail "pi ${HAVE:-not found} does not match pi-version $WANTED"
 fi
 
+section "qmd version"
+QMD_WANTED="$(tr -d '[:space:]' <"$AGENT_DIR/qmd-version" 2>/dev/null)"
+QMD_HAVE="$(qmd --version 2>/dev/null | awk '{print $2}')"
+if [ -z "$QMD_WANTED" ]; then
+  fail "qmd-version file missing or empty"
+elif [ "$QMD_HAVE" = "$QMD_WANTED" ]; then
+  pass "qmd $QMD_HAVE matches qmd-version"
+else
+  fail "qmd ${QMD_HAVE:-not found} does not match qmd-version $QMD_WANTED (run bootstrap.sh)"
+fi
+while IFS= read -r name; do
+  out="${QMD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/qmd}/$name.yml"
+  if [ -f "$out" ] && cmp -s <("$AGENT_DIR/qmd/render" "$name") "$out"; then
+    pass "qmd index '$name' config matches qmd/render $name (its template plus local additions)"
+  else
+    fail "qmd index '$name' config missing or out of date (run bootstrap.sh)"
+  fi
+done < <("$AGENT_DIR/qmd/render" --list)
+
 section "skills resolve exactly once"
 SKILL_DIRS=("$AGENT_DIR/skills")
 while IFS= read -r entry; do

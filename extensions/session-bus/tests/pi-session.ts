@@ -165,7 +165,7 @@ await test("queue: nothing starts, the note rides along with the next prompt", a
 		},
 	]);
 	const target = { ...r.entry, address: bus.sessionAddressFor(r.key) };
-	const m = bus.send(target, sender, { note: "QUEUE-NOTE" });
+	const m = bus.send(target, sender, { note: "QUEUE-NOTE", delivery: "queue" });
 	const ack = await bus.waitForAck(m.id, { timeoutMs: 4000 });
 	assert.equal(ack?.status, "queued");
 	await sleep(500);

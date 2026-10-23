@@ -261,6 +261,7 @@ true parent it drops to `+300`. **If a PR's diff looks bigger than the work it c
 ## Designing stacks to avoid this
 
 - **Appending is free; inserting is expensive.** Decide the slice boundaries before opening PRs.
+- **Order the stack so it proves itself:** subtraction first, failing test before fix, legacy deletion last.
 - Merge **bottom-up and promptly** — a long-lived deep stack multiplies every restack.
 - A PR carrying a cherry-picked commit from a lower PR will shed it on rebase once that
   lower PR merges. Say so in the body so reviewers do not review it twice.

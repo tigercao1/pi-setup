@@ -1,0 +1,39 @@
+# Session-export segments for pi-memory-export. The company layer's qmd/segments.tsv is read first.
+# kind	pattern	segment	[min hits]
+# skip: never exported. path: cwd equals the glob or sits under it. remote: substring of the
+# origin URL of the cwd's git repo. mixed: cwd exactly; the first matching strong rule wins, then the
+# segment with the highest signal score, else this one. strong/signal match user turns, the worker
+# assignment, the session name and tool-call lines. Single sessions are pinned in session-overrides.tsv.
+# fallback: everything still unmatched.
+skip	/private/tmp*
+skip	/private/var*
+skip	/var/folders*
+skip	/tmp*
+path	$HOME/.pi/agent	pi
+path	$HOME/.pi/orchestrator-teams	pi
+path	$HOME/Documents/knowledge-base-remote/Pi	pi
+path	$HOME/Documents/knowledge-base-remote/pi-extensions	pi
+path	$HOME/files/ssms-*	ssms
+path	$HOME/Documents/knowledge-base-remote/SSMS	ssms
+path	$HOME/Documents/knowledge-base-remote/ssnow-management-system-plan	ssms
+path	$HOME/projects/financial-analyst-agent	financial-analyst-agent
+path	$HOME/projects/fa-*	financial-analyst-agent
+path	$HOME/Documents/knowledge-base-remote/financial-analyst-agent	financial-analyst-agent
+path	$HOME/files/carpool	carpool
+path	$HOME/Documents/knowledge-base-remote/Carpool	carpool
+path	$HOME/files/urban-dollop	urban-dollop
+remote	tigercao1/ssms-	ssms
+remote	tigercao1/financial-analyst-agent	financial-analyst-agent
+remote	tigercao1/urban-dollop	urban-dollop
+remote	/carpool	carpool
+path	$HOME/files/wt/*-api*	ssms
+path	$HOME/files/wt/*-portal*	ssms
+signal	^(edit|write) .*"path": "(~|$HOME)/\.pi/agent/	pi	1	100
+signal	^(edit|write) .*"path": "(~|$HOME)/Documents/knowledge-base-remote/(Pi|pi-extensions)/	pi	1	100
+signal	ssms-(api|portal)	ssms	3
+signal	financial-analyst-agent|/projects/fa-	financial-analyst-agent	3
+mixed	$HOME	pi
+mixed	$HOME/files	misc
+mixed	$HOME/files/wt	misc
+mixed	$HOME/projects	financial-analyst-agent
+fallback		misc

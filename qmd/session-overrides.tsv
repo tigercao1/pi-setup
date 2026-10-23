@@ -1,0 +1,3 @@
+# Sessions to export to a personal segment, whatever their cwd or content says.
+# The company layer's qmd/session-overrides.tsv is read first and wins for any session it names.
+# session id<TAB>segment

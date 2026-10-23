@@ -29,6 +29,7 @@ import {
 	reapRetentionMs,
 	buildSystemPrompt,
 	defaultContextFiles,
+	resolveSkillPath,
 	defaultSkills,
 	NAMED_PROFILES,
 	orchLevel,
@@ -50,6 +51,8 @@ import { buildViews, countsLine, countStates, displayState, STATE_ICON, subtreeO
 import { runSkeptics, SKEPTIC_LABEL } from "./verify.ts";
 import { type CapHit, claim, countCapHit, countLive, enqueue, holdsSlot, listQueue, queuePosition } from "./caps.ts";
 import { ensureDir } from "../_shared/fsjson.ts";
+import { absoluteContract, checkDone, invalidRequiredFields, missingFields, normalisePath } from "./contract.ts";
+import { type GateReservation, gateShapeError, gateTrigger, runGate } from "./gate.ts";
 import { askLine, askWithRetry, dismissAsks, finishAsk, isOwed, runAsk, startAsk, visibleAsks } from "./ask.ts";
 import {
 	type AgentRecord,
@@ -102,6 +105,14 @@ const ContractSchema = Type.Object({
 	),
 	passDefinition: Type.Optional(Type.String()),
 	failDefinition: Type.Optional(Type.String()),
+	requiredFields: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Strings the deliverable must contain, checked by team_await: a literal (case-insensitive) such as " +
+				"'head SHA' or 'method:', or a regex written '/pattern/flags' such as '/\\b[0-9a-f]{7,40}\\b/'. " +
+				"A done agent whose deliverable misses one is reported as GAP. Presence only, not truth.",
+		}),
+	),
 });
 
 export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
@@ -116,13 +127,24 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 			description:
 				"Spawn a teammate agent in its own process (and pane, when a multiplexer is available). " +
 				"Returns as soon as the agent starts — it works in parallel while you stay responsive. " +
-				"Always give a self-contained task and a taskContract with an outputPath.",
+				"Always give a self-contained task and a taskContract with an outputPath. " +
+				"Nothing is inherited: skills, extensions and contextFiles are off under slim unless passed, " +
+				"for every worker and grandchild. team_recycle replays the original spawn's channels.",
 			promptSnippet: "Spawn a teammate agent to work on a task in parallel",
 			promptGuidelines: [
 				"Use team_spawn to delegate any large, parallelisable, or high-token task instead of doing it inline.",
 				"Every team_spawn task must be self-contained: the teammate cannot see your conversation.",
 				"After team_spawn, never block waiting for teammates: do not call sleep, do not poll team_status in a loop. " +
 					"End your turn instead — teammate messages arrive on their own and wake you, and the human can keep working meanwhile.",
+				"Give every team_spawn worker a taskContract with an absolute outputPath (a spawn without one returns a WARNING), " +
+					"and requiredFields for anything the result must name (SHAs, method, sources) so team_await can flag a GAP.",
+				"Pass each team_spawn channel explicitly at every spawn: skills (names only, the body is not injected; tell the worker to read it), " +
+					"extensions: ['mcp'] for Linear/Confluence/Slack/Sentry/Datadog, contextFiles: true for house rules and repo conventions. " +
+					"None is inherited by a grandchild; team_recycle keeps the ones the original spawn was given.",
+				"A team_spawn WARNING about unresolved skills means the worker will not get them: fix the name or move the skill into a pi skill directory and respawn. " +
+					"A resolved skill is still not a read one: confirm by grepping the worker log for the skill path before trusting work that depends on it.",
+				"A spawn result is not proof the worker is healthy. A startup crash arrives as a 'Spawn failed' message; " +
+					"an agent that exits without reporting shows as GAP in team_await. Recycle it once with a handoff telling it to checkpoint early, then treat a second miss as a gap.",
 			],
 			parameters: Type.Object({
 				name: Type.String({ description: "Unique agent name, e.g. 'auth-refactor'" }),
@@ -160,13 +182,19 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				),
 				extensions: Type.Optional(
 					Type.Array(Type.String(), {
-						description: "Extra extensions to load (names under ~/.pi/agent/extensions or paths)",
+						description:
+							"Extra extensions to load (names under ~/.pi/agent/extensions or paths). Off under slim unless passed. " +
+							"Pass ['mcp'] for any task that reads Linear, Confluence, Slack, Sentry, Datadog or similar: without it the worker " +
+							"cannot fetch the source and will improvise. 'mcp' expands to builtin:mcp, builtin:codemode and builtin:tool-search; " +
+							"its tools are named mcp__<server>__<tool> and are reached through tool_search or a codemode script. " +
+							"Replaces the profile's extensions when given.",
 					}),
 				),
 				slim: Type.Optional(
 					Type.Boolean({
 						description:
-							"Default true: strip skills/extensions/context files the agent does not need. false gives the agent your full context.",
+							"Default true: the agent starts with no skills, extensions or context files except the ones passed in " +
+							"skills, extensions and contextFiles (or its profile). false gives the agent your full context; expensive, prefer naming what it needs.",
 					}),
 				),
 				visible: Type.Optional(
@@ -178,18 +206,49 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				contextFiles: Type.Optional(
 					Type.Boolean({
 						description:
-							"Keep AGENTS.md/CLAUDE.md repo conventions in the agent's context. Set true for any task that writes code, commits, or opens a PR.",
+							"Keep AGENTS.md/CLAUDE.md (house rules and repo conventions) in the agent's context. Off by default. " +
+							"Set true for any task that writes code, commits, or opens a PR, and for every sub-orchestrator: " +
+							"without it a manager does not follow the house process rules.",
 					}),
 				),
 				skills: Type.Optional(
 					Type.Array(Type.String(), {
 						description:
-							"Skills to load by name (e.g. 'my-skill') or path. Survives slim, " +
-							"which otherwise strips all skills. Name every skill the task depends on.",
+							"Skills to load by name (e.g. 'my-skill') or absolute path, never a repo-relative path. Survives slim, " +
+							"which otherwise strips all skills. Name every skill the task depends on. Only the name, description " +
+							"and path reach the agent; the body is NOT in its prompt, so tell it to read the file. Names resolve from " +
+							"the agent's cwd, then ~/.pi/agent/skills and the settings skill directories; unresolved names are listed " +
+							"as a WARNING in the spawn result.",
 					}),
 				),
 				cwd: Type.Optional(Type.String({ description: "Working directory for the agent" })),
 				taskContract: Type.Optional(ContractSchema),
+				gate: Type.Optional(
+					Type.Object(
+						{
+							state: Type.String({ description: "Absolute path to the PR's gate state JSON" }),
+							spawnId: Type.String({ description: "The spawn_id printed by `pr-gate-spawn.sh check` for this lane" }),
+						},
+						{
+							description:
+								"PR review gate reservation. team_spawn runs `pr-gate-spawn.sh verify` (the reservation exists, is for the " +
+								"PR's recorded head, has no verdict and is not bound to another agent), then `bind` to record this agent " +
+								"on it, and refuses the spawn otherwise. Required, unless gateExempt is given, for a gate-lane spawn: " +
+								"any profiled spawn whose effective skills (profile skills from the built-in profile and settings team.profiles, " +
+								"plus explicit skills and team.defaultSkills) include 'pr-approval-review', which covers every 'code-review' " +
+								"and 'reviewer' spawn; or a 'code-review'/'reviewer' task that mentions 'pr-review-gate' or 'gate lane'. " +
+								"verifier and verifier-mcp spawns are unaffected unless pr-approval-review is passed to them.",
+						},
+					),
+				),
+				gateExempt: Type.Optional(
+					Type.String({
+						description:
+							"Reason a gate-shaped spawn (see gate) runs outside the PR review gate, e.g. 'review requested by Tiger' for a " +
+							"review the user asked for directly, or 'ledger trail review'. Stored on the agent record and replayed by " +
+							"team_recycle. Use gate instead for pr-review-gate lanes.",
+					}),
+				),
 			}),
 			async execute(_id, params) {
 				return text(spawnOne(rt, params as SpawnParams));
@@ -347,7 +406,8 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 		label: "Write status",
 		description:
 			"Write your status file so your parent can see progress without interrupting you. " +
-			"Call with 'done' and an output path when your deliverable is written.",
+			"Call with 'done' and an output path when your deliverable is written. " +
+			"'done' is refused unless that file exists, is non-empty, and is your contract's outputPath when you have one.",
 		parameters: Type.Object({
 			state: StringEnum(["active", "done", "stuck", "error"] as const),
 			output: Type.Optional(Type.String({ description: "Path to your deliverable" })),
@@ -361,8 +421,13 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 			};
 			const team = rt.team;
 			if (!team) return text("No team — status not recorded.");
-			writeStatus(team, { agent: rt.me, state, output, note });
-			return text(`Status recorded: ${state}${output ? ` → ${output}` : ""}`);
+			if (state === "done") {
+				const problem = checkDone(output, readContract(team, rt.me), rt.cwd);
+				if (problem) return text(`ERROR: status NOT recorded: ${problem}`);
+			}
+			const recorded = output ? normalisePath(output, rt.cwd) : undefined;
+			writeStatus(team, { agent: rt.me, state, output: recorded, note });
+			return text(`Status recorded: ${state}${recorded ? ` → ${recorded}` : ""}`);
 		},
 	});
 
@@ -496,7 +561,8 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 		label: "Recycle agent",
 		description:
 			"Kill an agent and spawn a fresh replacement under the same name, seeded with its handoff report. " +
-			"Ask the agent for team_write_handoff first so its partial work survives.",
+			"Ask the agent for team_write_handoff first so its partial work survives. Carries over the task, contract, " +
+			"model, profile and the spawn's skills, extensions, contextFiles and slim.",
 		parameters: Type.Object({
 			name: Type.String(),
 			additionalContext: Type.Optional(
@@ -537,8 +603,14 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				provider: old.provider,
 				thinkingLevel: old.thinkingLevel,
 				profile: old.profile,
+				skills: old.skills,
+				extensions: old.extensions,
+				contextFiles: old.contextFiles,
+				slim: old.slim,
 				visible: old.visible,
 				cwd: old.cwd,
+				gate: old.gate,
+				gateExempt: old.gateExempt,
 				taskContract: readContract(config.team, name) ?? undefined,
 				handoff: handoffText,
 				extraContext: additionalContext,
@@ -621,6 +693,11 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 		promptGuidelines: [
 			"Use team_verify on load-bearing claims before you repeat them to the human, especially " +
 				"numbers, citations, and anything a worker asserted about its own output.",
+			"team_verify takes ONE claim per call: a compound finding can pass while hiding a defect inside it. Split it first.",
+			"team_verify skeptics run with --no-extensions --no-skills --no-context-files and cannot be configured. They have " +
+				"read and bash, so files, repo paths and reasoning are in reach; they have NO MCP, so a Linear ticket, Confluence page, " +
+				"Slack thread, Sentry issue or web URL is not. For those, team_spawn a verifier with profile: 'verifier-mcp' " +
+				"(MCP and house rules on) plus any skill it needs to read the sources, and never show it the worker's reasoning.",
 		],
 		parameters: Type.Object({
 			finding: Type.String({
@@ -851,12 +928,16 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 		description:
 			"Block until the named agents (default: all your children) reach a terminal state, then return " +
 			"their outcomes and deliverable paths. This is how a manager waits: a headless agent exits when " +
-			"its turn ends, so parking inside this one tool call is what keeps it alive to collect results.",
+			"its turn ends, so parking inside this one tool call is what keeps it alive to collect results. " +
+			"Each done deliverable is checked against its contract's requiredFields; a miss, or an agent that exited " +
+			"without reporting, is shown as GAP, never as done.",
 		promptGuidelines: [
 			"If you spawned children and must collect their results, call team_await instead of polling " +
 				"team_status in a loop — polling burns your context and a headless agent may exit first.",
 			"Never call team_await from the interactive lead session: it blocks the human. End your turn " +
 				"instead; each child's report arrives as a message and wakes you.",
+			"A GAP from team_await is not a pass. Recycle that agent once with the missing fields named; if it misses again, " +
+				"report the gap as a gap. team_await never respawns anything itself.",
 		],
 		parameters: Type.Object({
 			agents: Type.Optional(
@@ -924,10 +1005,23 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 			}
 
 			const statuses = readAllStatuses(config.team);
+			const gaps: string[] = [];
 			const rows = names.map((name) => {
-				const state = done.get(name) ?? (statuses[name]?.state === "queued" ? "still queued" : "still running");
+				let state = done.get(name) ?? (statuses[name]?.state === "queued" ? "still queued" : "still running");
 				const status = statuses[name];
-				return `| ${name} | ${state} | ${status?.output ?? "—"} | ${(status?.note ?? "").slice(0, 80)} |`;
+				const contract = readContract(config.team, name);
+				const childCwd = findAgent(readTeam(config.team) ?? config, name)?.cwd ?? rt.cwd;
+				let contractCell = contract?.requiredFields?.length ? "pending" : "—";
+				if (state === "done") {
+					const missing = missingFields(status?.output, contract, childCwd);
+					if (missing) contractCell = missing.length === 0 ? "ok" : `missing: ${missing.join(", ")}`;
+					if (missing && missing.length > 0) state = "GAP (done, fields missing)";
+				} else if (state === "exited-without-reporting") {
+					state = "GAP (exited without reporting)";
+					contractCell = "no deliverable";
+				}
+				if (state.startsWith("GAP")) gaps.push(name);
+				return `| ${name} | ${state} | ${status?.output ?? "—"} | ${contractCell.replace(/\|/g, "/")} | ${(status?.note ?? "").slice(0, 80)} |`;
 			});
 			const unfinished = names.filter((n) => !done.has(n));
 			return text(
@@ -935,9 +1029,15 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 					unfinished.length === 0
 						? `All ${names.length} agent(s) finished.`
 						: `Timed out with ${unfinished.length} still running: ${unfinished.join(", ")}.`,
+					...(gaps.length > 0
+						? [
+								`GAP: ${gaps.join(", ")}. A gap is not a pass. Recycle each once with the missing fields named ` +
+									"(team_recycle additionalContext); a second miss is reported as a gap. Nothing was respawned automatically.",
+							]
+						: []),
 					"",
-					"| agent | state | deliverable | note |",
-					"|---|---|---|---|",
+					"| agent | state | deliverable | contract | note |",
+					"|---|---|---|---|---|",
 					...rows,
 					"",
 					"Read each deliverable before reporting upward. Do not forward raw worker output —",
@@ -1024,6 +1124,8 @@ interface SpawnParams {
 	visible?: boolean;
 	cwd?: string;
 	taskContract?: TaskContract;
+	gate?: GateReservation;
+	gateExempt?: string;
 	/** Internal: used by recycle/evaluate. */
 	roleOverride?: Role;
 	handoff?: string;
@@ -1072,8 +1174,28 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		return refuse(`Invalid agent name '${params.name}'. Use letters, digits, dot, dash, underscore.`);
 	}
 	if (!params.task?.trim()) return refuse("Refusing to spawn: task is empty.");
+	const gateExempt = typeof params.gateExempt === "string" ? params.gateExempt.trim() : "";
+	if (params.gate) {
+		const shape = gateShapeError(params.gate);
+		if (shape) return refuse(`Refused to spawn '${params.name}': ${shape}.`);
+	} else if (!gateExempt) {
+		const trigger = gateTrigger(params.profile, params.skills, params.task);
+		if (trigger) {
+			return refuse(
+				`Refused to spawn '${params.name}': this '${params.profile}' spawn is a PR review gate lane (${trigger}), ` +
+					"so it needs one of: gate: {state: '<absolute gate state JSON>', spawnId: '<spawn_id from " +
+					"pr-gate-spawn.sh check>'}, or gateExempt: '<reason>' for a review that sits outside the gate.",
+			);
+		}
+	}
 
 	const team = rt.ensureTeam();
+	if (params.gate) {
+		const verified = runGate("verify", params.gate, params.name, team);
+		if (!verified.ok) {
+			return refuse(`Refused to spawn '${params.name}': gate reservation ${params.gate.spawnId} failed verify: ${verified.error}`);
+		}
+	}
 	const config = readTeam(team);
 	if (!config) return refuse("Failed to create team state.");
 	const parent = params.parent ?? rt.me;
@@ -1147,6 +1269,24 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		slim,
 	});
 
+	const unresolvedSkills = [...new Set([...runtime.skills, ...runtime.profileSkills])].filter(
+		(name) => !resolveSkillPath(name, cwd),
+	);
+	const taskContract = params.taskContract ? absoluteContract(params.taskContract, cwd) : undefined;
+	const badFields = invalidRequiredFields(params.taskContract?.requiredFields);
+	const spawnWarnings = [
+		role === "worker" && !params.taskContract?.outputPath
+			? "WARNING: no taskContract.outputPath. Nothing will check that this worker wrote a deliverable, and " +
+				"team_write_status cannot hold it to a path. Give workers a taskContract with an absolute outputPath."
+			: "",
+		unresolvedSkills.length > 0
+			? `WARNING: skill(s) not found from ${cwd}, so the agent will NOT get them: ${unresolvedSkills.join(", ")}. ` +
+				"Fix the name or move the skill into ~/.pi/agent/skills (or a settings skill directory), then respawn. " +
+				"A resolved skill is not proof it was read: grep the agent's log for the skill path."
+			: "",
+		badFields.length > 0 ? `WARNING: requiredFields entries that will never match: ${badFields.join("; ")}.` : "",
+	].filter(Boolean);
+
 	const record: AgentRecord = {
 		name: params.name,
 		role,
@@ -1157,11 +1297,17 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		provider: runtime.provider,
 		thinkingLevel: runtime.thinkingLevel,
 		profile: params.profile,
+		skills: params.skills,
+		extensions: params.extensions,
+		contextFiles: params.contextFiles,
+		slim: params.slim,
 		canSpawn,
 		backend: detectBackend(),
 		paneId: null,
 		visible,
 		createdAt: new Date().toISOString(),
+		...(params.gate ? { gate: { state: params.gate.state, spawnId: params.gate.spawnId.trim() } } : {}),
+		...(gateExempt ? { gateExempt } : {}),
 	};
 
 	// Count and reserve under one lock: two sub-orchestrators spawning at the
@@ -1221,6 +1367,18 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 	const lost = conflict as string | null;
 	if (lost === "superseded") return { kind: "superseded", message: "entry no longer queued" };
 	if (lost) return refuse(lost);
+	let gateLine = gateExempt ? `Gate exempt: ${gateExempt}` : "";
+	if (params.gate) {
+		const bound = runGate("bind", params.gate, params.name, team);
+		if (!bound.ok) {
+			updateTeam(team, (current) => {
+				current.agents = current.agents.filter((a) => a.name !== params.name);
+			});
+			writeStatus(team, { agent: params.name, state: "error", note: "gate reservation refused" });
+			return refuse(`Refused to spawn '${params.name}': gate reservation ${params.gate.spawnId} failed bind: ${bound.error}`);
+		}
+		gateLine = `Gate: ${params.gate.spawnId} bound (lane ${bound.detail.lane}, head ${String(bound.detail.head ?? "").slice(0, 12)}).`;
+	}
 	ensureDir(mailboxDir(team, params.name));
 	if (canSpawn) ensureDir(attentionDir(team, params.name));
 
@@ -1234,7 +1392,7 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 					`${hit.key} in ~/.pi/agent/settings.json.`,
 			);
 		}
-		if (params.taskContract) writeContract(team, params.name, params.taskContract);
+		if (taskContract) writeContract(team, params.name, taskContract);
 		const { fromQueue: _fromQueue, parent: _parent, inherit: _inherit, leadSessionId: _lead, ...replay } = params;
 		try {
 			enqueue(team, {
@@ -1258,6 +1416,8 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 				`Queued **${params.name}** (${role}): ${hit.message}.`,
 				`It starts automatically when a slot frees (queue position ${queuePosition(team, params.name)}), ` +
 					"and team_await already includes it. Do NOT retry or respawn it.",
+				gateLine,
+				...spawnWarnings,
 				atDepthLimit
 					? `NOTE: it will run as a worker, not an orchestrator: at level ${depth} it is at the depth cap (maxDepth=${limits.maxDepth}).`
 					: "",
@@ -1268,7 +1428,7 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 	}
 
 	const delaySeconds = Math.min(liveSiblings, 8) * 3;
-	if (params.taskContract) writeContract(team, params.name, params.taskContract);
+	if (taskContract) writeContract(team, params.name, taskContract);
 
 	const systemPrompt = buildSystemPrompt({
 		team,
@@ -1277,7 +1437,7 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		parent,
 		canSpawn,
 		task: params.task,
-		contract: params.taskContract,
+		contract: taskContract,
 		handoff: params.handoff,
 		extraContext: params.extraContext,
 	});
@@ -1357,6 +1517,8 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		message: [
 			`Spawned **${params.name}** (${role}, ${result.backend}${result.backend === "headless" ? "" : visible ? ", visible pane" : ", hidden window"}).`,
 			runtime.model ? `Model: ${runtime.model}${runtime.thinkingLevel ? ` (${runtime.thinkingLevel})` : ""}` : "",
+			gateLine,
+			...spawnWarnings,
 			conventionWarning,
 			atDepthLimit
 				? `NOTE: spawned as a worker, not an orchestrator: at level ${depth} it is at the depth cap (maxDepth=${limits.maxDepth}) and could not spawn anything.`

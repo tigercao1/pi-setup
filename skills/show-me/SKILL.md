@@ -122,9 +122,30 @@ $HOME/Documents/knowledge-base-remote/<Project>/docs/plans/<topic-folder>/show-m
 
 ### guidance
 
+Page shape. Tiger reads these pages, and a wall of text is unreadable to him.
+
+- Each section has three parts, in this order:
+  1. A one-line answer, in plain words.
+  2. One small table or diagram.
+  3. A "Do this" line naming the next action and who takes it.
+- Put everything else in a collapsed `<details>` block: evidence, file:line lists, long cards.
+- Write one idea per sentence. No dashes as punctuation.
+- Show work as a workflow: the step, the skill that fires, what comes out. Never as a catalogue of
+  skills or files.
+- Keep the top of the page to one screen: what this is, the decision or action needed, and links to
+  the sections.
+
+Status on a page. A page that shows status (done ticks, ticket or PR state, "sent", "pending X") takes
+it from the source and shows the link and an "as of <date>" next to it. Never hard-code a done tick
+that the page's script cannot trace to a source or to Tiger saying he did it; a generator bug once
+ticked a monitor that never existed. Label the page with the `show-me:state` meta tag and the other
+tags in `~/.pi/agent/skills/recall/references/validity.md`; a new page is `proposed`.
+
 Place each visual next to the short text it supports. Keep only the calls, files, props, states, and boundaries needed to answer the user's current question or the options to resolve the current discussion point.
 
 You may use one of these, you may use several, it is unlikely you will use all of them. Use your judgement and don't overwhelm the user.
+
+Other skills (ketchup, teach, why, how) may hand you visuals; render them under the same rules.
 
 ### rendering — the user must see it rendered, not as source
 
@@ -204,6 +225,7 @@ session. Start it at iteration 1.
 <meta name="show-me:topic" content="Checkout: new vs reopen">
 <meta name="show-me:summary" content="One sentence a later session can match against">
 <meta name="show-me:updated" content="2026-10-15">
+<meta name="show-me:state" content="proposed">
 ...
 <nav class="iterations">  <!-- newest first; each links to its section -->
   <a href="#iter-3">v3 · 2026-10-15 · pivot — split into two PRs</a>

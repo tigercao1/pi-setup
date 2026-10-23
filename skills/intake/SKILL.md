@@ -22,8 +22,10 @@ Read the reference file for a phase when you reach it, not before:
 |---|---|
 | Authoring anchors, keeping workers on intent | `references/anchors.md` |
 | Resolving open questions before escalating | `references/deciding.md` |
+| Design before a split: product, architecture, program design, slices; reverse design for existing PRs | `references/design.md` |
 | Running the lanes | `references/lanes.md` |
 | Split / unit / release gates | `references/gates.md` |
+| Ledger rows, pointer check, end-of-mission audit | `references/ledger.md` |
 
 ---
 
@@ -56,13 +58,40 @@ State lives on disk — you will be recycled and workers will die.
 Write `mission.md` before spawning anything. Append to `ledger.md` at every decision and gate
 result. Workers get a path, never a paragraph.
 
+One header line per entry, optional indented prose under it:
+`- <ISO ts> · <phase> · <decision> · result: <state> · evidence: <SHA | PR# | path:line | file>`.
+Add a `start` row whenever a new agent or session picks the mission up. Supersede a wrong row
+with a new one; never edit. Details in `references/ledger.md`.
+
+Resuming or pausing a mission: follow the recall skill's pause and resume sections
+(`~/.pi/agent/skills/recall/SKILL.md`).
+
 ---
 
 ## Phase 0 — Recon (always)
 
-Never infer the lane from the title. Spawn **one read-only researcher**: what is actually being
-asked, which files/modules it touches, who owns them, what prior art exists, what is genuinely
-unknown versus merely unstated.
+Never infer the lane from the title. Spawn **one read-only researcher** with `extensions: ["mcp"]`
+and `contextFiles: true`: what is actually being asked, which files/modules it touches, who owns
+them, what prior art exists, what is genuinely unknown versus merely unstated. It also builds a
+git-blame/PR anchor for the code the change will touch (`git blame`, `git log --follow`, the PR
+bodies via `gh pr view`), and lists every source it searched, including the ones that came back
+empty.
+
+If recon surfaces a "why is it like this" question about code the change will alter, offer the
+`why` skill (`~/.pi/agent/skills/why/SKILL.md`) and ask the human before its full fan-out.
+
+Optional clarity nudge, after recon: one `jev` call with the human's original ask and the recon
+summary as `state`, and two questions:
+
+- `restate` (boolean): "Would a competent engineer reading only this ask likely build something
+  other than what is wanted?"
+- `deepen` (score, lowest rung first): "already specifies inputs, method and an external check" ·
+  "specifies inputs and method, no external check" · "names the outcome, not the method" ·
+  "names a goal, not the outcome" · "names only a topic".
+
+`restate` p ≥ 0.6: open the report to the human with a one-line restatement of their goal.
+`deepen` ≥ 3 (of 0..4): add one line suggesting `/sharpen`; never run it yourself. Append both
+answers to `ledger.md`. The thresholds are a starting guess, to be tuned from the ledger.
 
 Where a spec or triage comment already exists, aim recon at **falsifying** it — specs go stale and
 a wrong one poisons every unit downstream. Recon is the cheapest phase and its failure is the most
@@ -100,6 +129,12 @@ why. Never read it as EXECUTE.
 Most open questions are evidence-resolvable (precedent, a grep, a query), not value judgements.
 Resolve those with a decider agent before escalating anything. See `references/deciding.md`.
 
+## Phase 1.75 — Design (SPLIT only)
+
+Before splitting, write the design at the depth `references/design.md` gives for the route: product,
+architecture, program design, slices. The PR reviewers read it before any unit is ticketed. Its
+slices become the units, and its program design becomes each unit's anchor.
+
 ## Phase 2 — Lanes
 
 EXECUTE · SPLIT · SCOPE · SPIKE. See `references/lanes.md`.
@@ -115,10 +150,16 @@ Verifiers are **blind**: anchor and diff only, never the worker's narrative. Mec
 as a script, never by eye. All gates bounded at **3 attempts**, then escalate with the specific
 failing bullet. See `references/gates.md`.
 
-A unit is not done when its draft PR opens — that **starts** the PR gate: an independent reviewer
-on a different model, blocking items fed back as new commits, re-review, max 3 rounds. The
-reviewer also checks the PR description against the standard in `references/lanes.md`: a short
-summary and a short test plan, nothing else.
+Before a unit's 3rd attempt, write down the premise the failed fixes share and test it directly.
+Two failures that assume the same thing usually mean that thing is wrong.
+
+A unit is not done when its draft PR opens — that **starts** the PR gate, which is the
+`pr-review-gate` skill: its scripts pick the lanes, clear each reviewer spawn, record every verdict
+and keep the round and spawn budget in `<mission>/gate/<pr>.json`. Blocking items go back as new
+commits and the gate's delta script decides what re-runs. Run that skill's procedure; do not spawn
+PR reviewers outside it. The unit gate above stays separate: it checks the anchor and is voided by
+any new head. The PR description must meet the standard in `references/lanes.md`: a short
+summary and a short test plan, nothing else. See `references/gates.md`.
 
 ---
 
@@ -169,3 +210,7 @@ Write the observed state and its timestamp into `ledger.md`, never only into you
 
 The lane and why · the unit tree with status and PR links (**re-read, not recalled**) · gate
 results · every escalation with its specific question · the `mission.md` path.
+
+Before reporting, run the end-of-mission audit in `references/ledger.md`: `ledger-check.py` exits
+0, every spawn, gate verdict and push of this run has a row, and SPLIT or escalated missions get
+the cross-model trail review, which ends with `Attention / reviewed by <model>`.

@@ -5,8 +5,16 @@ never shares one working tree.
 
 Surfaces three things:
 
-- `/wt` — asks first: list, list with PR status, new, or clean. The list then offers create, check out a PR, remove. `/wt --pr`, `/wt new <spec>` and `/wt clean` skip the first step.
-- a `worktree` tool the model can call (`list`, `create`, `path`, `remove`).
+- `/wt` — asks first: list, list with PR status, new, clean, or cleanup audit. The list then offers create, check out a PR, remove. `/wt --pr`, `/wt new <spec>`, `/wt clean` and `/wt clean --audit [--size] [--stale-days N]` skip the first step.
+- a `worktree` tool the model can call (`list`, `create`, `path`, `audit`, `remove`).
+
+`wt clean --audit` is read-only: it does not prune or remove anything. Per worktree it reports
+size (with `--size`), days since the last commit and since the newest pi session in that
+directory (`$WT_SESSIONS_DIR`, default `~/.pi/agent/sessions`), processes whose cwd is inside it,
+tracked uncommitted files (`wip:N`), untracked files (`scratch:N`), commits on no remote, merge and
+PR state, and a suggested bucket (`keep`, `hold`, `verify`, `candidate`). `0(pr)` in AHEAD means
+the only local commits are the head of a merged PR, so a squash merge already contains them. The
+bucket is advice; the `worktree-cleanup` skill owns the procedure and the approval gate.
 - a `team_spawn` hook: a spawn with `cwd: "worktree:PROJ-123"` (or `worktree:pr/1234`) is
   provisioned and rewritten to the real path before the worker starts. Append `+fast` to skip the
   profile's heavy paths.
@@ -87,7 +95,9 @@ Also required: `git`, `jq` or `python3` (to read profiles), and `gh` for the PR-
 | `WT_PREFIX` | profile `prefix`, else your GitHub login |
 | `WT_PROFILE_DIRS` | `~/.pi/agent/worktree` then every `~/.pi/*/worktree` |
 | `WT_BIN` | first candidate in CLI resolution |
+| `WT_LIST_TIMEOUT_MS` | `180000` — how long the extension waits for `wt ls` and `wt clean` (`wt ls` takes about 45 s over ~35 worktrees) |
 | `WT_NO_FZF` | `1` forces the built-in picker |
+| `WT_SESSIONS_DIR` | `~/.pi/agent/sessions` — read by `wt clean --audit` for the last pi session per worktree |
 
 ## Changing directory
 

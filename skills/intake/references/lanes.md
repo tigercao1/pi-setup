@@ -14,9 +14,22 @@ project rules) with the leaf anchor copied in verbatim and `DONE WHEN` as the ev
 `needs-split` — it must never widen its own scope. Misrouting is expected and recoverable; silent
 widening is neither.
 
+Name the work type and copy its row into the anchor's `DONE WHEN` / `NEVER`:
+
+| Work type | Discipline |
+|---|---|
+| bug | Reproduce first. Commit the failing test before the fix, inside one PR that is green when it opens; never ship a red PR. Drop hypotheses the evidence refutes. |
+| refactor | Pin the current behaviour first. Subtract before you add. Deleting the old API is the last PR of the stack, not part of the first. |
+| perf | Baseline number first. Measure before and after the same way, and explain the number, not just report it. |
+| investigation | This is SCOPE, not EXECUTE. Re-route. |
+| prototype | This is SPIKE, not EXECUTE. Re-route; the code is throwaway. |
+
 ### SPLIT — narrow the anchor into children
-Produce child units, each: one module or one layer, independently mergeable, own reviewer, own
-anchor, no file overlap with a *concurrent* sibling. Record deps.
+Produce child units from the design's slices (`references/design.md`). Each unit is one behaviour a
+person can check by curl or in a browser once it merges. A unit is never one layer. Each unit is
+independently mergeable, has its own reviewer and anchor, and shares no file with a *concurrent*
+sibling. Unit 0 is the contract: the routes the FE will call, behind the rollout, returning the
+agreed shapes. Record deps.
 
 Do not split a single security fix across PRs to satisfy a size heuristic — shipping half a
 vulnerability fix is worse than one larger PR. Conversely, keep unrelated cleanups (dead-code

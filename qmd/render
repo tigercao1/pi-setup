@@ -1,0 +1,51 @@
+#!/bin/bash
+# Render qmd index configs from templates.
+#
+#   render --list          index names, one per line
+#   render <name>          the rendered <name>.yml on stdout
+#
+# An index comes from <layer>/qmd/<name>.yml.tmpl or <agent>/qmd/<name>.yml.tmpl. Machine-local
+# additions, <layer>/qmd/local/<name>.local.yml.tmpl (gitignored in the layer) and
+# <agent>/qmd/<name>.local.yml.tmpl, hold extra collection entries (indented as under collections:)
+# that are inserted right after the template's collections: line. $HOME is substituted in all.
+set -euo pipefail
+
+QMD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_DIR="${PI_AGENT_DIR:-$(dirname "$QMD_DIR")}"
+LAYER_DIR="${PI_LAYER_DIR:-$AGENT_DIR/../homebase}"
+
+templates() {
+  shopt -s nullglob
+  local tmpl
+  for tmpl in "$LAYER_DIR"/qmd/*.yml.tmpl "$AGENT_DIR"/qmd/*.yml.tmpl; do
+    case "$tmpl" in *.local.yml.tmpl) continue ;; esac
+    printf '%s\n' "$tmpl"
+  done
+}
+
+case "${1:-}" in
+  --list)
+    templates | while IFS= read -r tmpl; do basename "$tmpl" .yml.tmpl; done | sort -u
+    ;;
+  "" | -h | --help)
+    sed -n '4,5p' "$0" | sed 's/^# *//' >&2; exit 2
+    ;;
+  *)
+    name="$1"
+    tmpl=""
+    while IFS= read -r t; do
+      if [ -z "$tmpl" ] && [ "$(basename "$t" .yml.tmpl)" = "$name" ]; then tmpl="$t"; fi
+    done < <(templates)
+    [ -n "$tmpl" ] || { echo "render: no template for index '$name'" >&2; exit 1; }
+    extras=()
+    for local_tmpl in "$LAYER_DIR/qmd/local/$name.local.yml.tmpl" "$AGENT_DIR/qmd/$name.local.yml.tmpl"; do
+      [ -f "$local_tmpl" ] && extras+=("$local_tmpl")
+    done
+    if [ ${#extras[@]} -gt 0 ]; then
+      grep -q '^collections:' "$tmpl" || { echo "render: $tmpl has no collections: line" >&2; exit 1; }
+      awk -v extras="$(printf '%s\n' "${extras[@]}")" '{ print } /^collections:/ { n = split(extras, files, "\n"); for (i = 1; i <= n; i++) while ((getline line < files[i]) > 0) print line }' "$tmpl"
+    else
+      cat "$tmpl"
+    fi | sed "s|\$HOME|$HOME|g"
+    ;;
+esac

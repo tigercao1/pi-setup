@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Skim test for a message Tiger will post.
 
-usage: skim-test.py <message.md> --kind <approve|choose|do|answer|fyi> --intent "<the one decision or action you want>" [--title "<thread parent>"]
+usage: skim-test.py <message.md> --kind <approve|choose|do|answer|fyi> --intent "<the one decision or action you want>" [--title "<thread parent>"] [--voice tiger|none] [--no-lint]
 
 --kind is what the reader must do: approve a proposed change, choose between options, do a task,
 answer a factual question, or nothing (fyi).
@@ -10,10 +10,15 @@ A busy reader sees the title, the opening and the closing line, and little else.
 the message down to exactly that, hands only the cut to a fresh reader with no context, and asks
 what it is being asked to do. A second fresh reader gets the full message and is asked what would
 change versus today. A third compares both answers with the intent. Exit code 0 = PASS, 1 = FAIL.
+
+slop-lint.py (next to this file) runs first, at no model cost. Its hits are printed under the
+verdict as warnings and never change the exit code. --voice defaults to tiger.
 """
 import argparse
 import concurrent.futures as cf
+import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -28,6 +33,14 @@ KINDS = {
     "confirm": "confirm the current design or behaviour is right, no change proposed",
     "fyi": "nothing, it is for information",
 }
+
+
+def load_lint():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slop-lint.py")
+    spec = importlib.util.spec_from_file_location("slop_lint", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def run_reader(prompt):
@@ -67,8 +80,15 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--reader", default="a busy product manager",
                     help="who receives the message, e.g. 'an engineer on the billing team who asked the question in the thread parent'")
+    ap.add_argument("--voice", choices=["tiger", "none"], default="tiger")
+    ap.add_argument("--no-lint", action="store_true")
     args = ap.parse_args()
     text = open(args.message).read().strip()
+    lint_lines = []
+    if not args.no_lint:
+        lint = load_lint()
+        hits = lint.lint(text, None if args.voice == "none" else args.voice)
+        lint_lines = [f"slop-lint: {len(hits)} warning(s), voice {args.voice}"] + ["  " + h for h in lint.format_hits(hits)]
     view = skim_view(text, args.title)
     with cf.ThreadPoolExecutor() as pool:
         results = list(pool.map(lambda _: evaluate(text, view, args), range(args.runs)))
@@ -82,6 +102,8 @@ def main():
         print("WHY: " + r["why"] + "\n")
     print("FULL READER (run 1): " + results[0]["full"].replace("\n", " | ") + "\n")
     print(f"VERDICT: {'PASS' if passed else 'FAIL'} ({passes}/{args.runs} runs passed)")
+    if lint_lines:
+        print("\n".join(lint_lines))
     sys.exit(0 if passed else 1)
 
 

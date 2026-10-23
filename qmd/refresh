@@ -1,0 +1,32 @@
+#!/bin/bash
+# Export new pi sessions and handoffs, then re-index every qmd index (seconds, no model).
+#
+#   refresh            export + qmd update for each index
+#   refresh --embed    also qmd embed for each index (minutes, about 3 GB RAM)
+set -euo pipefail
+
+QMD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_DIR="$(dirname "$QMD_DIR")"
+
+if ! command -v qmd >/dev/null 2>&1 && [ -s "$HOME/.nvm/nvm.sh" ]; then
+  set +u; . "$HOME/.nvm/nvm.sh" >/dev/null; set -u
+fi
+command -v qmd >/dev/null 2>&1 || { echo "refresh: qmd not found" >&2; exit 1; }
+
+EMBED=0
+case "${1:-}" in
+  --embed) EMBED=1 ;;
+  "") ;;
+  *) sed -n '4,5p' "$0" | sed 's/^# *//' >&2; exit 2 ;;
+esac
+
+printf '%s refresh start\n' "$(date -u +%FT%TZ)"
+"$AGENT_DIR/bin/pi-memory-export"
+while IFS= read -r name; do
+  qmd --index "$name" update | tail -n 1
+  if [ "$EMBED" -eq 1 ]; then
+    qmd --index "$name" embed 2>&1 | tail -n 2
+    qmd --index "$name" cleanup 2>&1 | tail -n 1
+  fi
+done < <("$QMD_DIR/render" --list)
+printf '%s refresh done\n' "$(date -u +%FT%TZ)"

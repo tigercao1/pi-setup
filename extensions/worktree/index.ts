@@ -32,6 +32,15 @@ function resolveWt(): string | undefined {
 }
 
 const WT = resolveWt();
+
+const envMs = (name: string, fallback: number): number => {
+  const raw = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+};
+const LIST_TIMEOUT_MS = envMs("WT_LIST_TIMEOUT_MS", 180_000);
+const PATH_TIMEOUT_MS = 30_000;
+const RM_TIMEOUT_MS = 300_000;
+const AUDIT_TIMEOUT_MS = 600_000;
 const STATUS_KEY = "worktree";
 const SPEC_PREFIX = "worktree:";
 
@@ -72,7 +81,7 @@ async function run(args: string[], cwd: string, timeoutMs = 300_000): Promise<Ru
 
 async function list(cwd: string, withPr: boolean): Promise<Worktree[]> {
   const args = withPr ? ["ls", "--json", "--pr"] : ["ls", "--json"];
-  const res = await run(args, cwd, 30_000);
+  const res = await run(args, cwd, LIST_TIMEOUT_MS);
   if (!res.ok) throw new Error(res.error);
   return JSON.parse(res.stdout) as Worktree[];
 }
@@ -142,7 +151,7 @@ export default function (pi: ExtensionAPI) {
     const prMatch = target.match(/^pr\/?#?(\d+)$/i);
     const slug = prMatch ? `pr-${prMatch[1]}` : target.toLowerCase();
 
-    const existing = await run(["path", slug], ctx.cwd, 30_000);
+    const existing = await run(["path", slug], ctx.cwd, PATH_TIMEOUT_MS);
     if (existing.ok && existing.stdout.trim()) {
       input.cwd = existing.stdout.trim();
       ctx.ui.notify(`worktree: reusing ${input.cwd} for ${input.name ?? "worker"}`, "info");
@@ -176,6 +185,7 @@ export default function (pi: ExtensionAPI) {
         { value: "--pr", label: "--pr  include PR status (slower)" },
         { value: "new", label: "new   create a worktree" },
         { value: "clean", label: "clean prune stale, report merged" },
+        { value: "clean --audit", label: "clean --audit  read-only cleanup report (slow)" },
       ].filter((i) => i.value.startsWith(prefix));
       return items.length > 0 ? items : null;
     },
@@ -187,13 +197,15 @@ export default function (pi: ExtensionAPI) {
           { label: "List with GitHub PR status (slower)", value: ["--pr"] },
           { label: "New worktree…", value: ["new"] },
           { label: "Clean: prune stale, report merged", value: ["clean"] },
+          { label: "Cleanup audit: size, age, sessions, merge state (read-only, slow)", value: ["clean", "--audit", "--size"] },
         ]);
         if (!picked) return;
         argv.push(...picked.value);
       }
 
       if (argv[0] === "clean") {
-        const res = await run(["clean"], ctx.cwd, 60_000);
+        const audit = argv.includes("--audit");
+        const res = await run(argv, ctx.cwd, audit ? AUDIT_TIMEOUT_MS : LIST_TIMEOUT_MS);
         ctx.ui.notify(res.ok ? res.stdout.trim() : res.error, res.ok ? "info" : "error");
         return;
       }
@@ -289,7 +301,7 @@ export default function (pi: ExtensionAPI) {
     const res = await run(
       ["rm", "-y", deleteBranch ? "--delete-branch" : "--keep-branch", wt.path],
       ctx.cwd,
-      60_000,
+      RM_TIMEOUT_MS,
     );
     ctx.ui.notify(res.ok ? res.stdout.trim() : res.error, res.ok ? "info" : "error");
   }
@@ -300,6 +312,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Manage provisioned git worktrees of this repo. Use 'list' to see existing worktrees, " +
       "'create' to make an isolated checkout for a ticket, 'path' to resolve one by name, " +
+      "'audit' for a read-only cleanup report (size, age, last pi session, live processes, " +
+      "uncommitted work, merge/PR state, suggested bucket), " +
       "and 'remove' to delete one. Created worktrees are provisioned from the repo's worktree " +
       "profile (shared config linked, per-branch state cloned) and can be used immediately via " +
       "'cd <path> && ...' in bash.",
@@ -308,9 +322,11 @@ export default function (pi: ExtensionAPI) {
       "Use worktree with action 'create' when work on a different ticket must not disturb the " +
         "current checkout; then run commands inside it with 'cd <path> && ...'.",
       "Do not use worktree remove without the user explicitly asking.",
+      "For a cleanup, run audit, list the candidates to the user, and remove only the ones the " +
+        "user explicitly approves, one name at a time.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["list", "create", "path", "remove"] as const),
+      action: StringEnum(["list", "create", "path", "audit", "remove"] as const),
       ticket: Type.Optional(
         Type.String({
           description: "Ticket ID or existing branch name (with a slash) for create, e.g. PROJ-123",
@@ -321,6 +337,9 @@ export default function (pi: ExtensionAPI) {
       ),
       name: Type.Optional(
         Type.String({ description: "Worktree name or path for path/remove" }),
+      ),
+      withSize: Type.Optional(
+        Type.Boolean({ description: "audit: include disk usage per worktree (slower)" }),
       ),
       skipHeavy: Type.Optional(
         Type.Boolean({
@@ -338,7 +357,7 @@ export default function (pi: ExtensionAPI) {
 
       switch (params.action) {
         case "list": {
-          const res = await run(["ls"], ctx.cwd, 30_000);
+          const res = await run(["ls"], ctx.cwd, LIST_TIMEOUT_MS);
           return res.ok
             ? { content: [{ type: "text", text: res.stdout.trim() }], details: {} }
             : fail(res.error);
@@ -359,7 +378,15 @@ export default function (pi: ExtensionAPI) {
         }
         case "path": {
           if (!params.name) return fail("name is required for path");
-          const res = await run(["path", params.name], ctx.cwd, 30_000);
+          const res = await run(["path", params.name], ctx.cwd, PATH_TIMEOUT_MS);
+          return res.ok
+            ? { content: [{ type: "text", text: res.stdout.trim() }], details: {} }
+            : fail(res.error);
+        }
+        case "audit": {
+          const args = ["clean", "--audit"];
+          if (params.withSize) args.push("--size");
+          const res = await run(args, ctx.cwd, AUDIT_TIMEOUT_MS);
           return res.ok
             ? { content: [{ type: "text", text: res.stdout.trim() }], details: {} }
             : fail(res.error);
@@ -367,7 +394,7 @@ export default function (pi: ExtensionAPI) {
         case "remove": {
           if (!params.name) return fail("name is required for remove");
           // No -y: wt refuses to discard a dirty worktree for a non-TTY caller.
-          const res = await run(["rm", "--keep-branch", params.name], ctx.cwd, 60_000);
+          const res = await run(["rm", "--keep-branch", params.name], ctx.cwd, RM_TIMEOUT_MS);
           return res.ok
             ? { content: [{ type: "text", text: res.stdout.trim() }], details: {} }
             : fail(res.error);

@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""Export pi sessions and handoffs to markdown for the qmd indexes.
+
+  pi-memory-export [--full] [--dry-run] [--quiet]
+
+Each session JSONL under the sessions dir becomes <memory>/<segment>/sessions/<date>-<session id>.md
+(user and assistant text only; a worker's assignment from its system prompt counts as user text).
+Publishing tool calls (gh pr/issue writes, gh api writes, git push, pbcopy, slack-copy, session_send,
+Slack/Linear/Confluence/Google Docs/GitHub MCP writes, also inside codemode) become rows in
+<memory>/<segment>/evidence.tsv and a published: list in the session export's front matter.
+Orchestrator handoff JSON and session-fork handoff markdown become <memory>/<segment>/handoffs/*.md.
+Segments come from <layer>/qmd/segments.tsv, then <agent>/qmd/segments.tsv. Per-session overrides
+("<session id>\t<segment>") come from <layer>/qmd/session-overrides.tsv, then
+<agent>/qmd/session-overrides.tsv; the first file naming a session wins. Only new or changed sources
+are rewritten; a change to any rules or overrides file reclassifies everything; --full rewrites
+everything. One export runs at a time (<memory>/.export.lock).
+
+Environment: PI_MEMORY_DIR (default ~/.pi/memory), PI_AGENT_DIR, PI_LAYER_DIR, PI_SESSIONS_DIR.
+"""
+import argparse
+import fcntl
+import fnmatch
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+AGENT_DIR = os.environ.get("PI_AGENT_DIR") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LAYER_DIR = os.environ.get("PI_LAYER_DIR") or os.path.normpath(os.path.join(AGENT_DIR, "../homebase"))
+MEMORY_DIR = os.environ.get("PI_MEMORY_DIR") or os.path.join(HOME, ".pi", "memory")
+SESSIONS_DIR = os.environ.get("PI_SESSIONS_DIR") or os.path.join(AGENT_DIR, "sessions")
+TEAMS_DIR = os.path.join(HOME, ".pi", "orchestrator-teams")
+FORK_HANDOFFS_DIR = os.path.join(HOME, ".pi", "session-forks", "handoffs")
+STATE_PATH = os.path.join(MEMORY_DIR, ".export-state.json")
+LOCK_PATH = os.path.join(MEMORY_DIR, ".export.lock")
+SEGMENT_FILES = [os.path.join(LAYER_DIR, "qmd", "segments.tsv"), os.path.join(AGENT_DIR, "qmd", "segments.tsv")]
+OVERRIDE_FILES = [os.path.join(LAYER_DIR, "qmd", "session-overrides.tsv"),
+                  os.path.join(AGENT_DIR, "qmd", "session-overrides.tsv")]
+WORKER_KICKOFF = "Begin the assignment"
+READ_ATTEMPTS = 5
+
+
+def load_rules():
+    rules = []
+    for path in SEGMENT_FILES:
+        if not os.path.isfile(path):
+            continue
+        for line in open(path, encoding="utf-8"):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split("\t")
+            kind = parts[0]
+            pattern = parts[1].replace("$HOME", HOME) if len(parts) > 1 else ""
+            segment = parts[2] if len(parts) > 2 else ""
+            minimum = int(parts[3]) if len(parts) > 3 and parts[3] else 1
+            weight = int(parts[4]) if len(parts) > 4 and parts[4] else 1
+            rule = {"kind": kind, "pattern": pattern, "segment": segment, "min": minimum, "weight": weight}
+            if kind in ("signal", "strong"):
+                rule["regex"] = re.compile(pattern, re.M)
+            rules.append(rule)
+    return rules
+
+
+def load_overrides():
+    overrides = {}
+    for path in OVERRIDE_FILES:
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) < 2 or not parts[0].strip() or parts[0].lstrip().startswith("#"):
+                continue
+            overrides.setdefault(parts[0].strip(), parts[1].strip())
+    return overrides
+
+
+def rules_identity():
+    digest = hashlib.sha256()
+    for path in SEGMENT_FILES + OVERRIDE_FILES + [os.path.realpath(__file__)]:
+        digest.update(path.encode())
+        if os.path.isfile(path):
+            with open(path, "rb") as fh:
+                digest.update(fh.read())
+    return digest.hexdigest()[:16]
+
+
+_remote_cache = {}
+
+
+def git_remote(cwd):
+    if cwd not in _remote_cache:
+        url = ""
+        if os.path.isdir(cwd):
+            try:
+                url = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"], capture_output=True,
+                                     text=True, timeout=10).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                url = ""
+        _remote_cache[cwd] = url
+    return _remote_cache[cwd]
+
+
+def path_matches(cwd, pattern):
+    return fnmatch.fnmatchcase(cwd, pattern) or fnmatch.fnmatchcase(cwd, pattern.rstrip("/") + "/*")
+
+
+def classify(cwd, signal_text, rules):
+    cwd = (cwd or "").rstrip("/") or "/"
+    for rule in rules:
+        if rule["kind"] == "skip" and path_matches(cwd, rule["pattern"]):
+            return None
+    for rule in rules:
+        kind = rule["kind"]
+        if kind == "path" and path_matches(cwd, rule["pattern"]):
+            return rule["segment"]
+        if kind == "remote":
+            remote = git_remote(cwd)
+            if remote and rule["pattern"] in remote:
+                return rule["segment"]
+        if kind == "mixed" and cwd == rule["pattern"].rstrip("/"):
+            for strong in rules:
+                if strong["kind"] == "strong" and strong["regex"].search(signal_text):
+                    return strong["segment"]
+            scores = {}
+            for signal in rules:
+                if signal["kind"] != "signal":
+                    continue
+                hits = len(signal["regex"].findall(signal_text))
+                if hits >= signal["min"]:
+                    scores[signal["segment"]] = scores.get(signal["segment"], 0) + hits * signal["weight"]
+            return max(scores, key=scores.get) if scores else rule["segment"]
+        if kind == "fallback":
+            return rule["segment"]
+    return "misc"
+
+
+def text_blocks(content):
+    if isinstance(content, str):
+        return [content]
+    out = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+            out.append(block["text"])
+    return out
+
+
+def tool_args(content):
+    out = []
+    if not isinstance(content, list):
+        return out
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "toolCall":
+            out.append(block.get("name", "tool") + " " + json.dumps(block.get("arguments", {}), ensure_ascii=False))
+    return out
+
+
+def assignment_from(message):
+    sections = message.get("sections") or {}
+    addendum = sections.get("addendum") or ""
+    match = re.search(r"## Your Assignment[^\n]*\n(.*?)(?:\n---\n|\Z)", addendum, re.S)
+    return match.group(1).strip() if match else ""
+
+
+EVIDENCE_COLUMNS = ("ts", "session", "channel", "tool", "target", "result", "via", "call_id", "excerpt", "source")
+EXCERPT_CHARS = 200
+MCP_PUBLISH = {
+    "slack": re.compile(r"send_message|schedule_message|post_message|reply|update_message|delete_message|add_reaction|canvas"),
+    "linear": re.compile(r"^(save|create|update|delete)_"),
+    "atlassian": re.compile(r"^(create|update|add|edit|transition|delete)"),
+    "google_docs": re.compile(r"^(create|insert|replace|delete|update|append|batch)"),
+    "github": re.compile(r"^(create|update|add|merge|push|submit|delete|request|close|reopen)"),
+}
+MCP_CHANNEL = {"google_docs": "google-docs"}
+TARGET_KEYS = ("issueId", "issue_id", "pageId", "page_id", "channel_id", "channel", "documentId", "document_id",
+               "project", "projectId", "parentId", "id", "to", "title", "name")
+EXCERPT_KEYS = ("body", "message", "text", "content", "description", "markdown", "note", "title")
+GH_ACTIONS = {"pr": {"comment", "review", "edit", "create", "merge", "ready", "close", "reopen"},
+              "issue": {"comment", "create", "edit", "close", "reopen"},
+              "stack": {"push", "sync", "submit"}}
+GH_VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--title", "-B", "--base", "-H", "--head",
+                  "-X", "--method", "-f", "--field", "--raw-field", "--input", "-H", "--header", "-q", "--jq",
+                  "-a", "--assignee", "-l", "--label", "-r", "--reviewer", "-m", "--milestone", "-p", "--project",
+                  "--template", "-T"}
+GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+HEREDOC = re.compile(r"([^\n]*?)<<-?\s*(['\"]?)([A-Za-z_]\w*)\2([^\n]*)\n(.*?)\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+CODEMODE_CALL = re.compile(r"tools(?:\.(mcp__\w+?__\w+)|\[\s*[\"'](mcp__[\w-]+?__[\w-]+)[\"']\s*\])\s*\(")
+JS_STRING = r"\s*:\s*(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$.]*)"
+REPO_SLUG = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$")
+
+
+def one_line(text, limit=EXCERPT_CHARS):
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text[:limit]
+
+
+def mcp_tool(name):
+    match = re.match(r"^mcp__([a-z0-9_-]+?)__(.+)$", name or "")
+    server, tool = (match.group(1), match.group(2)) if match else (None, None)
+    if not server:
+        for known in MCP_PUBLISH:
+            if (name or "").startswith(known + "_"):
+                server, tool = known, name[len(known) + 1:]
+                break
+    if not server:
+        return None, None
+    if tool.startswith(server + "_"):
+        tool = tool[len(server) + 1:]
+    return server, tool
+
+
+def mcp_channel(server, tool):
+    if server == "atlassian":
+        return "confluence" if "confluence" in tool.lower() else "jira"
+    return MCP_CHANNEL.get(server, server)
+
+
+def mcp_target(server, args):
+    if server == "github" and args.get("owner") and args.get("repo"):
+        number = args.get("pull_number") or args.get("issue_number") or args.get("pullNumber") or ""
+        return f"{args['owner']}/{args['repo']}" + (f"#{number}" if number else "")
+    for key in TARGET_KEYS:
+        value = args.get(key)
+        if value not in (None, "", [], {}):
+            return f"new: {one_line(value, 80)}" if key in ("title", "name") else one_line(value, 120)
+    return ""
+
+
+def mcp_excerpt(args):
+    for key in EXCERPT_KEYS:
+        if isinstance(args.get(key), str) and args[key].strip():
+            return one_line(args[key])
+    return ""
+
+
+def js_value(text, key):
+    match = re.search(r"\b" + re.escape(key) + JS_STRING, text)
+    if not match:
+        shorthand = re.search(r"[{,]\s*" + re.escape(key) + r"\s*(?=[,}])", text)
+        return f"({key})" if shorthand else ""
+    value = match.group(1)
+    if value[:1] in "\"'`":
+        return value[1:-1]
+    return f"({value})"
+
+
+def codemode_calls(code):
+    for match in CODEMODE_CALL.finditer(code or ""):
+        server, tool = mcp_tool(match.group(1) or match.group(2))
+        if not server or server not in MCP_PUBLISH or not MCP_PUBLISH[server].search(tool):
+            continue
+        window = code[match.end():match.end() + 1500]
+        depth, end = 1, len(window)
+        for i, ch in enumerate(window):
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if depth == 0:
+                end = i
+                break
+        window = window[:end]
+        args = {key: js_value(window, key) for key in TARGET_KEYS + EXCERPT_KEYS + ("owner", "repo", "pull_number")}
+        args = {k: v for k, v in args.items() if v}
+        yield server, tool, args
+
+
+def split_segments(command):
+    segments, current, quote, i, piped = [], [], None, 0, False
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            current.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                current.append(command[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            current.append(ch)
+        elif ch == "\\" and i + 1 < len(command):
+            current.append(command[i:i + 2])
+            i += 1
+        elif ch in ";\n|" or (ch == "&" and command[i - 1:i] not in ("<", ">") and command[i + 1:i + 2] != ">"):
+            segments.append(("".join(current).strip(), piped))
+            piped = ch == "|" and not command.startswith("||", i)
+            current = []
+            if command.startswith(("&&", "||"), i):
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    segments.append(("".join(current).strip(), piped))
+    return [(s, p) for s, p in segments if s]
+
+
+def words(segment):
+    try:
+        return shlex.split(segment, comments=True)
+    except ValueError:
+        return segment.split()
+
+
+def strip_prefix(tokens):
+    while tokens:
+        head = tokens[0]
+        if re.match(r"^[A-Za-z_]\w*=", head) or head in ("command", "time", "env", "exec", "sudo", "nohup", "(", "{"):
+            tokens = tokens[1:]
+        elif head == "timeout" and len(tokens) > 1:
+            tokens = tokens[2:]
+        else:
+            break
+    return tokens
+
+
+def flag_value(tokens, *names):
+    for i, tok in enumerate(tokens):
+        for name in names:
+            if tok == name and i + 1 < len(tokens):
+                return tokens[i + 1]
+            if name.startswith("--") and tok.startswith(name + "="):
+                return tok[len(name) + 1:]
+    return None
+
+
+def positionals(tokens, value_flags):
+    out, skip = [], False
+    for tok in tokens:
+        if skip:
+            skip = False
+            continue
+        if tok.startswith("-"):
+            skip = tok in value_flags
+            continue
+        if not re.search(r"[<>]", tok):
+            out.append(tok)
+    return out
+
+
+def repo_slug(cwd):
+    match = REPO_SLUG.search(git_remote(cwd) if cwd else "")
+    return match.group(1) if match else ""
+
+
+def gh_row(tokens, cwd, file_text):
+    if len(tokens) < 2:
+        return None
+    group = tokens[1]
+    if group == "api":
+        rest = tokens[2:]
+        method = (flag_value(rest, "-X", "--method") or "").upper()
+        endpoint = next(iter(positionals(rest, GH_VALUE_FLAGS)), "")
+        fields = any(t in ("-f", "-F", "--field", "--raw-field", "--input") or t.startswith(("--field=", "--raw-field=", "--input="))
+                     for t in rest)
+        if endpoint == "graphql":
+            if "mutation" not in " ".join(rest):
+                return None
+        elif method in ("", "GET") and not (fields and not method):
+            return None
+        values = [rest[i + 1] for i, t in enumerate(rest[:-1]) if t in ("-f", "-F", "--field", "--raw-field")]
+        excerpt = next((v for v in values if v.startswith("body=")), values[0] if values else "")
+        excerpt = excerpt.split("=", 1)[-1]
+        return "github", f"gh api {method or 'POST'}", endpoint, excerpt
+    actions = GH_ACTIONS.get(group)
+    if not actions or len(tokens) < 3 or tokens[2] not in actions:
+        return None
+    action, rest = tokens[2], tokens[3:]
+    if group == "stack":
+        return "github", f"gh stack {action}", os.path.basename(cwd.rstrip("/")) if cwd else "", ""
+    repo = flag_value(rest, "-R", "--repo") or repo_slug(cwd)
+    subject = next(iter(positionals(rest, GH_VALUE_FLAGS)), "")
+    url = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:pull|issues)/(\d+)", subject)
+    if url:
+        target = f"{url.group(1)}#{url.group(2)}"
+    elif subject.isdigit():
+        target = f"{repo}#{subject}"
+    elif action == "create":
+        target = f"{repo} new" + (f" from {flag_value(rest, '-H', '--head')}" if flag_value(rest, "-H", "--head") else "")
+    else:
+        target = f"{repo} {subject}".strip()
+    body = flag_value(rest, "-b", "--body")
+    body_file = flag_value(rest, "-F", "--body-file")
+    if body is None and body_file:
+        body = file_text(body_file) or f"(file {body_file})"
+    if body is None:
+        body = flag_value(rest, "-t", "--title") or ""
+    return "github", f"gh {group} {action}", target, body
+
+
+def git_push_row(tokens, cwd):
+    i, where = 1, cwd
+    while i < len(tokens) and tokens[i].startswith("-"):
+        opt = tokens[i].split("=", 1)[0]
+        if opt in GIT_VALUE_OPTS:
+            value = tokens[i].split("=", 1)[1] if "=" in tokens[i] else (tokens[i + 1] if i + 1 < len(tokens) else "")
+            if opt in ("-C", "--work-tree"):
+                where = os.path.join(where or "", os.path.expanduser(value))
+            i += 1 if "=" in tokens[i] else 2
+        else:
+            i += 1
+    if i >= len(tokens) or tokens[i] != "push":
+        return None
+    rest = tokens[i + 1:]
+    if any(t in ("-n", "--dry-run") for t in rest):
+        return None
+    refs = [t for t in rest if not t.startswith("-") and not re.search(r"[<>]", t)]
+    name = repo_slug(where) or os.path.basename((where or "").rstrip("/"))
+    return "git", "git push", " ".join([name] + refs).strip(), ""
+
+
+def bash_rows(command, cwd, file_text):
+    bodies = []
+
+    def keep(match):
+        line = match.group(1) + match.group(4)
+        bodies.append(match.group(5))
+        target = re.search(r"(?<![0-9&])>>?\s*([^\s|;&]+)", line)
+        if target:
+            file_text.written[os.path.expanduser(target.group(1))] = match.group(5)
+        return f"{match.group(1)}<<HEREDOC{len(bodies) - 1}{match.group(4)}"
+
+    stripped = HEREDOC.sub(keep, command or "")
+    rows, previous = [], ""
+
+    def piped_text(segment):
+        here = re.search(r"<<HEREDOC(\d+)", segment)
+        if here:
+            return bodies[int(here.group(1))]
+        tokens = words(segment)
+        if len(tokens) == 2 and tokens[0] == "cat":
+            return file_text(tokens[1])
+        return segment
+    for segment, piped in split_segments(stripped):
+        tokens = strip_prefix(words(segment))
+        here = re.search(r"<<HEREDOC(\d+)", segment)
+        here_body = bodies[int(here.group(1))] if here else ""
+        if tokens and tokens[0] == "cd" and len(tokens) > 1:
+            cwd = os.path.join(cwd or "", os.path.expanduser(tokens[1]))
+        elif tokens and os.path.basename(tokens[0]) == "pbcopy":
+            source = re.search(r"<\s*(?!<)(\S+)", segment)
+            excerpt = here_body or (file_text(source.group(1)) if source else "") or (piped_text(previous) if piped else "")
+            rows.append(("clipboard", "pbcopy", "clipboard", excerpt))
+        elif tokens and any(os.path.basename(t).startswith("slack-copy") for t in tokens[:2]):
+            args = [t for t in tokens[1:] if not os.path.basename(t).startswith("slack-copy") and not t.startswith("-")]
+            excerpt = here_body or (file_text(args[0]) if args else "") or (piped_text(previous) if piped else "")
+            rows.append(("clipboard", "slack-copy", "clipboard", excerpt))
+        elif tokens and tokens[0] == "gh":
+            row = gh_row(tokens, cwd, file_text)
+            if row:
+                rows.append(row)
+        elif tokens and tokens[0] == "git":
+            row = git_push_row(tokens, cwd)
+            if row:
+                rows.append(row)
+        previous = segment
+    return rows
+
+
+class SessionFiles:
+    def __init__(self):
+        self.written = {}
+
+    def __call__(self, path):
+        path = os.path.expanduser(path)
+        if path in self.written:
+            return self.written[path]
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read(4096)
+        except OSError:
+            return ""
+
+
+def publishing_rows(name, args, cwd, file_text):
+    if name == "bash":
+        return [r + ("bash",) for r in bash_rows(str(args.get("command", "")), cwd, file_text)]
+    if name == "session_send":
+        return [("pi-session", "session_send", one_line(args.get("to", ""), 120), args.get("note", ""), "tool")]
+    if name == "codemode":
+        return [(mcp_channel(s, t), f"{s}.{t}", mcp_target(s, a), mcp_excerpt(a), "codemode")
+                for s, t, a in codemode_calls(str(args.get("code", "")))]
+    server, tool = mcp_tool(name)
+    if server in MCP_PUBLISH and MCP_PUBLISH[server].search(tool):
+        return [(mcp_channel(server, tool), f"{server}.{tool}", mcp_target(server, args), mcp_excerpt(args), "mcp")]
+    return []
+
+
+def evidence_rows(calls, results, sid, cwd, source):
+    rows, file_text = [], SessionFiles()
+    for call_id, stamp, name, args, line_no in calls:
+        if name == "write" and args.get("path"):
+            file_text.written[os.path.expanduser(str(args["path"]))] = str(args.get("content", ""))
+            continue
+        try:
+            found = publishing_rows(name, args if isinstance(args, dict) else {}, cwd, file_text)
+        except (ValueError, TypeError, AttributeError):
+            found = []
+        result = results.get(call_id, "no-result")
+        for channel, tool, target, excerpt, via in found:
+            rows.append({"ts": stamp, "session": sid, "channel": channel, "tool": tool, "target": one_line(target, 160),
+                         "result": result, "via": via, "call_id": call_id, "excerpt": one_line(excerpt),
+                         "source": f"{source}:{line_no}"})
+    return rows
+
+
+def published_front_matter(rows):
+    lines = ["---", "published:"]
+    for row in rows:
+        lines.append(f"  - {{at: {row['ts']}, tool: {json.dumps(row['tool'])}, target: {json.dumps(row['target'])}, "
+                     f"result: {row['result']}}}")
+    return lines + ["---"]
+
+
+def evidence_tsv(rows):
+    lines = ["\t".join(EVIDENCE_COLUMNS)]
+    for row in sorted(rows, key=lambda r: (r["ts"], r["session"], r["call_id"])):
+        lines.append("\t".join(str(row.get(c, "")).replace("\t", " ").replace("\n", " ") for c in EVIDENCE_COLUMNS))
+    return "\n".join(lines) + "\n"
+
+
+def worker_tasks():
+    tasks, sessions = {}, {}
+    for path in glob.glob(os.path.join(TEAMS_DIR, "*", "archive", "agents.jsonl")):
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                agent = json.loads(line)
+            except ValueError:
+                continue
+            if agent.get("sessionId") and agent.get("task"):
+                tasks[agent["sessionId"]] = agent["task"]
+            if agent.get("sessionId") and agent.get("name"):
+                team = os.path.basename(os.path.dirname(os.path.dirname(path)))
+                sessions[(team, agent["name"])] = agent["sessionId"]
+    return tasks, sessions
+
+
+def read_session(path, tasks):
+    header, name, assignment = {}, "", ""
+    turns, signals, calls, results = [], [], [], {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, 1):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            kind = entry.get("type")
+            if kind == "session":
+                header = entry
+            elif kind == "session_info" and entry.get("name"):
+                name = entry["name"]
+            elif kind == "message":
+                message = entry.get("message") or {}
+                role = message.get("role")
+                if role == "system" and not assignment:
+                    assignment = assignment_from(message)
+                elif role == "toolResult" and message.get("toolCallId"):
+                    results[message["toolCallId"]] = "error" if message.get("isError") else "ok"
+                elif role in ("user", "assistant"):
+                    if role == "assistant" and isinstance(message.get("content"), list):
+                        calls.extend((block.get("id", ""), entry.get("timestamp", ""), block.get("name", ""),
+                                      block.get("arguments") or {}, line_no)
+                                     for block in message["content"]
+                                     if isinstance(block, dict) and block.get("type") == "toolCall")
+                    texts = [t.strip() for t in text_blocks(message.get("content")) if t.strip()]
+                    if role == "assistant":
+                        signals.extend(tool_args(message.get("content")))
+                    else:
+                        signals.extend(texts)
+                    if texts:
+                        turns.append((role, entry.get("timestamp", ""), "\n\n".join(texts)))
+    assignment = assignment or tasks.get(header.get("id", ""), "")
+    signals += [name, assignment]
+    evidence = evidence_rows(calls, results, header.get("id", os.path.basename(path)), header.get("cwd", ""), path)
+    return header, name, assignment, turns, "\n".join(signals), evidence
+
+
+def first_line(text, limit=120):
+    for line in text.splitlines():
+        line = line.strip().lstrip("#").strip()
+        line = re.sub(r"^(\S+\.(png|jpe?g|gif|webp|heic)\s*)+", "", line, flags=re.I)
+        if line:
+            return line[:limit]
+    return ""
+
+
+def session_markdown(path, header, name, assignment, turns, published=()):
+    first_user = next((t for r, _, t in turns if r == "user"), "")
+    if assignment and (not first_user or first_user.startswith(WORKER_KICKOFF)):
+        title = first_line(assignment)
+    elif first_user.startswith(WORKER_KICKOFF) and name:
+        title = name
+    else:
+        title = first_line(first_user) or name or header.get("id", "")
+    lines = published_front_matter(published) if published else []
+    lines += [f"# {title}", "", f"- session: {header.get('id', '')}", f"- cwd: {header.get('cwd', '')}",
+             f"- started: {header.get('timestamp', '')}"]
+    if name:
+        lines.append(f"- name: {name}")
+    lines += [f"- source: {path}", ""]
+    if assignment:
+        lines += ["## assignment", "", assignment, ""]
+    for role, stamp, text in turns:
+        lines += [f"## {role} {stamp}".rstrip(), "", text, ""]
+    return "\n".join(lines)
+
+
+def handoff_markdown(team, data, cwd, source):
+    lines = [f"# Handoff from {data.get('agent', '')} ({team})", "", f"- team: {team}",
+             f"- agent: {data.get('agent', '')}", f"- written: {data.get('writtenAt', '')}", f"- cwd: {cwd}",
+             f"- source: {source}", ""]
+    for key, heading in (("completedWork", "Completed work"), ("pendingTasks", "Pending tasks"),
+                         ("corrections", "Corrections"), ("stateRefs", "State refs")):
+        value = data.get(key)
+        if not value:
+            continue
+        if isinstance(value, list):
+            value = "\n".join(f"- {v}" for v in value)
+        lines += [f"## {heading}", "", str(value).strip(), ""]
+    return "\n".join(lines)
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def write_atomic(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def fingerprint(path):
+    st = os.stat(path)
+    return [st.st_size, st.st_mtime_ns]
+
+
+def task_identity(task):
+    return hashlib.sha256(task.encode()).hexdigest()[:16] if task else ""
+
+
+class Exporter:
+    def __init__(self, args):
+        self.args = args
+        self.rules = load_rules()
+        self.overrides = load_overrides()
+        self.rules_id = rules_identity()
+        self.state = read_json(STATE_PATH)
+        self.full = args.full or self.state.get("__rules__") != self.rules_id
+        self.counts = {}
+        self.session_segments = {}
+        self.published = {}
+        self.tasks, self.agent_sessions = worker_tasks()
+
+    def unchanged(self, source):
+        prior = self.state.get(source)
+        if self.full or prior is None or prior.get("fp") is None:
+            return False
+        if "task" in prior and prior["task"] != task_identity(self.tasks.get(prior.get("sid", ""), "")):
+            return False
+        try:
+            return prior["fp"] == fingerprint(source)
+        except OSError:
+            return False
+
+    def read_stable(self, source, reader):
+        for _ in range(READ_ATTEMPTS):
+            before = fingerprint(source)
+            result = reader()
+            if fingerprint(source) == before:
+                return result, before
+        return result, None
+
+    def record(self, source, segment, out, text, fp):
+        prior = self.state.get(source) or {}
+        old_out = prior.get("out")
+        key = segment or "skipped"
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if self.args.dry_run:
+            return
+        if old_out and old_out != out and os.path.isfile(old_out):
+            os.remove(old_out)
+        if out and text is not None:
+            write_atomic(out, text)
+        self.state[source] = {"fp": fp, "segment": segment, "out": out}
+
+    def sessions(self):
+        for path in sorted(glob.glob(os.path.join(SESSIONS_DIR, "*", "*.jsonl"))):
+            prior = self.state.get(path)
+            if self.unchanged(path):
+                if prior.get("segment"):
+                    self.session_segments[prior.get("sid", "")] = prior["segment"]
+                continue
+            try:
+                (header, name, assignment, turns, signals, evidence), fp = self.read_stable(
+                    path, lambda: read_session(path, self.tasks))
+            except OSError:
+                continue
+            sid = header.get("id", os.path.basename(path))
+            segment = self.overrides.get(sid) or classify(header.get("cwd", ""), signals, self.rules)
+            if segment and sid:
+                self.session_segments[sid] = segment
+            if not segment or not turns and not assignment:
+                self.record(path, segment, None, None, fp)
+            else:
+                date = (header.get("timestamp") or "")[:10] or "undated"
+                out = os.path.join(MEMORY_DIR, segment, "sessions", f"{date}-{sid}.md")
+                self.record(path, segment, out, session_markdown(path, header, name, assignment, turns, evidence), fp)
+            self.published[segment or "skipped"] = self.published.get(segment or "skipped", 0) + len(evidence)
+            if not self.args.dry_run:
+                self.state[path].update(sid=sid, task=task_identity(self.tasks.get(sid, "")), evidence=evidence)
+
+    def team_handoffs(self):
+        for path in sorted(glob.glob(os.path.join(TEAMS_DIR, "*", "handoffs", "*.json"))):
+            if self.unchanged(path):
+                continue
+            team = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            try:
+                data, fp = self.read_stable(path, lambda: read_json(path))
+            except OSError:
+                continue
+            config = read_json(os.path.join(TEAMS_DIR, team, "config.json"))
+            agent = data.get("agent") or os.path.splitext(os.path.basename(path))[0]
+            cwd = config.get("cwd", "")
+            for member in config.get("agents") or []:
+                if isinstance(member, dict) and member.get("name") == agent and member.get("cwd"):
+                    cwd = member["cwd"]
+            segment = self.session_segments.get(self.agent_sessions.get((team, agent), ""))
+            segment = segment or classify(cwd, json.dumps(data, ensure_ascii=False), self.rules)
+            out = os.path.join(MEMORY_DIR, segment, "handoffs", f"{team}-{agent}.md") if segment else None
+            self.record(path, segment, out, handoff_markdown(team, data, cwd, path) if out else None, fp)
+
+    def fork_handoffs(self):
+        for path in sorted(glob.glob(os.path.join(FORK_HANDOFFS_DIR, "*.md"))):
+            if self.unchanged(path):
+                continue
+            try:
+                text, fp = self.read_stable(path, lambda: read_text(path))
+            except OSError:
+                continue
+            match = re.search(r"\(session ([0-9a-f]{6,})\)", text.split("\n", 1)[0])
+            segment = None
+            if match:
+                segment = next((seg for sid, seg in self.session_segments.items() if sid.startswith(match.group(1))), None)
+            segment = segment or classify(HOME, text, self.rules)
+            out = os.path.join(MEMORY_DIR, segment, "handoffs", "fork-" + os.path.basename(path)) if segment else None
+            body = None
+            if out:
+                body = text.rstrip("\n") + f"\n\n- source: {path}\n"
+            self.record(path, segment, out, body, fp)
+
+    def write_evidence(self):
+        by_segment = {}
+        for source, entry in self.state.items():
+            if isinstance(entry, dict) and entry.get("segment") and entry.get("evidence"):
+                by_segment.setdefault(entry["segment"], []).extend(entry["evidence"])
+        existing = {os.path.basename(os.path.dirname(p)): p for p in glob.glob(os.path.join(MEMORY_DIR, "*", "evidence.tsv"))}
+        for segment in sorted(set(by_segment) | set(existing)):
+            path = os.path.join(MEMORY_DIR, segment, "evidence.tsv")
+            if segment not in by_segment:
+                os.remove(path)
+                continue
+            text = evidence_tsv(by_segment[segment])
+            if not os.path.isfile(path) or read_text(path) != text:
+                write_atomic(path, text)
+
+    def run(self):
+        self.sessions()
+        self.team_handoffs()
+        self.fork_handoffs()
+        if not self.args.dry_run:
+            self.write_evidence()
+            self.state["__rules__"] = self.rules_id
+            write_atomic(STATE_PATH, json.dumps(self.state, indent=1, sort_keys=True))
+        if not self.args.quiet:
+            changed = ", ".join(f"{k} {v}" for k, v in sorted(self.counts.items())) or "nothing new"
+            published = sum(self.published.values())
+            changed += f"; {published} publishing call{'s' if published != 1 else ''} in re-read sessions" if published else ""
+            print(f"pi-memory-export: {changed}{' (dry run)' if self.args.dry_run else ''}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Export pi sessions and handoffs to markdown for qmd.")
+    parser.add_argument("--full", action="store_true", help="ignore saved state and rewrite every export")
+    parser.add_argument("--dry-run", action="store_true", help="classify and count, write nothing")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    with open(LOCK_PATH, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        Exporter(args).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

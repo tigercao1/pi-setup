@@ -519,7 +519,15 @@ await test("a profile carries model, provider, skills and repo conventions", asy
 	assert.equal(r.provider, "vercel-ai-gateway", "provider travels with the model");
 	assert.equal(r.thinkingLevel, "medium");
 	assert.ok(r.profileSkills.includes("pr-approval-review"), "profile carries its review skill");
+	for (const skill of ["github-cli", "tiger-voice", "clear-message"]) assert.ok(r.profileSkills.includes(skill), `code-review carries ${skill}`);
+	assert.deepEqual(r.extensions, ["mcp"], "code-review can reach Linear/Datadog/Sentry");
 	assert.equal(r.contextFiles, true, "profile keeps AGENTS.md conventions");
+
+	const vm = resolveRuntime({ role: "worker", profile: "verifier-mcp", slim: true });
+	assert.equal(vm.model, profiles.verifier!.model, "verifier-mcp uses the verifier model");
+	assert.deepEqual(vm.extensions, ["mcp"]);
+	assert.equal(vm.contextFiles, true);
+	assert.deepEqual(vm.profileSkills, []);
 
 	// Explicit args must still win over the profile.
 	const override = resolveRuntime({
@@ -581,6 +589,59 @@ await test("team_recycle respawns with the provider the agent was started with",
 	assert.equal(record.provider, "vercel-ai-gateway");
 });
 
+await test("team_recycle replays the spawn's skills, extensions and contextFiles", async () => {
+	const skillDir = join(cwd, "recycle-skill");
+	mkdirSync(skillDir, { recursive: true });
+	const skillPath = join(skillDir, "SKILL.md");
+	writeFileSync(skillPath, "---\nname: recycle-skill\ndescription: test\n---\n");
+	assert.match(
+		await call("team_spawn", {
+			name: "recycle-skills",
+			task: "Keep my channels",
+			skills: [skillPath],
+			extensions: ["mcp"],
+			contextFiles: true,
+		}),
+		/Spawned/,
+	);
+	const before = readTeam(team)!.agents.find((a) => a.name === "recycle-skills")!;
+	assert.deepEqual(before.skills, [skillPath]);
+	assert.deepEqual(before.extensions, ["mcp"]);
+	assert.equal(before.contextFiles, true);
+
+	rmSync(argvDump, { force: true });
+	const recycled = await call("team_recycle", { name: "recycle-skills" });
+	assert.match(recycled, /Recycled/);
+	let dump = "";
+	for (let i = 0; i < 400 && !(dump.includes(":recycle-skills") && dump.includes("PI_ORCH_TEAM_NAME=")); i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		dump = existsSync(argvDump) ? readFileSync(argvDump, "utf8") : "";
+	}
+	const lines = dump.split("\n");
+	assert.equal(lines[lines.indexOf("--skill") + 1], skillPath, dump.slice(0, 400) || "(no argv dump)");
+	assert.ok(!lines.includes("--no-context-files"), "contextFiles survives the recycle");
+	const after = readTeam(team)!.agents.find((a) => a.name === "recycle-skills")!;
+	assert.deepEqual(after.skills, [skillPath]);
+	assert.deepEqual(after.extensions, ["mcp"]);
+	assert.equal(after.contextFiles, true);
+	await call("team_force_shutdown", { name: "recycle-skills" });
+});
+
+await test("settings profile skills add to a built-in profile's skills", async () => {
+	const { allProfiles } = await import("../config.ts");
+	const merged = allProfiles({
+		"code-review": { skills: ["github-cli", "clear-message"] },
+		verifier: { model: "x/y" },
+		fresh: { skills: ["a", "a"] },
+	});
+	assert.deepEqual(merged["code-review"]!.skills, ["pr-approval-review", "github-cli", "tiger-voice", "clear-message"]);
+	assert.equal(merged["code-review"]!.model, "openai/gpt-6.1-sol", "unrelated built-in fields survive");
+	assert.deepEqual(merged.verifier!.skills, [], "a profile without skills keeps the built-in list");
+	assert.equal(merged.verifier!.model, "x/y", "other fields still override");
+	assert.deepEqual(merged.fresh!.skills, ["a"]);
+	assert.equal(merged.fresh!.role, "worker");
+});
+
 await test("a profile that supplies skills suppresses the convention warning", async () => {
 	// The warning exists to catch silent convention loss; firing it when a
 	// profile already supplied the skills trains the reader to ignore it.
@@ -588,6 +649,7 @@ await test("a profile that supplies skills suppresses the convention warning", a
 		name: "warn-none",
 		task: "Review the PR for ABC-1234 and comment",
 		profile: "code-review",
+		gateExempt: "review requested by Tiger",
 	});
 	assert.ok(!withProfile.includes("NOTE: this looks like code/PR work"), withProfile);
 
@@ -735,6 +797,317 @@ await test("team_await times out instead of hanging a manager forever", async ()
 	assert.match(output, /Timed out with 1 still running: worker-a/);
 	assert.match(output, /still running/);
 	writeStatus(team, { agent: "worker-a", state: "done", output: "/tmp/haiku.md" });
+});
+
+await test("team_await greps requiredFields and shows misses and silent exits as GAP", async () => {
+	const { writeContract } = await import("../state.ts");
+	const record = (name: string) => ({
+		name, role: "worker" as const, parent: "team_lead", task: "t", cwd,
+		canSpawn: false, backend: "headless" as const, paneId: null, visible: false,
+		createdAt: new Date().toISOString(),
+	});
+	const fields = ["head SHA", "/method:\\s*\\w+/i"];
+	const okFile = join(cwd, "fields-ok.md");
+	const missFile = join(cwd, "fields-miss.md");
+	writeFileSync(okFile, "Head SHA abc1234\nMethod: rerun\n");
+	writeFileSync(missFile, "head sha abc1234 only\n");
+	for (const [name, file] of [["fields-ok", okFile], ["fields-miss", missFile], ["fields-ghost", join(cwd, "ghost.md")]] as const) {
+		addAgent(team, record(name));
+		writeContract(team, name, { outputPath: file, requiredFields: fields });
+	}
+	addAgent(team, record("fields-none"));
+	writeStatus(team, { agent: "fields-ok", state: "done", output: okFile });
+	writeStatus(team, { agent: "fields-miss", state: "done", output: missFile });
+	writeStatus(team, { agent: "fields-none", state: "done", output: okFile });
+	writeStatus(team, { agent: "fields-ghost", state: "active", note: "mid-flight" });
+
+	const output = await call("team_await", {
+		agents: ["fields-ok", "fields-miss", "fields-none", "fields-ghost"],
+		timeoutSeconds: 10,
+	});
+	assert.match(output, /\| agent \| state \| deliverable \| contract \| note \|/);
+	assert.match(output, /\| fields-ok \| done \| [^|]+ \| ok \|/);
+	assert.match(output, /\| fields-miss \| GAP \(done, fields missing\) \| [^|]+ \| missing: \/method:/);
+	assert.ok(!/fields-miss \| GAP[^\n]*head SHA/.test(output), "a literal matches case-insensitively");
+	assert.match(output, /\| fields-none \| done \| [^|]+ \| — \|/, "no requiredFields, no check");
+	assert.match(output, /\| fields-ghost \| GAP \(exited without reporting\)/);
+	assert.match(output, /GAP: fields-miss, fields-ghost\. A gap is not a pass/);
+	assert.match(output, /Nothing was respawned automatically/);
+});
+
+await test("team_await resolves a relative deliverable against the child's cwd, not the parent's", async () => {
+	const { writeContract } = await import("../state.ts");
+	const childCwd = join(cwd, "child-cwd");
+	mkdirSync(childCwd, { recursive: true });
+	writeFileSync(join(childCwd, "rel-out.md"), "## Sources\nchild\n");
+	for (const name of ["rel-child", "rel-parent-trap"]) {
+		addAgent(team, {
+			name, role: "worker", parent: "team_lead", task: "t", cwd: name === "rel-child" ? childCwd : join(cwd, "missing-dir"),
+			canSpawn: false, backend: "headless", paneId: null, visible: false, createdAt: new Date().toISOString(),
+		});
+		writeContract(team, name, { outputPath: "rel-out.md", requiredFields: ["Sources"] });
+		writeStatus(team, { agent: name, state: "done", output: "rel-out.md" });
+	}
+	writeFileSync(join(cwd, "rel-out.md"), "## Sources\nparent copy\n");
+	const output = await call("team_await", { agents: ["rel-child", "rel-parent-trap"], timeoutSeconds: 10 });
+	assert.match(output, /\| rel-child \| done \| rel-out\.md \| ok \|/);
+	assert.match(output, /\| rel-parent-trap \| GAP \(done, fields missing\) \| [^|]+ \| missing: deliverable \(rel-out\.md unreadable\)/,
+		"a parent-side file with the same relative name must not pass for the child");
+});
+
+await test("checkDone and absoluteContract: regular files only, controlled errors, paths pinned to the worker cwd", async () => {
+	const { absoluteContract, checkDone, missingFields } = await import("../contract.ts");
+	const dir = join(cwd, "cd-dir");
+	mkdirSync(join(dir, "junk"), { recursive: true });
+	writeFileSync(join(dir, "junk", "x"), "x");
+	assert.match(checkDone(dir, null, cwd) ?? "", /is not a regular file/, "a non-empty directory is not a deliverable");
+	assert.match(checkDone(join(cwd, "nope.md"), null, cwd) ?? "", /does not exist/);
+	assert.match(checkDone(join(cwd, "rel-out.md", "under-a-file"), null, cwd) ?? "", /cannot be read \(ENOTDIR\)/);
+	const childCwd = join(cwd, "child-cwd");
+	const pinned = absoluteContract({ outputPath: "rel-out.md", requiredFields: ["Sources"] }, childCwd);
+	assert.equal(pinned.outputPath, join(childCwd, "rel-out.md"));
+	assert.equal(checkDone("rel-out.md", pinned, childCwd), null);
+	assert.match(checkDone("rel-out.md", pinned, cwd) ?? "", /does not match your contract's outputPath/);
+	assert.deepEqual(missingFields(undefined, pinned, cwd), [], "an absolute contract path reads the same file from any cwd");
+	assert.deepEqual(absoluteContract({ outputFormat: "markdown" }, cwd), { outputFormat: "markdown" });
+});
+
+await test("spawn warns about a missing outputPath and unresolved skills, and still spawns", async () => {
+	const skillDir = join(cwd, ".pi", "skills", "warn-test-skill");
+	mkdirSync(skillDir, { recursive: true });
+	writeFileSync(join(skillDir, "SKILL.md"), "---\nname: warn-test-skill\ndescription: test\n---\n");
+
+	const bare = await call("team_spawn", {
+		name: "warn-contract",
+		task: "Summarise the notes",
+		skills: ["warn-test-skill", "no-such-skill-xyz"],
+		taskContract: { requiredFields: ["/([/"] },
+	});
+	assert.match(bare, /Spawned|Queued/, "a warning never refuses the spawn");
+	assert.match(bare, /WARNING: no taskContract\.outputPath/);
+	assert.match(bare, /WARNING: skill\(s\) not found from [^:]+, so the agent will NOT get them: no-such-skill-xyz\./);
+	assert.ok(!/NOT get them:[^\n]*warn-test-skill/.test(bare), "a resolvable skill is not listed");
+	assert.match(bare, /grep the agent's log/, "resolving is not reading");
+	assert.match(bare, /requiredFields entries that will never match: invalid regex/);
+
+	const clean = await call("team_spawn", {
+		name: "warn-clean",
+		task: "Summarise the notes",
+		skills: ["warn-test-skill"],
+		taskContract: { outputPath: join(cwd, "warn-clean.md"), requiredFields: ["Summary"] },
+	});
+	assert.ok(!clean.includes("WARNING"), clean);
+	await call("team_force_shutdown", { name: "warn-contract" });
+	await call("team_force_shutdown", { name: "warn-clean" });
+});
+
+console.log("review gate enforcement");
+const gateHead = "a".repeat(40);
+const gateState = join(cwd, "gate-state.json");
+writeFileSync(
+	gateState,
+	JSON.stringify({
+		pending: { head: gateHead, lanes: ["approval", "convention"], recorded: [], spawned: ["approval", "convention"] },
+		spawn_log: [
+			{ id: "S1-approval", lane: "approval", head: gateHead, model: "openai/gpt-6.1-sol", consumed: null },
+			{ id: "S2-convention", lane: "convention", head: gateHead, model: "openai/gpt-6.1-sol", consumed: null },
+			{ id: "S3-approval", lane: "approval", head: "b".repeat(40), model: "openai/gpt-6.1-sol", consumed: null },
+			{ id: "S4-approval", lane: "approval", head: gateHead, model: "openai/gpt-6.1-sol", consumed: "2026-10-22T00:00:00" },
+			{ id: "S5-approval", lane: "approval", head: gateHead, model: "openai/gpt-6.1-sol", consumed: null },
+		],
+	}),
+);
+const gateTicket = (id: string) =>
+	(JSON.parse(readFileSync(gateState, "utf8")).spawn_log as Array<{ id: string; bound?: { agent: string; team: string } }>).find(
+		(t) => t.id === id,
+	);
+const noRecord = (name: string) => !readTeam(team)!.agents.some((a) => a.name === name && !a.killedAt);
+
+await test("gate: a gate-lane reviewer spawn without gate or gateExempt is refused", async () => {
+	const viaSkill = await call("team_spawn", {
+		name: "gate-none-a",
+		task: "Review PR 12 at its head",
+		profile: "code-review",
+		skills: ["pr-approval-review", "github-cli"],
+	});
+	assert.match(viaSkill, /Refused to spawn 'gate-none-a'/);
+	assert.match(viaSkill, /effective skills include pr-approval-review/);
+	assert.match(viaSkill, /gate: \{state/);
+	assert.match(viaSkill, /gateExempt/);
+	const viaTask = await call("team_spawn", {
+		name: "gate-none-b",
+		task: "Run the convention gate lane of pr-review-gate on PR 12",
+		profile: "reviewer",
+	});
+	assert.match(viaTask, /Refused to spawn 'gate-none-b'.*PR review gate lane \(its effective skills include pr-approval-review\)/s);
+	assert.match(
+		await call("team_spawn", { name: "gate-none-c", task: "Spawned as a gate lane reviewer", profile: "reviewer", gateExempt: "  " }),
+		/Refused to spawn 'gate-none-c'/,
+		"a blank exemption is no exemption",
+	);
+	for (const name of ["gate-none-a", "gate-none-b", "gate-none-c"]) assert.ok(noRecord(name), `${name} left a record`);
+});
+
+await test("gate: a bad, stale, consumed or reused reservation is refused", async () => {
+	const base = { task: "pr-review-gate approval lane for PR 12", profile: "code-review" };
+	assert.match(
+		await call("team_spawn", { ...base, name: "gate-bad-rel", gate: { state: "gate-state.json", spawnId: "S1-approval" } }),
+		/gate\.state must be an absolute path/,
+	);
+	assert.match(
+		await call("team_spawn", { ...base, name: "gate-bad-missing", gate: { state: join(cwd, "nope.json"), spawnId: "S1-approval" } }),
+		/gate\.state does not exist/,
+	);
+	assert.match(
+		await call("team_spawn", { ...base, name: "gate-bad-id", gate: { state: gateState, spawnId: "S9-approval" } }),
+		/failed verify: spawn id S9-approval was never issued/,
+	);
+	assert.match(
+		await call("team_spawn", { ...base, name: "gate-bad-head", gate: { state: gateState, spawnId: "S3-approval" } }),
+		/failed verify: .*recorded head/,
+	);
+	assert.match(
+		await call("team_spawn", { ...base, name: "gate-bad-used", gate: { state: gateState, spawnId: "S4-approval" } }),
+		/failed verify: .*already recorded a verdict/,
+	);
+	for (const name of ["gate-bad-rel", "gate-bad-missing", "gate-bad-id", "gate-bad-head", "gate-bad-used"]) {
+		assert.ok(noRecord(name), `${name} left a record`);
+	}
+	assert.equal(gateTicket("S3-approval")?.bound, undefined, "a refused spawn binds nothing");
+});
+
+await test("gate: a valid reservation is verified, bound to the agent and not reusable", async () => {
+	const output = await call("team_spawn", {
+		name: "gate-ok",
+		task: "pr-review-gate approval lane for PR 12",
+		profile: "code-review",
+		skills: ["pr-approval-review"],
+		gate: { state: gateState, spawnId: "S1-approval" },
+	});
+	assert.match(output, /Spawned \*\*gate-ok\*\*|Queued \*\*gate-ok\*\*/, output);
+	assert.match(output, /Gate: S1-approval bound \(lane approval, head aaaaaaaaaaaa\)/);
+	assert.deepEqual(gateTicket("S1-approval")?.bound && { ...gateTicket("S1-approval")!.bound, at: undefined }, {
+		agent: "gate-ok",
+		team,
+		at: undefined,
+	});
+	const record = readTeam(team)!.agents.find((a) => a.name === "gate-ok")!;
+	assert.deepEqual(record.gate, { state: gateState, spawnId: "S1-approval" });
+
+	const reused = await call("team_spawn", {
+		name: "gate-dup",
+		task: "pr-review-gate approval lane for PR 12",
+		profile: "code-review",
+		gate: { state: gateState, spawnId: "S1-approval" },
+	});
+	assert.match(reused, /Refused to spawn 'gate-dup'.*already bound to agent gate-ok/s);
+	assert.ok(noRecord("gate-dup"));
+	await call("team_force_shutdown", { name: "gate-ok" });
+});
+
+await test("gate: team_recycle re-binds the reservation to the same agent", async () => {
+	const params = { name: "gate-rc", task: "pr-review-gate convention lane for PR 12", profile: "reviewer" };
+	assert.match(await call("team_spawn", { ...params, gate: { state: gateState, spawnId: "S2-convention" } }), /Gate: S2-convention bound/);
+	const recycled = await call("team_recycle", { name: "gate-rc" });
+	assert.match(recycled, /Recycled gate-rc\.[\s\S]*Gate: S2-convention bound/, recycled);
+	assert.equal(gateTicket("S2-convention")?.bound?.agent, "gate-rc");
+	await call("team_force_shutdown", { name: "gate-rc" });
+});
+
+await test("gate: gateExempt spawns and its reason is logged in the agent record", async () => {
+	const output = await call("team_spawn", {
+		name: "gate-exempt",
+		task: "Review https://github.com/o/r/pull/12 at abc1234, follow pr-approval-review",
+		profile: "code-review",
+		skills: ["pr-approval-review"],
+		gateExempt: "review requested by Tiger",
+	});
+	assert.match(output, /Spawned \*\*gate-exempt\*\*|Queued \*\*gate-exempt\*\*/, output);
+	assert.match(output, /Gate exempt: review requested by Tiger/);
+	const record = readTeam(team)!.agents.find((a) => a.name === "gate-exempt")!;
+	assert.equal(record.gateExempt, "review requested by Tiger");
+	assert.equal(record.gate, undefined);
+	await call("team_force_shutdown", { name: "gate-exempt" });
+});
+
+await test("gate: a code-review spawn with profile skills only and no gate or gateExempt is refused", async () => {
+	const output = await call("team_spawn", {
+		name: "gate-profile-only",
+		task: "Check each ledger row against the session transcript",
+		profile: "code-review",
+	});
+	assert.match(output, /Refused to spawn 'gate-profile-only'/);
+	assert.match(output, /effective skills include pr-approval-review/);
+	assert.match(output, /gate: \{state/);
+	assert.match(output, /gateExempt: '<reason>'/);
+	assert.ok(noRecord("gate-profile-only"));
+	assert.match(
+		await call("team_spawn", { name: "gate-profile-rv", task: "Verify the claims in /tmp/findings.md", profile: "reviewer" }),
+		/Refused to spawn 'gate-profile-rv'.*effective skills include pr-approval-review/s,
+	);
+	assert.ok(noRecord("gate-profile-rv"));
+});
+
+await test("gate: a code-review spawn with profile skills only and gateExempt is accepted, reason stored", async () => {
+	const output = await call("team_spawn", {
+		name: "gate-profile-exempt",
+		task: "Check each ledger row against the session transcript",
+		profile: "code-review",
+		gateExempt: "ledger trail review",
+	});
+	assert.match(output, /Spawned \*\*gate-profile-exempt\*\*|Queued \*\*gate-profile-exempt\*\*/, output);
+	assert.match(output, /Gate exempt: ledger trail review/);
+	assert.equal(readTeam(team)!.agents.find((a) => a.name === "gate-profile-exempt")!.gateExempt, "ledger trail review");
+});
+
+await test("gate: team_recycle of an exempt agent keeps the exempt reason", async () => {
+	const recycled = await call("team_recycle", { name: "gate-profile-exempt" });
+	assert.match(recycled, /Recycled gate-profile-exempt\.[\s\S]*Gate exempt: ledger trail review/, recycled);
+	const live = readTeam(team)!.agents.filter((a) => a.name === "gate-profile-exempt" && !a.killedAt);
+	assert.equal(live.length, 1);
+	assert.equal(live[0]!.gateExempt, "ledger trail review");
+	await call("team_force_shutdown", { name: "gate-profile-exempt" });
+});
+
+await test("gate: a code-review spawn with profile skills only and a valid gate is accepted and bound", async () => {
+	const output = await call("team_spawn", {
+		name: "gate-profile-gated",
+		task: "Review PR 12 at its head",
+		profile: "code-review",
+		gate: { state: gateState, spawnId: "S5-approval" },
+	});
+	assert.match(output, /Spawned \*\*gate-profile-gated\*\*|Queued \*\*gate-profile-gated\*\*/, output);
+	assert.match(output, /Gate: S5-approval bound \(lane approval, head aaaaaaaaaaaa\)/);
+	assert.equal(gateTicket("S5-approval")?.bound?.agent, "gate-profile-gated");
+	assert.deepEqual(readTeam(team)!.agents.find((a) => a.name === "gate-profile-gated")!.gate, {
+		state: gateState,
+		spawnId: "S5-approval",
+	});
+	await call("team_force_shutdown", { name: "gate-profile-gated" });
+});
+
+await test("gate: verifier, verifier-mcp and unprofiled spawns are unaffected", async () => {
+	const cases = [
+		{ name: "gate-free-skeptic", task: "Disprove the pr-review-gate lane counts in the report", profile: "verifier" },
+		{ name: "gate-free-mcp", task: "Check the Linear ticket claims in /tmp/findings.md", profile: "verifier-mcp" },
+		{ name: "gate-free-plain", task: "Read the pr-review-gate SKILL.md and summarise it", skills: ["pr-approval-review"] },
+	];
+	for (const params of cases) {
+		const output = await call("team_spawn", params);
+		assert.match(output, /Spawned|Queued/, `${params.name}: ${output}`);
+		assert.ok(!output.includes("Gate"), `${params.name} must not mention the gate: ${output}`);
+		await call("team_force_shutdown", { name: params.name });
+	}
+	assert.match(
+		await call("team_spawn", {
+			name: "gate-verifier-skill",
+			task: "Review PR 12",
+			profile: "verifier",
+			skills: ["pr-approval-review"],
+		}),
+		/Refused to spawn 'gate-verifier-skill'.*effective skills include pr-approval-review/s,
+		"a verifier given pr-approval-review is gate-shaped",
+	);
 });
 
 await test("team_status renders the tree", async () => {
@@ -1849,11 +2222,35 @@ await test("attention notifies the parent and flags stuck", async () => {
 	assert.equal(readAllStatuses("smoke-worker-team")["w1"]!.state, "stuck");
 });
 
+await test("write_status refuses done until the deliverable is real and on the contract path", async () => {
+	const contractFile = join(TEAMS_ROOT, "smoke-worker-team", "contracts", "w1.json");
+	mkdirSync(join(TEAMS_ROOT, "smoke-worker-team", "contracts"), { recursive: true });
+	const status = () => readAllStatuses("smoke-worker-team")["w1"]?.state;
+	const before = status();
+	const target = join(cwd, "w1-out.md");
+
+	assert.match(await call("team_write_status", { state: "done", output: join(cwd, "nope.md") }), /ERROR: status NOT recorded: .*does not exist/);
+	writeFileSync(target, "");
+	assert.match(await call("team_write_status", { state: "done", output: target }), /ERROR: .*is empty/);
+	assert.equal(status(), before, "a refused done leaves the status alone");
+
+	writeFileSync(contractFile, JSON.stringify({ outputPath: target }));
+	writeFileSync(join(cwd, "elsewhere.md"), "content");
+	assert.match(await call("team_write_status", { state: "done", output: join(cwd, "elsewhere.md") }), /does not match your contract's outputPath/);
+	assert.match(await call("team_write_status", { state: "done" }), /needs output: your contract's outputPath/);
+	assert.match(await call("team_write_status", { state: "active", note: "other states are never checked" }), /Status recorded: active/);
+	rmSync(contractFile);
+});
+
 await test("write_status records the deliverable", async () => {
-	await call("team_write_status", { state: "done", output: "/tmp/out.md", note: "finished" });
+	const out = join(cwd, "out.md");
+	writeFileSync(out, "result\n");
+	await call("team_write_status", { state: "done", output: out, note: "finished" });
 	const status = readAllStatuses("smoke-worker-team")["w1"]!;
 	assert.equal(status.state, "done");
-	assert.equal(status.output, "/tmp/out.md");
+	assert.equal(status.output, out);
+	await call("team_write_status", { state: "done", output: "out.md", note: "relative" });
+	assert.equal(readAllStatuses("smoke-worker-team")["w1"]!.output, out, "a relative output is stored against the worker's cwd");
 });
 
 await test("clean exit stays silent, failed exit reports", async () => {

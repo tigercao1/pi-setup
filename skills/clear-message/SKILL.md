@@ -13,7 +13,9 @@ the first pass.
 
 ## Order of work
 
-1. Draft with `tiger-voice` (wording and tone).
+1. Draft with `tiger-voice` (wording and tone), writing the numbered rules of the Writing addendum
+   (`~/.pi/agent/APPEND_SYSTEM.md`) in as you go, minus tiger-voice's unslop exemptions. Do not
+   draft first and clean up after.
 2. Write the intent before touching structure:
    - **kind**: `approve` (a change to how things work), `choose` (between options), `do` (a task),
      `answer` (a factual question), `confirm` (the current design is right, no change), `fyi`.
@@ -21,9 +23,11 @@ the first pass.
    If you cannot write the ask in one sentence, the message is not ready. Ask Tiger what he wants
    from the reader instead of drafting further.
 3. Apply the rules below.
-4. Run the skim test. Fix and rerun on FAIL, at most 3 rounds.
-5. Show Tiger the draft with one line under it:
-   `Skim test: PASS 3/3 — a skimmer reads it as: <the skimmers' ASK>`
+4. Run the skim test. It runs the regex lint first (`bin/slop-lint.py --voice tiger`, no model),
+   then the skimmers. Fix and rerun on FAIL, at most 3 rounds. Fix lint warnings that are real
+   hits; they never fail the test.
+5. Show Tiger the draft with the skim-test line under it, then any lint warnings you left in:
+   `Skim test: PASS 3/3. A skimmer reads it as: <the skimmers' ASK>`
    On a FAIL after 3 rounds, show the best draft anyway, say it failed, and quote what the skimmer
    understood so he can decide.
 6. Only then copy it (`slack-copy`) or hand it over.
@@ -39,8 +43,8 @@ the first pass.
    does ("pausing a card purges the hold queue").
 3. **Name the one change.** Say what would be new and add "everything else already works". Do not
    list existing behaviour next to the change; the reader cannot tell which part is proposed.
-4. **Plain words.** Replace internal terms with what happens to people: "the member never gets the
-   pickup notice", not "the hold events get dropped from the queue".
+4. **Say what happens to people.** "The member never gets the pickup notice", not "the hold events
+   get dropped from the queue". Word choice is the Writing addendum's job.
 5. **End with a question that has a short answer** matching the kind: "Ok with that?", "A or B?",
    "Can you take a look by Friday?". Not "thoughts?" on its own, and not "love to hear your thoughts"
    when a decision is needed.
@@ -65,6 +69,7 @@ the first pass.
   that to fresh readers with no context. A second fresh reader gets the whole message and must
   separate what changes from what already happens. A judge compares both with the intent.
 - Three runs; PASS needs a majority and the skimmer must name the same kind. Exit 0 = PASS.
+- `--voice tiger` is the default; pass `--voice none` for text not in his voice, or `--no-lint`.
 - About 5 seconds. Uses a small model through the gateway, with no tools, skills or context files.
 - A PASS is evidence, not proof. A FAIL is a strong signal: the usual fix is moving the question into
   the first sentence or cutting the existing behaviour out of the change.

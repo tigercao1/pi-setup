@@ -83,15 +83,22 @@ export function setOrchLevel(level: OrchLevel): void {
 }
 
 /**
- * Built-ins plus `team.profiles` from settings. Settings win, so a profile can
- * be redefined (or a new one added) without touching this file. Read at tool
- * registration, so edits need a /reload.
+ * Built-ins plus `team.profiles` from settings. Settings win for every field
+ * except `skills`, which are added to the built-in profile's skills
+ * (deduplicated, built-ins first). A new profile can be added without touching
+ * this file. Read at tool registration, so edits need a /reload.
  */
-export function allProfiles(): Record<string, Profile> {
-	const custom = readSettings().team?.profiles ?? {};
+export function allProfiles(
+	custom: Record<string, Partial<Profile>> = readSettings().team?.profiles ?? {},
+): Record<string, Profile> {
 	const merged: Record<string, Profile> = { ...NAMED_PROFILES };
 	for (const [name, profile] of Object.entries(custom)) {
-		merged[name] = { ...(merged[name] ?? { role: "worker", description: name }), ...profile };
+		const base = merged[name] ?? { role: "worker", description: name };
+		const next: Profile = { ...base, ...profile };
+		if (base.skills || profile.skills) {
+			next.skills = [...new Set([...(base.skills ?? []), ...(profile.skills ?? [])])];
+		}
+		merged[name] = next;
 	}
 	return merged;
 }
@@ -208,10 +215,12 @@ export const NAMED_PROFILES: Record<string, Profile> = {
 		model: "openai/gpt-6.1-sol",
 		provider: "vercel-ai-gateway",
 		thinkingLevel: "medium",
-		skills: ["pr-approval-review"],
+		skills: ["pr-approval-review", "github-cli", "tiger-voice", "clear-message"],
+		extensions: ["mcp"],
 		contextFiles: true,
 		description:
-			"Second-opinion PR/code review on gpt-6.1-sol with the pr-approval-review rubric",
+			"Second-opinion PR/code review on gpt-6.1-sol with the pr-approval-review rubric, github-cli, MCP for tickets/logs, " +
+			"and tiger-voice + clear-message for drafted comments",
 	},
 	verifier: {
 		role: "worker",
@@ -224,6 +233,18 @@ export const NAMED_PROFILES: Record<string, Profile> = {
 		contextFiles: false,
 		description:
 			"Hostile verifier: tries to DISPROVE a finding. Fresh empty context, never sees the worker's chat",
+	},
+	"verifier-mcp": {
+		role: "worker",
+		model: "openai/gpt-6.1-sol",
+		provider: "vercel-ai-gateway",
+		thinkingLevel: "high",
+		skills: [],
+		extensions: ["mcp"],
+		contextFiles: true,
+		description:
+			"Spawned verifier for claims whose sources sit behind MCP (Linear, Confluence, Slack, Sentry, web), " +
+			"which team_verify skeptics cannot reach. Clean context, full tooling: never give it the worker's reasoning",
 	},
 	manager: {
 		role: "orchestrator",
@@ -442,8 +463,7 @@ export function resolveSkillPath(name: string, cwd: string): string | null {
 }
 
 /** Env vars a spawned agent needs: auth, PATH, and its own identity. */
-const ROLE_GUIDE_FILE: Record<Role, string> = {
-	lead: "lead",
+const ROLE_GUIDE_FILE: Partial<Record<Role, string>> = {
 	orchestrator: "orchestrator",
 	worker: "worker",
 	evaluator: "worker",
@@ -453,7 +473,9 @@ const ROLE_GUIDE_FILE: Record<Role, string> = {
 export { spawnEnv };
 
 export function roleGuide(role: Role): string {
-	const path = join(EXT_DIR, "skills", ROLE_GUIDE_FILE[role], "SKILL.md");
+	const file = ROLE_GUIDE_FILE[role];
+	if (!file) return "";
+	const path = join(EXT_DIR, "skills", file, "SKILL.md");
 	try {
 		return readFileSync(path, "utf8");
 	} catch {
@@ -512,6 +534,10 @@ export function buildSystemPrompt(options: {
 		}
 		if (c.passDefinition) lines.push(`- **Pass**: ${c.passDefinition}`);
 		if (c.failDefinition) lines.push(`- **Fail**: ${c.failDefinition}`);
+		if (c.requiredFields?.length) {
+			lines.push("- **Required fields** (your deliverable must contain each; checked mechanically, a miss is a GAP):");
+			for (const field of c.requiredFields) lines.push(`  - \`${field}\``);
+		}
 		parts.push(lines.join("\n"));
 	}
 

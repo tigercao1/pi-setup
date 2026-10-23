@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Resolve claim pointers mechanically: the deterministic first pass of a recall reconcile.
+
+  reconcile-check CLAIMS [--note FILE]... [--repo DIR]... [--gh-repo OWNER/NAME] [--evidence TSV]...
+                  [--offline] [--format md|tsv|json]
+
+CLAIMS is a TSV with a header row or a JSON list, with fields claim, kind, pointer and optionally
+expect, state (the claim's current label; empty means proposed) and id. '-' reads stdin. --note adds
+the claim comments of a markdown or HTML note (labels in ~/.pi/agent/skills/recall/references/validity.md).
+
+kind     pointer                                   expect
+pr       URL, OWNER/NAME#N, #N or N                open, merged, closed, draft, approved (optional)
+pr-body  same                                      text the body must contain ('!text': must not)
+issue    GitHub issue URL, OWNER/NAME#N or #N      open or closed (optional)
+sha      SHA or DIR@SHA                            'on:<ref>' to require the commit on that ref
+path     path or path:line[-line]                  text the file must contain (optional)
+sent     publishing target (OWNER/NAME#N, channel  the drafted text, matched against the excerpts in
+         id, ticket id, 'clipboard'; may be empty) evidence.tsv
+auto     anything: kind inferred from the pointer
+prose    none: goes to the verifier
+
+Linear, Slack, Confluence, Granola, Datadog, Google Docs and Sentry pointers are reported needs-mcp;
+pointers with no mechanical check are needs-verifier. A pointer that exists but has no expect is
+'resolved', not confirmed. Nothing is written anywhere. Only a proposed claim whose expect matches its
+source is marked for an automatic change to confirmed; every other change is 'ask Tiger'.
+Exit 1 when any claim is contradicted or its pointer does not resolve, 0 otherwise, 2 on usage errors.
+
+Environment: PI_MEMORY_DIR (default ~/.pi/memory) for the default --evidence files.
+"""
+import argparse
+import csv
+import glob
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import labels  # noqa: E402
+
+HOME = os.path.expanduser("~")
+MEMORY_DIR = os.environ.get("PI_MEMORY_DIR") or os.path.join(HOME, ".pi", "memory")
+SHA = re.compile(r"^[0-9a-f]{7,40}$")
+REPO_SHA = re.compile(r"^(?P<repo>.+)@(?P<sha>[0-9a-f]{7,40})$")
+GH_URL = re.compile(r"^https://github\.com/(?P<repo>[^/]+/[^/]+)/(?P<what>pull|issues|commit)/(?P<id>[0-9a-f]+)")
+NUMBER = re.compile(r"^(?:(?P<repo>[\w.-]+/[\w.-]+))?(?:PR)?#?(?P<num>\d+)$", re.I)
+PATH_LINE = re.compile(r"^(?P<path>.+?):(?P<start>\d+)(?:-(?P<end>\d+))?$")
+TICKET = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d+$")
+MCP_HOSTS = (("linear.app", "linear"), ("slack.com", "slack"), ("atlassian.net", "atlassian"),
+             ("granola.ai", "granola"), ("datadoghq.com", "datadog"), ("docs.google.com", "google_docs"),
+             ("sentry.io", "sentry"))
+CLIPBOARD_TOOLS = ("pbcopy", "slack-copy")
+NOT_SENT_TOOLS = re.compile(r"_draft$|^session_send$")
+MATCH_THRESHOLD = 0.5
+FIELDS = ("id", "claim", "kind", "pointer", "expect", "state", "verdict", "facts", "evidence", "label")
+
+
+def run(cmd, cwd=None):
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    return proc.returncode == 0, proc.stdout if proc.returncode == 0 else (proc.stderr.strip() or proc.stdout.strip())
+
+
+def tokens(text):
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) >= 3}
+
+
+def overlap(draft, excerpt):
+    want, have = tokens(draft), tokens(excerpt)
+    if not want or not have:
+        return 0.0
+    return len(want & have) / min(len(want), len(have))
+
+
+class Checker:
+    def __init__(self, repos, gh_repo, evidence_files, offline):
+        self.repos = repos
+        self.gh_repo = gh_repo
+        self.offline = offline
+        self.evidence_files = evidence_files
+        self._rows = None
+
+    def evidence(self):
+        if self._rows is None:
+            self._rows = []
+            for path in self.evidence_files:
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        self._rows.extend(csv.DictReader(fh, delimiter="\t", quoting=csv.QUOTE_NONE))
+                except OSError:
+                    continue
+        return self._rows
+
+    def infer(self, pointer):
+        if not pointer:
+            return "prose"
+        url = GH_URL.match(pointer)
+        if url:
+            return {"pull": "pr", "issues": "issue", "commit": "sha"}[url["what"]]
+        if any(host in pointer for host, _ in MCP_HOSTS) or TICKET.match(pointer):
+            return "mcp"
+        if pointer.startswith(("http://", "https://")):
+            return "prose"
+        if REPO_SHA.match(pointer) or SHA.match(pointer):
+            return "sha"
+        if NUMBER.match(pointer) and "#" in pointer:
+            return "pr"
+        return "path"
+
+    def mcp_server(self, pointer):
+        for host, server in MCP_HOSTS:
+            if host in pointer:
+                return server
+        return "linear" if TICKET.match(pointer) else "the tracker"
+
+    def number(self, pointer):
+        url = GH_URL.match(pointer)
+        if url:
+            return url["repo"], url["id"]
+        m = NUMBER.match(pointer)
+        if m:
+            return m["repo"] or self.gh_repo, m["num"]
+        return None, None
+
+    def gh_view(self, what, pointer, fields):
+        repo, num = self.number(pointer)
+        if not num:
+            return None, "not a PR or issue pointer"
+        if self.offline:
+            return None, "offline"
+        cmd = ["gh", what, "view", num, "--json", fields]
+        if repo:
+            cmd += ["--repo", repo]
+        ok, out = run(cmd, cwd=str(self.repos[0]) if self.repos and not repo else None)
+        if not ok:
+            return None, f"gh {what} view failed: {out[:160]}"
+        try:
+            return json.loads(out), ""
+        except ValueError:
+            return None, "gh returned non-JSON"
+
+    def check(self, claim):
+        kind = (claim.get("kind") or "auto").strip().lower()
+        pointer = (claim.get("pointer") or "").strip()
+        if kind == "auto":
+            kind = self.infer(pointer)
+        if kind != "sent" and pointer and self.infer(pointer) == "mcp":
+            kind = "mcp"
+        handler = getattr(self, "check_" + kind.replace("-", "_"), None)
+        if not handler:
+            return "unresolved", f"unknown kind '{kind}'", ""
+        return handler(pointer, (claim.get("expect") or "").strip())
+
+    def check_prose(self, pointer, expect):
+        return "needs-verifier", "no mechanical check" + (f" for {pointer}" if pointer else ""), pointer
+
+    def check_mcp(self, pointer, expect):
+        return "needs-mcp", f"check with the {self.mcp_server(pointer)} MCP", pointer
+
+    def check_pr(self, pointer, expect):
+        data, err = self.gh_view("pr", pointer, "number,state,isDraft,mergedAt,reviewDecision,headRefOid,url")
+        if data is None:
+            return ("skipped", "gh skipped (--offline)", pointer) if err == "offline" else ("unresolved", err, pointer)
+        state = data.get("state", "").lower()
+        facts = f"{state}" + (", draft" if data.get("isDraft") else "") + \
+                (f", merged {data['mergedAt']}" if data.get("mergedAt") else "") + \
+                (f", review {data['reviewDecision'].lower()}" if data.get("reviewDecision") else "") + \
+                (f", head {data.get('headRefOid', '')[:11]}" if data.get("headRefOid") else "")
+        if not expect:
+            return "resolved", facts, data.get("url", pointer)
+        want = expect.lower()
+        actual = {"open": state == "open" and not data.get("isDraft"), "merged": state == "merged",
+                  "closed": state == "closed", "draft": bool(data.get("isDraft")),
+                  "approved": (data.get("reviewDecision") or "").lower() == "approved"}
+        if want not in actual:
+            return "unresolved", f"unknown expectation '{expect}' ({facts})", data.get("url", pointer)
+        return ("confirmed" if actual[want] else "contradicted"), facts, data.get("url", pointer)
+
+    def check_pr_body(self, pointer, expect):
+        data, err = self.gh_view("pr", pointer, "body,url")
+        if data is None:
+            return ("skipped", "gh skipped (--offline)", pointer) if err == "offline" else ("unresolved", err, pointer)
+        absent = expect.startswith("!")
+        text = expect[1:] if absent else expect
+        found = text in (data.get("body") or "")
+        facts = ("body contains" if found else "body lacks") + f" {text[:60]!r}"
+        return ("confirmed" if found != absent else "contradicted"), facts, data.get("url", pointer)
+
+    def check_issue(self, pointer, expect):
+        data, err = self.gh_view("issue", pointer, "number,state,url,closedAt")
+        if data is None:
+            return ("skipped", "gh skipped (--offline)", pointer) if err == "offline" else ("unresolved", err, pointer)
+        state = data.get("state", "").lower()
+        if not expect:
+            return "resolved", state, data.get("url", pointer)
+        return ("confirmed" if state == expect.lower() else "contradicted"), state, data.get("url", pointer)
+
+    def sha_repo(self, pointer):
+        url = GH_URL.match(pointer)
+        if url:
+            return None, url["id"], url["repo"]
+        m = REPO_SHA.match(pointer)
+        if m:
+            return [os.path.expanduser(m["repo"])], m["sha"], None
+        return [str(r) for r in self.repos], pointer, None
+
+    def check_sha(self, pointer, expect):
+        repos, sha, gh = self.sha_repo(pointer)
+        if gh:
+            if self.offline:
+                return "skipped", "gh skipped (--offline)", pointer
+            ok, out = run(["gh", "api", f"repos/{gh}/commits/{sha}", "--jq", ".sha"])
+            return ("resolved", f"commit {out.strip()[:11]} exists", pointer) if ok else ("unresolved", "commit not found", pointer)
+        if not repos:
+            return "unresolved", "SHA given but no --repo to check it in", pointer
+        for repo in repos:
+            ok, full = run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
+            if not ok:
+                continue
+            full = full.strip()
+            evidence = f"{repo}@{full[:11]}"
+            if expect.startswith("on:"):
+                ref = expect[3:]
+                inside, _ = run(["git", "-C", repo, "merge-base", "--is-ancestor", full, ref])
+                return ("confirmed" if inside else "contradicted"), f"{full[:11]} {'is' if inside else 'is not'} on {ref}", evidence
+            return "resolved", f"commit {full[:11]} exists", evidence
+        return "unresolved", "commit not in " + ", ".join(repos), pointer
+
+    def check_path(self, pointer, expect):
+        m = PATH_LINE.match(pointer)
+        raw = m["path"] if m else pointer
+        candidates = [os.path.expanduser(raw)] if os.path.isabs(os.path.expanduser(raw)) else \
+            [os.path.join(str(r), raw) for r in self.repos] + [os.path.abspath(raw)]
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            if m or expect:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+                count = len(text.splitlines())
+            if m:
+                start, end = int(m["start"]), int(m["end"] or m["start"])
+                if not 1 <= start <= end <= count:
+                    return "unresolved", f"line out of range ({count} lines)", path
+            if expect:
+                found = expect in text
+                return ("confirmed" if found else "contradicted"), ("contains" if found else "lacks") + f" {expect[:60]!r}", pointer
+            return "resolved", "exists", pointer
+        return "unresolved", "path not found", pointer
+
+    def check_sent(self, pointer, expect):
+        rows = self.evidence()
+        scope = f"searched {len(rows)} rows in {len(self.evidence_files)} evidence file(s)"
+        if pointer:
+            url = GH_URL.match(pointer)
+            wanted = (f"{url['repo']}#{url['id']}" if url and url["what"] != "commit" else pointer).lower()
+            scope += f", target ~ {wanted!r}"
+            rows = [r for r in rows if wanted in (r.get("target") or "").lower()
+                    or (wanted == "clipboard" and r.get("channel") == "clipboard")]
+        if expect:
+            scope += f", text overlap >= {MATCH_THRESHOLD}"
+            rows = [r for r in rows if overlap(expect, r.get("excerpt")) >= MATCH_THRESHOLD]
+        if not pointer and not expect:
+            return "unresolved", "sent needs a target, the drafted text, or both", ""
+        if not rows:
+            return "not-found", scope + "; not proof it was never sent", ""
+        sent = [r for r in rows if r.get("result") == "ok" and r.get("tool") not in CLIPBOARD_TOOLS
+                and not NOT_SENT_TOOLS.search(r.get("tool") or "")]
+        pick = lambda rs: max(rs, key=lambda r: r.get("ts", ""))
+        describe = lambda r: f"{r.get('tool')} -> {r.get('target')} at {r.get('ts')} ({r.get('result')}), session {r.get('session')}"
+        if sent:
+            row = pick(sent)
+            return "confirmed", f"{describe(row)}; {len(sent)} matching publishing row(s)", row.get("source", "")
+        drafts = [r for r in rows if NOT_SENT_TOOLS.search(r.get("tool") or "") and r.get("result") == "ok"]
+        if drafts:
+            row = pick(drafts)
+            return "drafted", f"{describe(row)}; a draft or a local pi message, not a sent post", row.get("source", "")
+        copies = [r for r in rows if r.get("tool") in CLIPBOARD_TOOLS and r.get("result") == "ok"]
+        if copies:
+            row = pick(copies)
+            return "clipboard", f"{describe(row)}; pasting it is only Tiger's word", row.get("source", "")
+        row = pick(rows)
+        return "attempted", f"{describe(row)}; every matching call failed or has no result", row.get("source", "")
+
+
+def label_change(state, verdict, evidence):
+    state = (state or "proposed").strip().lower()
+    if verdict == "confirmed":
+        if state == "proposed":
+            return f"auto: proposed -> confirmed ({evidence})" if evidence else "ask Tiger: resolves but no evidence link"
+        if state == "confirmed":
+            return "keep confirmed"
+        return f"ask Tiger: {state} -> confirmed ({evidence})"
+    if verdict == "contradicted":
+        return f"ask Tiger: source disagrees; supersede or drop ({state} now)"
+    if verdict == "unresolved":
+        return "fix the pointer"
+    if verdict == "resolved":
+        return f"compare the facts with the claim; an automatic change needs an expect (keep {state})"
+    if verdict in ("drafted", "clipboard"):
+        return f"ask Tiger whether he sent it (keep {state})"
+    if verdict in ("needs-mcp", "needs-verifier", "skipped"):
+        return f"pending (keep {state})"
+    return f"keep {state}"
+
+
+def read_claims(path):
+    if path == "-":
+        text = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    if text.lstrip().startswith("["):
+        return json.loads(text)
+    lines = [l for l in text.splitlines() if l.strip() and not l.startswith("#")]
+    return list(csv.DictReader(io.StringIO("\n".join(lines)), delimiter="\t", quoting=csv.QUOTE_NONE))
+
+
+def note_claims(path):
+    out = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().split("\n")
+    html = labels.is_html(path, "\n".join(lines[:5]))
+    for no, line in enumerate(lines, 1):
+        tag = labels.claim_tag(line) or (labels.data_tag(line) if html else None)
+        if not tag:
+            continue
+        text = re.sub(r"<[^>]+>", "", labels.CLAIM.sub("", line)).strip(" -*\t")
+        pointers = tag.get("evidence") or [""]
+        for pointer in pointers:
+            out.append({"id": f"{path}:{no}", "claim": text, "kind": "auto", "pointer": pointer,
+                        "state": tag.get("state", "")})
+    return out
+
+
+def render(results, fmt):
+    if fmt == "json":
+        return json.dumps(results, indent=1)
+    if fmt == "tsv":
+        return "\n".join(["\t".join(FIELDS)] + ["\t".join(str(r.get(f, "")).replace("\t", " ") for f in FIELDS)
+                                                for r in results])
+    out = ["| # | Claim | Kind | Verdict | Facts | Evidence | Label |", "|---|---|---|---|---|---|---|"]
+    for r in results:
+        cells = [r.get("id", ""), r.get("claim", "")[:90], r.get("kind", ""), r.get("verdict", ""), r.get("facts", ""),
+                 r.get("evidence", ""), r.get("label", "")]
+        out.append("| " + " | ".join(str(c).replace("|", "\\|") for c in cells) + " |")
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    out.append("")
+    out.append("Verdicts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("claims", nargs="?", help="claims TSV or JSON ('-' for stdin)")
+    ap.add_argument("--note", action="append", default=[], help="markdown or HTML note whose claim labels to check")
+    ap.add_argument("--repo", action="append", default=[], help="git repo or worktree for SHAs and relative paths")
+    ap.add_argument("--gh-repo", help="OWNER/NAME for bare #N pointers")
+    ap.add_argument("--evidence", action="append", help="evidence.tsv to search for sent claims (default: every segment's)")
+    ap.add_argument("--offline", action="store_true", help="skip gh calls")
+    ap.add_argument("--format", choices=("md", "tsv", "json"), default="md")
+    a = ap.parse_args(argv)
+    if not a.claims and not a.note:
+        ap.print_usage(sys.stderr)
+        return 2
+    try:
+        claims = read_claims(a.claims) if a.claims else []
+        for note in a.note:
+            claims += note_claims(note)
+    except (OSError, ValueError) as exc:
+        print(f"reconcile-check: {exc}", file=sys.stderr)
+        return 2
+    evidence = a.evidence if a.evidence is not None else sorted(glob.glob(os.path.join(MEMORY_DIR, "*", "evidence.tsv")))
+    checker = Checker([os.path.expanduser(r) for r in a.repo], a.gh_repo, evidence, a.offline)
+    results = []
+    for i, claim in enumerate(claims, 1):
+        verdict, facts, pointer = checker.check(claim)
+        results.append({"id": claim.get("id") or str(i), "claim": claim.get("claim", ""), "kind": claim.get("kind") or "auto",
+                        "pointer": claim.get("pointer", ""), "expect": claim.get("expect", ""),
+                        "state": claim.get("state", ""), "verdict": verdict, "facts": facts, "evidence": pointer,
+                        "label": label_change(claim.get("state"), verdict, pointer)})
+    print(render(results, a.format))
+    return 1 if any(r["verdict"] in ("contradicted", "unresolved") for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

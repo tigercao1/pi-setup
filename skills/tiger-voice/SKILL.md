@@ -17,6 +17,21 @@ Each rule is tagged:
 - **[confirmed 2026-10-15]**: Tiger agreed with it in a session.
 - **[observed]**: seen in his posted text but not yet confirmed. Follow it, and ask about it at the next alignment.
 
+## Unslop exemptions
+
+**[confirmed 2026-10-22]** The numbered rules in the Writing addendum (`~/.pi/agent/APPEND_SYSTEM.md`)
+apply to his drafts while you write them, except these:
+
+- 18: Slack emoji codes for tone (`:pray:`, `:sweat_smile:`) are fine.
+- 20: "Let me know your thoughts" is fine.
+- 22: his openers "Great question," and "Good callout," are fine.
+- 33: short fragments are fine ("Primary key is UUID", "Updating.").
+
+Rule 13 is not exempt: **[confirmed 2026-10-22]** no em dash, en dash or spaced hyphen used as a
+dash in his drafts, even though one curated example has them (those came from the agent draft).
+Rule 28 is not exempt (see the run-on rule below). Rule 24 bans only stacked hedges, so keep his
+single hedges. `clear-message/bin/slop-lint.py --voice tiger` skips the same patterns.
+
 ## Review comments on someone else's PR
 
 - **[confirmed 2026-10-15]** One or two sentences. Most are a single sentence.
@@ -29,8 +44,11 @@ Each rule is tagged:
   code, a column comment vs the implementation.
 - **[confirmed 2026-10-15]** No emoji prefix (no `:warning:`), no bold title line, no impact/trigger/evidence
   paragraph, no repro steps unless he ran a repro himself.
-- **[confirmed 2026-10-15]** Casual, conversational grammar: run-on sentences joined with commas are fine. Do not
-  polish them into formal prose.
+- **[confirmed 2026-10-22]** Casual, conversational wording, but break up long run-on sentences. He finds his
+  own comma-joined run-ons hard to read, so split a sentence that chains several clauses into two or three
+  short ones. Keep the casual words and do not polish them into formal prose. This rule wins over the
+  run-ons in the curated examples (the `TextScrubber` comment, for one). Copy their wording, not their
+  sentence length.
 - **[confirmed 2026-10-15]** Identifiers go in backticks.
 
 ## Replies on his own PRs
@@ -42,12 +60,23 @@ Every reply is in his voice, whoever the reviewer is.
   reviewer needs it to find the change, no numbering.
 - **[confirmed 2026-10-15]** The existing "Addressed in <sha>: …" replies on his PRs are agent drafts and are
   not evidence of his voice.
+- **[confirmed 2026-10-21]** Answer only the question asked, often as a fragment ("Primary key is UUID").
+  Leave out supporting detail and side points unless the reviewer asked for them.
+- **[confirmed 2026-10-21]** When agreeing to a change, write the acknowledgement plus the action and nothing
+  else: "Good callout, agreed it reads better. Updating." Don't restate the plan or the reasoning.
+- **[confirmed 2026-10-21]** When disagreeing about a name or design, say what the thing is or does ("This is
+  recording the user's decision…"), then how the alternative reads to him ("I find X feels more like…").
+  Don't write "I'd keep X". The posted original is in the curated examples (PR #79300 rename reply).
+- **[confirmed 2026-10-21]** Cite evidence as a link to the PR or source ("[create_schedule_builder_availability_templates](…/pull/77385)"),
+  not as a backticked filename.
 
 ## Any channel
 
 - **[confirmed 2026-10-15]** When the decision belongs to someone else, ask instead of recommending. Drop
   "I'd suggest…" and "Happy to … if you'd prefer". "confirming this is still the case correct?",
   "Do we want to keep logging these?"
+- **[confirmed 2026-10-21]** This also covers conditional offers in PR replies: drop "Happy to split if there's
+  a rule I'm missing". Ask the question and stop.
 - **[confirmed 2026-10-15]** Hedge what he inferred rather than verified: "seems", "I think", "IIRC", "From
   what I've found", "I would assume".
 

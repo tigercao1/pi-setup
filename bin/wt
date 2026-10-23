@@ -350,19 +350,19 @@ worktree_rows() {
   '
 }
 
-# Emits branch<TAB>number<TAB>state per line. Costs a network round trip, so
+# Emits branch<TAB>number<TAB>state<TAB>head-sha per line. Costs a network round trip, so
 # callers opt in rather than paying it on every list.
 pr_index() {
   command -v gh >/dev/null 2>&1 || return 0
   (cd "$MAIN" && gh pr list --author '@me' --state all --limit 100 \
-      --json number,headRefName,state,isDraft \
-      --template '{{range .}}{{.headRefName}}	{{.number}}	{{if .isDraft}}DRAFT{{else}}{{.state}}{{end}}
+      --json number,headRefName,headRefOid,state,isDraft \
+      --template '{{range .}}{{.headRefName}}	{{.number}}	{{if .isDraft}}DRAFT{{else}}{{.state}}{{end}}	{{.headRefOid}}
 {{end}}') 2>/dev/null || true
 }
 
 pr_lookup() {
   local index="$1" branch="$2"
-  printf '%s' "$index" | awk -F'\t' -v b="$branch" '$1==b {print $2"\t"$3; exit}'
+  printf '%s' "$index" | awk -F'\t' -v b="$branch" '$1==b {print $2"\t"$3"\t"$4; exit}'
 }
 
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
@@ -753,7 +753,122 @@ cmd_rm() {
   fi
 }
 
+file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+days_since() {
+  local then="$1"
+  [[ -n "$then" && "$then" != "0" ]] || { printf -- '-'; return; }
+  printf '%s' $(( ($(date +%s) - then) / 86400 ))
+}
+
+age_label() { if [[ "$1" == "-" ]]; then printf -- '-'; else printf '%sd' "$1"; fi; }
+
+last_session_epoch() {
+  local dir="$1" sessions safe newest
+  sessions="${WT_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
+  safe="--$(printf '%s' "${dir#/}" | tr '/:' '--')--"
+  [[ -d "$sessions/$safe" ]] || return 0
+  newest=$(ls -t "$sessions/$safe" 2>/dev/null | head -1)
+  [[ -n "$newest" ]] && file_mtime "$sessions/$safe/$newest"
+  return 0
+}
+
+cmd_audit() {
+  local with_size=no stale_days=30
+  while (($#)); do
+    case "$1" in
+      --size) with_size=yes; shift ;;
+      --stale-days)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--stale-days needs a number"
+        stale_days="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local main here index cwds
+  main="$MAIN"
+  here=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null || true)
+  index=$(pr_index)
+  cwds=$(lsof -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)
+
+  info "disk: $(df -h "$main" | awk 'NR==2 {print $4" free of "$2" ("$5" used) on "$9}')"
+  info "base: $BASE_REF   stale after: ${stale_days}d without a commit   report only, nothing is removed"
+  printf '%-28s %-8s %-7s %-8s %-6s %-9s %-9s %-6s %-28s %s\n' \
+    WORKTREE SIZE COMMIT SESSION PROCS WIP SCRATCH AHEAD STATE BUCKET
+
+  local path branch prunable size commit_age session_age procs wip scratch ahead state bucket pr status_out
+  while IFS=$'\t' read -r path branch prunable; do
+    [[ "$path" == "$main" ]] && continue
+    if [[ -n "$prunable" ]]; then
+      printf '%-28s %-8s %-7s %-8s %-6s %-9s %-9s %-6s %-28s %s\n' \
+        "$(basename "$path")" - - - - - - - "dir missing" "prune (wt clean)"
+      continue
+    fi
+
+    size=-
+    [[ "$with_size" == "yes" ]] && size=$(du -sh "$path" 2>/dev/null | cut -f1)
+    commit_age=$(days_since "$(git -C "$path" log -1 --format=%ct 2>/dev/null || echo 0)")
+    session_age=$(days_since "$(last_session_epoch "$path")")
+    procs=$(printf '%s\n' "$cwds" | awk -v p="$path" '$0 == p || index($0, p "/") == 1' | wc -l | tr -d ' ')
+    status_out=$(git -C "$path" status --porcelain 2>/dev/null || true)
+    wip=$(printf '%s\n' "$status_out" | grep -c -v -e '^??' -e '^$' || true)
+    scratch=$(printf '%s\n' "$status_out" | grep -c '^??' || true)
+    ahead=$(git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null || echo "?")
+
+    state=""
+    if [[ "$branch" != "(detached)" ]]; then
+      if git -C "$main" branch --merged "$BASE_REF" --format='%(refname:short)' 2>/dev/null \
+          | grep -qx "$branch"; then
+        state="in base"
+      fi
+      pr=""
+      [[ -n "$index" ]] && pr=$(pr_lookup "$index" "$branch")
+      if [[ -n "$pr" ]]; then
+        state="${state:+$state,}#$(cut -f1 <<<"$pr") $(cut -f2 <<<"$pr" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$(cut -f2 <<<"$pr")" == "MERGED" && "$ahead" != "0" \
+            && "$(git -C "$path" rev-parse HEAD 2>/dev/null)" == "$(cut -f3 <<<"$pr")" ]]; then
+          ahead="0(pr)"
+        fi
+      fi
+      if [[ "$(git -C "$main" for-each-ref --format='%(upstream:track)' "refs/heads/$branch")" == "[gone]" ]]; then
+        state="${state:+$state,}upstream gone"
+      fi
+    else
+      state="detached"
+    fi
+    [[ -n "$state" ]] || state="-"
+
+    if [[ "$path" == "$here" ]]; then bucket="keep: current"
+    elif [[ "$procs" != "0" ]]; then bucket="keep: in use"
+    elif [[ "$wip" != "0" ]]; then bucket="hold: uncommitted"
+    elif [[ "$ahead" != "0" && "$ahead" != "0(pr)" ]]; then bucket="hold: unpushed"
+    elif [[ "$session_age" != "-" && "$session_age" -lt 2 ]]; then bucket="verify: recent session"
+    elif [[ "$state" == *open* || "$state" == *draft* ]]; then bucket="keep: open PR"
+    elif [[ "$state" == *merged* || "$state" == *closed* ]]; then bucket="candidate: done"
+    elif [[ "$state" == *"in base"* ]]; then bucket="verify: in base, no PR"
+    elif [[ "$commit_age" != "-" && "$commit_age" -ge "$stale_days" ]]; then bucket="verify: stale"
+    else bucket="keep: active"
+    fi
+
+    printf '%-28s %-8s %-7s %-8s %-6s %-9s %-9s %-6s %-28s %s\n' \
+      "$(basename "$path")" "$size" "$(age_label "$commit_age")" "$(age_label "$session_age")" "$procs" \
+      "wip:$wip" "scratch:$scratch" "$ahead" "$state" "$bucket"
+  done < <(worktree_rows)
+  info "${C_DIM}buckets are advice; removal needs the user's explicit yes per worktree (wt rm <name>)${C_RESET}"
+}
+
 cmd_clean() {
+  local audit=no arg
+  local -a audit_args=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--audit" ]]; then audit=yes; else audit_args+=("$arg"); fi
+  done
+  if [[ "$audit" == "yes" ]]; then
+    load_profile
+    cmd_audit ${audit_args[@]+"${audit_args[@]}"}
+    return
+  fi
+  (($# == 0)) || die "unknown argument to wt clean: $1 (only 'wt clean' or 'wt clean --audit [--size] [--stale-days N]')"
   load_profile
   local main
   main="$MAIN"
@@ -820,6 +935,11 @@ Usage:
   wt path <name>                            Print a worktree path
   wt rm [-y] [--delete-branch] <name>       Remove worktree (and optionally branch)
   wt clean                                  Prune stale, report merged/closed worktrees
+  wt clean --audit [--size] [--stale-days N]
+                                            Read-only report per worktree: size, days since
+                                            last commit and pi session, live processes, wip
+                                            (tracked) and scratch (untracked) files, commits
+                                            on no remote, merge/PR state, suggested bucket
   wt profile                                Show the resolved profile for this repo
 
 Examples:

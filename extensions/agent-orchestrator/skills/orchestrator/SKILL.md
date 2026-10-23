@@ -37,6 +37,11 @@ team_spawn(...) x N        →  team_await({})        →  read deliverables
 Do not poll `team_status` in a loop instead: it burns your context on repeated trees and your
 process may exit between calls.
 
+A `GAP` row in `team_await` (required fields missing, or exited without reporting) is not a pass.
+`team_recycle` that child once with the missing fields named; after a second miss, report the gap.
+For research or analysis fan-out, follow `~/.pi/agent/skills/swarm/SKILL.md` if your parent passed
+it, or read it before you consolidate: one verifier over the union of findings, before merging.
+
 ## 4. Monitor
 
 Poll `team_status` periodically. No status update in >10 minutes means presumed stuck. Call

@@ -13,6 +13,7 @@ answers. Split them.
 | Kind | Test | Who resolves |
 |---|---|---|
 | **Evidence-resolvable** | A query, a grep, or an existing precedent settles it | **the decider agent** |
+| **Observable** | No query answers it, but running code would | a **SPIKE** |
 | **Value judgement** | Reasonable engineers with the same facts still disagree | the human |
 
 404-vs-403 (what does this codebase already do? what does the security team standardise on?),
@@ -40,6 +41,9 @@ recycle and so a human can audit the reasoning later.
 > history shows the affected population is **zero**, and the tighter per-album scope is free. The
 > decision takes ninety seconds to settle and would otherwise ship a weaker fix on a
 > confident-sounding guess.
+
+If a run can observe the answer, prototype it in a SPIKE instead of asking the human. Build both sides
+of the fork on a throwaway branch, record what happened in the ledger, and decide from that.
 
 Escalate the residue — the genuine value judgements — in **one batch**, each with a
 recommendation and the evidence behind it. Do not trickle them out one per turn.

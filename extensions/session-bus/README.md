@@ -34,13 +34,27 @@ personal mailbox, even when the sender is the only session in its folder.
 
 | `delivery` | receiver busy | receiver idle | shown as |
 |---|---|---|---|
-| `"queue"` (default) | held for its next prompt | held for its next prompt; no turn | a `session-mail` message, rendered when that prompt starts |
-| `"steer"` | steering: after the current assistant turn and its tool calls, before the next model call | a turn starts with the note | a user message, listed as `Steering: …` under the editor while queued |
+| `"queue"` | held for its next prompt | held for its next prompt; no turn | a `session-mail` message, rendered when that prompt starts |
+| `"steer"` (default) | steering: after the current assistant turn and its tool calls, before the next model call | a turn starts with the note | a user message, listed as `Steering: …` under the editor while queued |
 
 `"steer"` uses `pi.sendUserMessage(text, { deliverAs: "steer" })`, the same path as the user typing
 while the agent runs (or `/steer` in pi's examples). `wake: true` is kept as an alias for
-`delivery: "steer"`; an explicit `delivery` wins. Mail from older senders that only set `wake` is
+`delivery: "steer"`; an explicit `delivery` wins. Mail with neither field, from older senders, is
 steered too, and new mail still sets `wake` so receivers running an older bus wake for it.
+
+Steer is the default so a receiver acts on the note as soon as it arrives: an idle session starts a
+turn and acknowledges it, and a busy one picks it up after its current step.
+
+## Before sending, and long notes
+
+In an interactive session `session_send` first shows the human the target and the start of the note,
+and asks "Anything else they should know?". Text typed there is appended to the note, Enter (or Esc,
+or the 2-minute timeout) sends it as is, and `cancel` stops the send. Headless sessions are never
+asked. `PI_BUS_CONFIRM=0` turns the question off; `PI_BUS_CONFIRM_WAIT_MS` changes the timeout.
+
+A note longer than 4000 characters is never cut. The full text is written to
+`~/.pi/agent/session-bus/notes/<id>.md` and attached as the first path, and the message carries a
+1500-character preview that points at the file.
 
 During a manual `/compact` pi rejects new prompts, so steering mail is held and delivered when the
 compaction ends (acked as `deferred`). Mail left for an offline session is delivered at its next
@@ -63,7 +77,7 @@ waited on.
 | | |
 |---|---|
 | `session_list` | other sessions: alias, live/offline, directory, queued count |
-| `session_send({ to, note, paths?, shareSession?, delivery?, wake? })` | hand over context; `delivery: "queue"` (default) or `"steer"`; `wake: true` = `"steer"` |
+| `session_send({ to, note, paths?, shareSession?, delivery?, wake? })` | hand over context; `delivery: "steer"` (default) or `"queue"`; asks the human first in an interactive session; `wake: true` = `"steer"` |
 | `/sessions` | same list, as a notification |
 | `/inbox-sessions` | deliver queued messages now |
 

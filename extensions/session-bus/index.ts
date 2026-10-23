@@ -11,10 +11,11 @@
  * 1. **Files, not a socket.** The most useful message is one left for a
  *    session that is not running. It is delivered when that session next
  *    starts.
- * 2. **Never interrupting.** Mail is queued for the receiver's next prompt by
- *    default. `delivery: "steer"` (alias `wake: true`) delivers it like a
+ * 2. **Acted on, never interrupting.** By default mail is delivered like a
  *    steering message typed into that session: after its current step, or as a
- *    new turn when it is idle. The receiver's run is never aborted.
+ *    new turn when it is idle, so the receiver acknowledges it right away.
+ *    `delivery: "queue"` holds it for the receiver's next prompt instead. The
+ *    receiver's run is never aborted.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -60,6 +61,17 @@ import {
 const MAIL_TYPE = "session-mail";
 
 type LiveContext = { isIdle?: () => boolean; hasUI?: boolean; ui?: { notify?: (m: string, t?: "info" | "warning" | "error") => void } };
+
+type InputDialog = (
+	title: string,
+	placeholder?: string,
+	opts?: { timeout?: number; signal?: AbortSignal },
+) => Promise<string | undefined>;
+
+const confirmWaitMs = (): number => {
+	const fromEnv = Number.parseInt(process.env.PI_BUS_CONFIRM_WAIT_MS ?? "", 10);
+	return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 120_000;
+};
 
 const ackWaitMs = (): number => {
 	const fromEnv = Number.parseInt(process.env.PI_BUS_ACK_WAIT_MS ?? "", 10);
@@ -302,13 +314,9 @@ export default function sessionBus(pi: ExtensionAPI): void {
 		} catch {
 			// Housekeeping only.
 		}
-		self = announce(
-			identity(
-				ctx.cwd,
-				sessionKey(ctx.sessionManager?.getSessionId?.()),
-				pi.getSessionName?.() ?? ctx.sessionManager?.getSessionName?.(),
-			),
-		);
+		const currentName = (): string | undefined =>
+			pi.getSessionName?.() ?? ctx.sessionManager?.getSessionName?.();
+		self = announce(identity(ctx.cwd, sessionKey(ctx.sessionManager?.getSessionId?.()), currentName()));
 
 		// Anything left while this session was not running, to its directory or to it alone.
 		const mine = sessionAddressFor(self.key);
@@ -317,7 +325,7 @@ export default function sessionBus(pi: ExtensionAPI): void {
 		const stopMine = watchInbox(mine, (mail) => deliver(mail, "live"));
 		disposers.push(stopMine);
 		const heartbeat = setInterval(() => {
-			if (self) self = announce({ ...self, startedAt: self.startedAt });
+			if (self) self = announce({ ...self, alias: currentName()?.trim() || self.alias });
 		}, 30_000);
 		heartbeat.unref?.();
 		disposers.push(stop, () => clearInterval(heartbeat));
@@ -399,10 +407,12 @@ export default function sessionBus(pi: ExtensionAPI): void {
 			"Hand context to another pi session. Prefer sending file PATHS and a short note over pasted content — " +
 			"the receiver reads what it needs. ALWAYS works regardless of whether the target is running: an " +
 			"offline session's mail is queued and delivered the moment it next starts, so never refuse to send " +
-			"because a target is offline. `delivery` picks how a live receiver gets it: \"queue\" (default) holds it " +
-			"for the receiver's next prompt; \"steer\" delivers it like a steering message typed into that session " +
-			"(after its current assistant turn and tool calls, before its next model call; an idle receiver starts a " +
-			"turn). Neither aborts the receiver. The reply says what the receiver acknowledged.",
+			"because a target is offline. `delivery` picks how a live receiver gets it: \"steer\" (default) delivers it " +
+			"like a steering message typed into that session (after its current assistant turn and tool calls, before " +
+			"its next model call; an idle receiver starts a turn and acknowledges right away); \"queue\" holds it for the " +
+			"receiver's next prompt. Neither aborts the receiver. In an interactive session the human is asked whether " +
+			"to add anything before it is sent. Notes over 4000 characters are sent as a file. The reply says what the " +
+			"receiver acknowledged.",
 		promptGuidelines: [
 			"Use session_send to pass a finding or deliverable to a pi session working in another repo; " +
 				"send paths and a summary, not large pasted text.",
@@ -422,9 +432,9 @@ export default function sessionBus(pi: ExtensionAPI): void {
 			delivery: Type.Optional(
 				StringEnum(["queue", "steer"] as const, {
 					description:
-						'"queue" (default): shown to the receiver with its next prompt, no turn started. ' +
-						'"steer": arrives like a message the user typed while it runs: after its current step, before its ' +
-						"next model call; an idle receiver starts a turn with it. Never aborts the receiver.",
+						'"steer" (default): arrives like a message the user typed while it runs: after its current step, ' +
+						"before its next model call; an idle receiver starts a turn with it. Never aborts the receiver. " +
+						'"queue": shown to the receiver with its next prompt, no turn started.',
 				}),
 			),
 			wake: Type.Optional(
@@ -433,8 +443,8 @@ export default function sessionBus(pi: ExtensionAPI): void {
 				}),
 			),
 		}),
-		async execute(_id, params, signal) {
-			const { to, note, paths, shareSession, wake } = params as {
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const { to, paths, shareSession, wake } = params as {
 				to: string;
 				note: string;
 				paths?: string[];
@@ -459,6 +469,25 @@ export default function sessionBus(pi: ExtensionAPI): void {
 			// A reference the receiver cannot open is worse than no reference.
 			const missing = (paths ?? []).filter((p) => !pathExists(p));
 			const target = resolved.entry;
+			let note = (params as { note: string }).note;
+			const ui = (ctx as { hasUI?: boolean; ui?: LiveContext["ui"] & { input?: InputDialog } } | undefined);
+			if (ui?.hasUI && ui.ui?.input && process.env.PI_BUS_CONFIRM !== "0") {
+				const name = target.kind === "session" ? splitName(target.alias).name : basename(target.cwd);
+				const preview = note.replace(/\s+/g, " ").slice(0, 160);
+				const extra = await ui.ui.input(
+					`Sending to ${name}${paths?.length ? ` with ${paths.length} file(s)` : ""}: "${preview}${note.length > 160 ? "…" : ""}". Anything else they should know? (Enter: send as is · type cancel: don't send)`,
+					"optional: decisions, gotchas, what you want back",
+					{ timeout: confirmWaitMs(), signal },
+				);
+				const added = extra?.trim() ?? "";
+				if (added.toLowerCase() === "cancel") {
+					return {
+						content: [{ type: "text", text: `Not sent: the user cancelled the message to ${target.alias}.` }],
+						details: { cancelled: true } as Record<string, unknown>,
+					};
+				}
+				if (added) note = `${note}\n\nFrom the user, added before sending: ${added}`;
+			}
 			const message = send(target, self, {
 				note,
 				paths,

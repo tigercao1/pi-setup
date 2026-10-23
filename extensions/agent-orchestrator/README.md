@@ -69,7 +69,7 @@ Availability is gated by role, so a worker literally cannot spawn or kill anythi
 
 | Tool | Roles | Purpose |
 |---|---|---|
-| `team_spawn` | lead, sub-orch | Spawn a teammate. `name`, `task`, `canSpawn`, `model`, `provider`, `thinkingLevel`, `profile`, `extensions`, `slim`, `visible`, `cwd`, `taskContract` |
+| `team_spawn` | lead, sub-orch | Spawn a teammate. `name`, `task`, `canSpawn`, `model`, `provider`, `thinkingLevel`, `profile`, `extensions`, `slim`, `visible`, `cwd`, `taskContract`, `gate` / `gateExempt` (PR review gate reservation, see `gate.ts`; required on any profiled spawn whose effective skills, profile plus settings plus explicit, include `pr-approval-review`, i.e. every `code-review` and `reviewer` spawn; `gateExempt` is stored on the agent record and replayed by recycle) |
 | `team_status` | lead, sub-orch | Agent tree with live process state, staleness (>10 min), attention requests, and ready deliverables |
 | `team_diagnose` | lead, sub-orch | Last N lines of an agent's pane/log output |
 | `team_message` | all | Message one agent by name |
@@ -124,6 +124,17 @@ team_spawn x N  →  team_await({})  →  read deliverables  →  team_verify  �
 
 `team_await` takes a timeout (default 900s) so one stuck worker cannot hang the manager forever;
 it returns with the stragglers named.
+
+**Contract checks.** `team_write_status('done')` is refused unless the output is a regular file
+(not a directory), is non-empty, and equals the contract's `outputPath` when there is one. Relative
+paths resolve against the worker's cwd: the contract's `outputPath` at spawn, the reported output at
+`team_write_status`, and both are stored absolute. A worker spawned without an
+`outputPath` gets a `WARNING` in the spawn result. `taskContract.requiredFields` lists strings the
+deliverable must contain (a literal, matched case-insensitively, or `/regex/flags`); `team_await`
+greps each done deliverable and adds a `contract` column (`ok` / `missing: …`). A done agent with
+missing fields, or one that exited without reporting, is shown as `GAP`, never as done. Nothing is
+respawned automatically: the manager recycles once with the missing fields named, and reports a
+second miss as a gap.
 
 **When it is worth it:** 4+ workers, verbose output, or work needing verification and re-spawning
 below the lead. **When it is not:** two or three workers (the manager costs a strong-model agent and
@@ -336,7 +347,7 @@ team_spawn({
 
 ### Rules the roles follow
 
-Each spawned agent gets a role guide injected into its system prompt (`skills/{lead,orchestrator,worker}/SKILL.md`):
+Each spawned agent gets a role guide injected into its system prompt (`skills/{orchestrator,worker}/SKILL.md`). The lead has no injected guide; the opt-in `swarm` skill (`~/.pi/agent/skills/swarm/SKILL.md`) carries the fan-out, verify and consolidate process:
 
 - one agent = one deliverable file; never two agents writing the same file
 - workers report `done` with an output path, then message their parent
@@ -371,15 +382,22 @@ inherit the spawning agent's model.
 
 | Profile | Model | Carries |
 |---|---|---|
-| `code-review` | `openai/gpt-6.1-sol` | `pr-approval-review` + `AGENTS.md` conventions |
+| `code-review` | `openai/gpt-6.1-sol` | `pr-approval-review`, `github-cli`, `tiger-voice`, `clear-message`, `extensions: ["mcp"]`, `AGENTS.md` conventions |
+| `verifier` | `openai/gpt-6.1-sol` | nothing: bare context, the model `team_verify` skeptics use |
+| `verifier-mcp` | `openai/gpt-6.1-sol` | `extensions: ["mcp"]` + `AGENTS.md`: a spawned verifier for claims behind Linear/Confluence/Slack/Sentry/web |
 | `reviewer` | `openai/gpt-6.1-sol` | `pr-approval-review` + `AGENTS.md` conventions |
 | `pr-author` | inherit | `AGENTS.md` conventions (add the repo's ticket-to-PR skill via `team.profiles`) |
 | `researcher` / `coder` / `tester` / `docs-writer` | inherit | thinking level only |
 | `batch-orchestrator` | inherit | sub-orchestrator role |
 
 Skill names in a profile are resolved per-repo (the `agentOrchestrator.projectSkillRoots`
-directories, then global). A name that does not resolve in the current repo is **skipped**, not an error, so a
-profile may safely name repo-specific skills.
+directories, then global). A name that does not resolve in the current repo is skipped, not an error, so a
+profile may safely name repo-specific skills. The spawn result lists every skipped name as a `WARNING`.
+A settings profile is merged over the built-in field by field, except `skills`: a `skills` list in settings
+is added to the built-in list (deduplicated, built-ins first), so name only the extra skills.
+
+`team_recycle` replays the original spawn's `skills`, `extensions`, `contextFiles` and `slim`, so the
+replacement gets the same channels without re-stating them.
 
 Define your own in `~/.pi/agent/settings.json` — merged over the built-ins, so you can also
 redefine one:

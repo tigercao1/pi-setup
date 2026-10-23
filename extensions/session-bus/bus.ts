@@ -17,7 +17,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { postEnvelope, drainEnvelopes, watchEnvelopes, type Envelope } from "../_shared/mailbox.ts";
@@ -34,6 +34,8 @@ const HEARTBEAT_STALE_MS = 90_000;
 const REGISTRY_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 /** Inline text is clamped: send pointers, not payloads. */
 export const MAX_NOTE_CHARS = 4000;
+export const NOTE_PREVIEW_CHARS = 1500;
+export const NOTES_DIR = join(BUS_ROOT, "notes");
 /** Acks nobody collected are pruned after a day. */
 const ACK_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -96,7 +98,7 @@ export interface SendInput {
 }
 
 export const resolveDelivery = (input: { delivery?: Delivery; wake?: boolean }): Delivery =>
-	input.delivery ?? (input.wake ? "steer" : "queue");
+	input.delivery ?? "steer";
 
 export const deliveryOf = (message: BusMessage): Delivery =>
 	resolveDelivery({ delivery: message.meta?.delivery, wake: message.meta?.wake });
@@ -274,10 +276,15 @@ export function send(
 	from: { key: string; alias: string; cwd: string },
 	input: SendInput,
 ): BusMessage {
-	const note =
-		input.note.length > MAX_NOTE_CHARS
-			? `${input.note.slice(0, MAX_NOTE_CHARS)}\n\n[…truncated. Send a file path instead of pasting content.]`
-			: input.note;
+	let note = input.note;
+	let paths = input.paths;
+	if (note.length > MAX_NOTE_CHARS) {
+		const file = join(NOTES_DIR, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.md`);
+		mkdirSync(NOTES_DIR, { recursive: true });
+		writeFileSync(file, `${input.note}\n`);
+		note = `${input.note.slice(0, NOTE_PREVIEW_CHARS)}\n\n[…preview only. The full note (${input.note.length} characters) is in ${file}. Read it before acting.]`;
+		paths = [file, ...(input.paths ?? [])];
+	}
 	return postEnvelope<BusMessage>(inboxRoot(), {
 		// Addressed to the place, not the process: survives the target restarting.
 		to: to.address,
@@ -287,7 +294,7 @@ export function send(
 		meta: {
 			fromAlias: from.alias,
 			fromCwd: from.cwd,
-			paths: input.paths,
+			paths,
 			sessionRef: input.sessionRef,
 			delivery: resolveDelivery(input),
 			wake: resolveDelivery(input) === "steer",

@@ -47,6 +47,7 @@ export interface TaskContract {
 	evaluationCriteria?: string[];
 	passDefinition?: string;
 	failDefinition?: string;
+	requiredFields?: string[];
 }
 
 export interface AgentRecord {
@@ -60,6 +61,10 @@ export interface AgentRecord {
 	provider?: string;
 	thinkingLevel?: string;
 	profile?: string;
+	skills?: string[];
+	extensions?: string[];
+	contextFiles?: boolean;
+	slim?: boolean;
 	canSpawn: boolean;
 	backend: Backend;
 	/** tmux pane id, iTerm session id, or `pid:<n>` for headless. */
@@ -73,6 +78,8 @@ export interface AgentRecord {
 	sessionFile?: string;
 	/** Exact launch argv, replayed when resuming so the agent is unchanged. */
 	argv?: string[];
+	gate?: { state: string; spawnId: string };
+	gateExempt?: string;
 }
 
 export interface TeamConfig {

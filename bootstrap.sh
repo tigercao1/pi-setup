@@ -5,6 +5,7 @@ set -euo pipefail
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PI_PACKAGE="@earendil-works/pi-coding-agent"
+QMD_PACKAGE="@tobilu/qmd"
 NODE_MAJOR=22
 PLIST_LABEL="com.ycao.pi-agent-caffeinate"
 PLIST_TEMPLATE="$AGENT_DIR/templates/$PLIST_LABEL.plist.tmpl"
@@ -106,6 +107,16 @@ if [ "$PI_HAVE" = "$PI_WANTED" ]; then
 else
   note "pi ${PI_HAVE:-missing} -> $PI_WANTED"
   npm install -g "$PI_PACKAGE@$PI_WANTED" --no-audit --no-fund
+fi
+
+step "qmd"
+QMD_WANTED="$(tr -d '[:space:]' <"$AGENT_DIR/qmd-version")"
+QMD_HAVE="$(qmd --version 2>/dev/null | awk '{print $2}' || true)"
+if [ "$QMD_HAVE" = "$QMD_WANTED" ]; then
+  note "qmd $QMD_HAVE already installed"
+else
+  note "qmd ${QMD_HAVE:-missing} -> $QMD_WANTED"
+  npm install -g "$QMD_PACKAGE@$QMD_WANTED" --no-audit --no-fund
 fi
 
 step "extension dependencies"
@@ -247,6 +258,26 @@ else
         "!security find-generic-password -s <name> -w", never the key itself), then set
         defaultProvider / defaultModel in ~/.pi/agent/settings.json.
 EOF
+fi
+
+step "qmd indexes from the company layer and qmd/"
+QMD_CONFIG_DIR_OUT="${QMD_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/qmd}"
+QMD_INDEXES=()
+while IFS= read -r name; do QMD_INDEXES+=("$name"); done < <("$AGENT_DIR/qmd/render" --list)
+if [ ${#QMD_INDEXES[@]} -eq 0 ]; then
+  note "no ../homebase/qmd/*.yml.tmpl or qmd/*.yml.tmpl; skipped"
+else
+  mkdir -p "$QMD_CONFIG_DIR_OUT"
+  for name in "${QMD_INDEXES[@]}"; do
+    out="$QMD_CONFIG_DIR_OUT/$name.yml"
+    rendered="$(mktemp)"
+    "$AGENT_DIR/qmd/render" "$name" >"$rendered"
+    if [ -f "$out" ] && cmp -s "$rendered" "$out"; then
+      rm -f "$rendered"; note "qmd index '$name' config up to date"
+    else
+      mv "$rendered" "$out"; note "qmd index '$name' config rendered to $out (run: qmd --index $name update && qmd --index $name embed)"
+    fi
+  done
 fi
 
 step "daily-ledger symlink"

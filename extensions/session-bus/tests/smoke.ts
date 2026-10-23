@@ -57,17 +57,21 @@ await test("a dead session still accepts mail, delivered on its next start", () 
 	assert.equal(bus.pendingCount(offline.address), 0, "drained exactly once");
 });
 
-await test("messages carry references, and huge notes are clamped", () => {
+await test("messages carry references, and a huge note travels whole as a file", async () => {
+	const huge = "x".repeat(bus.MAX_NOTE_CHARS + 500) + "THE-END";
 	bus.send(beta, alpha, {
-		note: "x".repeat(bus.MAX_NOTE_CHARS + 500),
+		note: huge,
 		paths: ["/tmp/finding.md"],
 		sessionRef: alpha.key,
 	});
 	const [mail] = bus.receive(beta.address);
 	assert.ok(mail, "delivered");
-	assert.ok(mail!.content.length <= bus.MAX_NOTE_CHARS + 200, "note clamped");
-	assert.match(mail!.content, /truncated. Send a file path/);
-	assert.deepEqual(mail!.meta?.paths, ["/tmp/finding.md"]);
+	assert.ok(mail!.content.length <= bus.NOTE_PREVIEW_CHARS + 300, "inline part is a preview");
+	assert.match(mail!.content, /preview only\. The full note/);
+	const [file, ...rest] = mail!.meta?.paths ?? [];
+	assert.deepEqual(rest, ["/tmp/finding.md"], "caller's paths kept after the note file");
+	const { readFileSync } = await import("node:fs");
+	assert.equal(readFileSync(file!, "utf8"), `${huge}\n`, "nothing is lost");
 	assert.equal(mail!.meta?.sessionRef, alpha.key);
 	const rendered = bus.formatMessage(mail!);
 	assert.match(rendered, /from @payments/);
@@ -240,8 +244,8 @@ const until = async (cond: () => boolean, ms = 4000) => {
 	while (!cond() && Date.now() < end) await settle(50);
 };
 
-await test("delivery: queue by default, steer on request, wake as an alias for steer", () => {
-	assert.equal(bus.resolveDelivery({}), "queue");
+await test("delivery: steer by default, queue on request, wake as an alias for steer", () => {
+	assert.equal(bus.resolveDelivery({}), "steer");
 	assert.equal(bus.resolveDelivery({ wake: true }), "steer");
 	assert.equal(bus.resolveDelivery({ delivery: "steer" }), "steer");
 	assert.equal(bus.resolveDelivery({ delivery: "queue", wake: true }), "queue", "explicit delivery wins");
@@ -256,7 +260,7 @@ await test("delivery: queue by default, steer on request, wake as an alias for s
 await test("queue mail is shown at the next prompt, starts nothing, and is acked as queued", async () => {
 	const r = fakeSession({ name: "q-recv", cwd: "/repo/q-recv", key: "q-recv-0001", idle: false });
 	await r.start();
-	const m = bus.send(mk("q-recv-0001", "q-recv", "/repo/q-recv"), alpha, { note: "normal priority" });
+	const m = bus.send(mk("q-recv-0001", "q-recv", "/repo/q-recv"), alpha, { note: "normal priority", delivery: "queue" });
 	await until(() => r.custom.length > 0);
 	assert.equal(r.custom.length, 1);
 	assert.equal(r.custom[0]!.options.deliverAs, "nextTurn", "must not start a turn");
@@ -319,7 +323,7 @@ await test("steer during a manual compaction waits for it to end", async () => {
 
 await test("mail left while away is delivered at startup by its own mode", async () => {
 	const target = mk("away-0001", "away", "/repo/away");
-	bus.send(target, alpha, { note: "left queued" });
+	bus.send(target, alpha, { note: "left queued", delivery: "queue" });
 	bus.send(target, alpha, { note: "left steering", delivery: "steer" });
 	const r = fakeSession({ name: "away", cwd: "/repo/away", key: "away-0001", idle: true });
 	await r.start();
@@ -351,7 +355,9 @@ await test("session_send reports what the receiver actually did", async () => {
 	const started = await say({ to: "01bb0000-idle", note: "n", wake: true });
 	assert.match(started, /was idle; started a turn/, started);
 
-	const queued = await say({ to: "01cc0000-busy", note: "n" });
+	const queued = await say({ to: "01cc0000-busy", note: "n", delivery: "queue" });
+	const byDefault = await say({ to: "01bb0000-idle", note: "n" });
+	assert.match(byDefault, /started a turn|Delivered as steering/, `steer is the default: ${byDefault}`);
 	assert.match(queued, /queued: it will see the note with its next prompt/, queued);
 
 	// Registered and live, but nobody is reading the inbox: say so, do not claim delivery.
@@ -433,12 +439,47 @@ await test("the extension watches its own session inbox as well as its directory
 	bus.send(
 		{ ...mk("tmp-target", "x", "/repo/watch"), address: bus.sessionAddressFor(key) },
 		{ key: "zz", alias: "zz", cwd: "/z" },
-		{ note: "queued for one session" },
+		{ note: "queued for one session", delivery: "queue" },
 	);
 	sessionBus(pi as never);
 	await handlers.session_start!({}, { cwd: "/repo/watch", sessionManager: { getSessionId: () => key } });
 	assert.ok(delivered.some((d) => d.includes("queued for one session")), "delivered on start");
 	await handlers.session_shutdown!({}, {});
+});
+
+
+await test("session_send asks the human first: additions travel, cancel stops it, no UI skips it", async () => {
+	process.env.PI_BUS_ACK_WAIT_MS = "2000";
+	const sender = fakeSession({ name: "asker", cwd: "/repo/ask-sender", key: "01ab0000-asker" });
+	const recv = fakeSession({ name: "ask-recv", cwd: "/repo/ask-recv", key: "01ac0000-recv", idle: true });
+	await sender.start();
+	await recv.start();
+	const tool = sender.tools.get("session_send")!;
+	const asked: string[] = [];
+	const ctxSaying = (answer: string | undefined) => ({
+		hasUI: true,
+		ui: { input: async (title: string) => (asked.push(title), answer) },
+	});
+
+	const cancelled = await tool.execute("t", { to: "01ac0000-recv", note: "do not send me" }, undefined, undefined, ctxSaying("cancel"));
+	assert.match(cancelled.content[0]!.text, /Not sent: the user cancelled/);
+	assert.equal(recv.user.length, 0, "nothing delivered");
+	assert.match(asked[0]!, /Sending to ask-recv: "do not send me"\. Anything else they should know\?/);
+
+	await tool.execute("t", { to: "01ac0000-recv", note: "the plan" }, undefined, undefined, ctxSaying("  also check ABC-5643  "));
+	await until(() => recv.user.length > 0);
+	assert.match(recv.user[0]!.content, /the plan/);
+	assert.match(recv.user[0]!.content, /From the user, added before sending: also check ABC-5643/);
+
+	await tool.execute("t", { to: "01ac0000-recv", note: "as is" }, undefined, undefined, ctxSaying(undefined));
+	await until(() => recv.user.length > 1);
+	assert.doesNotMatch(recv.user[1]!.content, /added before sending/, "Enter, Esc or timeout sends as is");
+
+	const before = asked.length;
+	await tool.execute("t", { to: "01ac0000-recv", note: "headless" }, undefined, undefined, { hasUI: false });
+	assert.equal(asked.length, before, "a headless session is never asked");
+	delete process.env.PI_BUS_ACK_WAIT_MS;
+	for (const s of [sender, recv]) await s.stop();
 });
 
 const labels = await import("../labels.ts");

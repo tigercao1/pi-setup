@@ -21,6 +21,12 @@ still belong in the repo.
 
 When a plan references a repo file, use the repo-relative path.
 
+**Label what you write.** A note an agent writes starts as `proposed`, with the front matter (or, for
+HTML, the meta tags) from `~/.pi/agent/skills/recall/references/validity.md`. Link to the source of
+truth (ticket, PR, Slack permalink) instead of copying its status; a copied status goes stale while
+the note still looks current. When a status must be shown, write "as of <date>" next to the link.
+Labels change only as the Labels rule in `~/.pi/agent/skills/recall/SKILL.md` allows.
+
 **Never reference a local-only path in anything other people will read.** Knowledge-base plan
 documents live outside any repo and outside your teammates' reach, so a path like
 `<Project>/docs/plans/foo.md` is unreadable to everyone but the user. In Linear issues, PR
@@ -34,41 +40,12 @@ context — it reads as context while conveying nothing.
 
 ## Verify, then consolidate
 
-Whenever work is split across parallel workers, or across several rounds of my own investigation,
-the deliverable is **one document**, not a pile of per-worker reports. Never hand over "see these
-four files". Per-worker outputs are raw material.
-
-The order is fixed — **verification happens before consolidation, never after**:
-
-1. **Workers produce findings** into their own scratch files. Inputs, not deliverables.
-2. **ONE verifier** runs over the **union of all worker findings**, before I merge anything. One
-   verifier, not one per worker: cross-worker contradictions are the highest-value thing to catch
-   and only a verifier holding every finding at once can see them. Its job is adversarial — try to
-   disprove **every** claim, from a named hostile angle (default: a reader with zero context who
-   will repeat these claims out loud and be embarrassed if they are wrong). It re-derives from
-   primary sources and must never see the workers' reasoning or narrative.
-3. **I consolidate what survived** into one document — the approved paths. Disproved and
-   unverifiable claims go in a short closing section, so the reader knows what was considered and
-   dropped rather than wondering whether it was missed.
-
-Why this order and not consolidate-then-verify: consolidating first means *I* reconcile the
-contradictions, and my reconciliation is exactly the thing most likely to be wrong. A merged draft
-launders two workers' disagreement into one confident sentence before any skeptic sees it, and the
-verifier then grades my prose instead of their evidence. Verifying first keeps disagreements visible
-as raw disagreements. It is also cheaper — nothing gets carefully merged and then deleted.
-
-Rules of thumb:
-
-- Agreement between workers is **not** evidence — they may share one wrong source. Overlapping
-  claims count as one claim and get verified once, against the source, not against each other.
-- Mark every surviving claim with its support: primary source, inference, or unverifiable.
-  Inferences survive, but labelled.
-- The consolidated doc is the single thing the user reads. Per-worker files may stay on disk, cited
-  as appendices at most, never as the answer.
-- This **supersedes `team_evaluate`'s per-agent grading** for research and analysis work.
-  `team_evaluate` grades each agent against its own contract, which is the right check for "did
-  this worker do its job" and the wrong one for "is this finding true". For code work, intake's
-  per-unit gates stay as they are.
+Research and analysis split across parallel workers, or across several rounds of my own
+investigation, **MUST** follow `~/.pi/agent/skills/swarm/SKILL.md`; read it before fanning out. In
+short: the deliverable is one document, ONE adversarial verifier runs over the union of all worker
+findings before anything is merged (never after), and disproved or unverifiable claims go in a short
+closing section. This supersedes `team_evaluate`'s per-agent grading for research and analysis; for
+code work, intake's per-unit gates stay as they are.
 
 ## External side effects
 
@@ -83,25 +60,46 @@ Allowed without asking: pushing commits to the agent's own working branch and op
 When asked to copy a Slack message to the clipboard, always use the `slack-copy` skill
 (`~/.pi/agent/skills/slack-copy/SKILL.md`) so the formatting survives the paste. Never plain `pbcopy`.
 
+## Ticket work goes through intake
+
+When a message names a ticket ID or a tracker URL and asks for work on it (take, work, fix, build,
+ship, figure out), load `~/.pi/agent/skills/intake/SKILL.md` and follow it, even if I did not type
+`/skill:intake`. Questions about a ticket (status, what it says) do not trigger it.
+
 ## Reviewing a PR when I ask
 
 When I ask for a review of a PR or diff ("review this PR", a PR URL, "review this as well"), do not
-review it inline on the lead's model. Spawn one worker with `profile: "code-review"` (pinned to
-`openai/gpt-6.1-sol`), `skills: ["pr-approval-review", "github-cli", "tiger-voice", "clear-message"]`, `extensions: ["mcp"]` so it can
-reach Linear, Datadog and Sentry, and `contextFiles: true`. Give it the PR URL, the head SHA, and
-the instruction to follow `pr-approval-review` and write its verdict to a file. Do not add your own
-reading of the PR to the brief. Then end the turn. When its report arrives, relay the verdict and
-copy-paste comments without rewriting their substance. If you disagree with a finding, say so
-separately and name the evidence. The reviewer never posts to GitHub, and you do not either.
+review it inline on the lead's model. Spawn one worker with `profile: "code-review"`, which carries the
+model (`openai/gpt-6.1-sol`), the skills (`pr-approval-review`, `github-cli`, `tiger-voice`,
+`clear-message`), `extensions: ["mcp"]` for Linear, Datadog and Sentry, and `contextFiles: true`. Give it
+the PR URL, the head SHA, and the instruction to follow `pr-approval-review` and write its verdict to a
+file, and pass `gateExempt: "review requested by Tiger"`: this review sits outside the PR review gate,
+and `team_spawn` refuses a gate-shaped reviewer spawn that carries neither `gate` nor `gateExempt`.
+Do not add your own reading of the PR to the brief. Then end the turn. When its report arrives,
+relay the verdict and copy-paste comments without rewriting their substance. If you disagree with a
+finding, say so separately and name the evidence. The reviewer never posts to GitHub, and you do not
+either.
 
 If the gateway rejects the model, say so and ask before falling back to another model. Do not
 silently review it yourself instead.
 
 ## Convention review before every PR
 
+**The full gate is the `pr-review-gate` skill in the project layer's skill directory
+(`~/.pi/homebase/skills/pr-review-gate/SKILL.md`).** Every PR passes its gate lanes
+at its current head before it is marked ready: approval (`pr-approval-review`) always; convention
+(below), necessity (every hunk maps to the ticket, size budget ~400 added lines) and blast-radius
+when the gate's lane script selects them. After a push, `pr-gate-delta.sh` decides which lanes
+re-run; any lane that runs reviews the whole PR, never just the delta, and approval re-runs whenever
+app code changed. Pass `pr-review-gate` to every
+worker that opens or changes PRs. Measured 2026-10-16: a stack that passed per-delta convention
+reviews came back with 4 request-changes from one approval review (swallowed failures, non-atomic
+writes, missing retries, missing pagination), and one PR had grown to 945 lines across three concerns.
+
 Green CI is not evidence that a change follows the repo's conventions. Before opening a PR, run a
 separate convention-review pass: a fresh agent (or a `reviewer`/`code-review` worker in parallel
-with implementation) whose only job is to diff the changed files against the repo `AGENTS.md` and
+with implementation, spawned as the gate's convention lane with `gate`, or with
+`gateExempt: "convention pre-review"` before the PR exists) whose only job is to diff the changed files against the repo `AGENTS.md` and
 any directory-local `AGENTS.md`, rule by rule. The author cannot do this pass — it will re-check what it
 was already thinking about.
 
@@ -170,67 +168,39 @@ leave it alone and mention it rather than clearing it.
 
 ## What a spawned worker actually receives
 
-Measured 2026-09-22 with a nonce canary (`~/Documents/knowledge-base-remote/Pi/docs/plans/mas-flow-test/RESULTS.md`).
-The four channels are **orthogonal, default-off under `slim`, and never inherited** — not by a
-worker, not by a grandchild, not across `team_recycle`. Pass each one explicitly at every spawn.
-
-| Want the worker to have | Pass | Notes |
-|---|---|---|
-| A skill | `skills: ["name"]` | Survives `slim`. Injects name/description/path only — the **body is not in the prompt**, the worker must `read` it |
-| MCP tools (Linear, Confluence, Slack, Sentry…) | `extensions: ["mcp"]` | Without this a worker sent to read a ticket has **no way to fetch it** and will improvise or report it unreachable. Expands to `-e builtin:mcp -e builtin:codemode -e builtin:tool-search`; tools are named `mcp__<server>__<tool>` and are reached through `tool_search` or a `codemode` script, not pre-declared |
-| These house rules | `contextFiles: true` | Off by default. A sub-orchestrator without it will not follow the process rules in this file |
-| Everything | `slim: false` | Expensive; prefer naming what is needed |
+Skills, extensions (`["mcp"]` for Linear, Confluence, Slack, Sentry), `contextFiles` and `slim` are
+orthogonal, default-off under `slim`, and never inherited by a worker or a grandchild. Pass each one
+explicitly at every spawn; `team_recycle` re-passes what the original spawn had. The details live on `team_spawn`'s
+parameters; a skill passes its name and path only, so the worker must `read` the body.
 
 **`~/.pi/agent/APPEND_SYSTEM.md` is a fifth channel and it is not optional.** Measured 2026-09-23
 with a canary: it reaches *every* pi process, including a `team_verify` skeptic launched with the
 full isolation set (`--no-extensions --no-skills --no-context-files --no-session`). `pi --help`
-offers no flag that suppresses it — `--no-context-files` disables AGENTS.md/CLAUDE.md only. So put
-nothing there that a blind verifier must not see: it is the one channel that bypasses the
-isolation the verifier design depends on. Global output-style rules are fine; repo conventions,
-project framing and anything resembling an argument are not.
+offers no flag that suppresses it. So put nothing there that a blind verifier must not see.
+Global output-style rules are fine; repo conventions, project framing and anything resembling an
+argument are not.
 
-**Always confirm a skill was read, never that it was passed.** A name that does not resolve from
-the worker's `cwd` is **silently dropped** (`agent-orchestrator/config.ts:488` —
-`if (path) argv.push(...)`, no else) and the spawn still returns success. Confirm by grepping the
-worker log for the skill path. Passing a skill is not evidence; reading it is.
+**Always confirm a skill was read, never that it was passed.** `team_spawn` lists names that do not
+resolve from the worker's `cwd` as a WARNING, but resolving is not reading. Confirm by grepping the
+worker log for the skill path (`grep -c <skill-name> ~/.pi/orchestrator-teams/*/logs/<agent>.log`);
+zero hits means it never read the skill, whatever it claims. Do not ask the worker to restate the
+skill's headings instead.
 
-### Give the verifier every tool it needs
-
-A verifier is **clean context, full tooling** — the isolation that matters is that it never sees the
-worker's reasoning, not that it is denied the means to check. A verifier without the tools to open
-the sources cannot verify; it can only agree. Spawn it with `extensions: ["mcp"]` whenever the
-sources are Confluence/Linear/Slack/Sentry/web, plus any skill it needs to interpret them, plus
-`contextFiles: true`.
-
-`team_verify`'s built-in skeptics **cannot be configured** — they are hard-coded to
-`--no-extensions --no-skills --no-context-files --no-session` (`verify.ts:164`). Measured
-2026-09-22: they **do** have `read`/`bash`, so local files and repo paths are fine (a skeptic
-checked a file's mtime unprompted). They have **no MCP**, so a ticket, Confluence page or URL is
-out of reach. Use `team_verify` for claims checkable on disk or by reasoning; for anything behind
-MCP, spawn a dedicated verifier instead.
-
-One claim per verification call — a compound finding can pass while hiding a defect inside it.
+A verifier is **clean context, full tooling**: it never sees the worker's reasoning, but it has the
+means to check. For sources behind MCP, spawn one with `profile: "verifier-mcp"` plus any skill it
+needs; `team_verify`'s limits are in its tool guidelines.
 
 ## Skills must actually load in the worker
 
 **All skills live in the pi skill directories: `~/.pi/agent/skills/` or a skill directory listed in
 `~/.pi/agent/settings.json`. Never keep a skill inside a repo's `.claude/`, and never symlink one in.**
-A repo-local skill name only resolves if the directory is visible from the worker's `cwd`. A
-gitignored skill directory is absent from a freshly created worktree, so the name resolves to
-nothing — silently. The spawn still returns success and the worker invents its own conventions. A
-force-added copy in a subdirectory *does* appear in worktrees, which masks the gap.
+A repo-local skill name only resolves if the directory is visible from the worker's `cwd`, and a
+gitignored skill directory is absent from a freshly created worktree. A force-added copy in a
+subdirectory *does* appear in worktrees, which masks the gap.
 
-When spawning:
-
-1. Pass skills by name (they resolve from `~/.pi/agent/skills/` and the settings skill directories)
-   or by absolute path. Never by a repo-relative path.
-2. If a skill you need still only exists in a repo, **move it into a pi skill directory first**
-   (`~/.pi/agent/skills/` for personal skills, the project layer's skill directory for project
-   ones) rather than pointing at it in place.
-3. Verify it loaded before trusting the output: grep its log
-   (`grep -c <skill-name> ~/.pi/orchestrator-teams/*/logs/<agent>.log`). Zero hits means it never read
-   the skill, whatever it claims. Do not ask the worker to restate the skill's headings instead — one
-   that never read it can still produce plausible ones.
+Pass skills by name or by absolute path, never by a repo-relative path. If a skill you need still
+only exists in a repo, move it into a pi skill directory first (`~/.pi/agent/skills/` for personal
+skills, the project layer's skill directory for project ones) rather than pointing at it in place.
 
 ## Do not dictate PR descriptions in a task brief
 
@@ -243,12 +213,10 @@ Depth belongs in the ticket and the plan documents, not the PR body.
 
 ## Team worker reliability
 
-A `team_spawn`/`team_recycle` call returning success does NOT mean the worker is healthy — workers
-can die immediately on a turn/lifecycle limit and the spawn still returns ok. After every
-spawn/recycle, verify the worker actually started before moving on: a quick `team_status` (or
-`team_diagnose`) to confirm it is alive and progressing, not already `exited`. If it exited without
-reporting done, `team_recycle` it again with a handoff telling the replacement to checkpoint early
-and work in smaller increments.
+A `team_spawn`/`team_recycle` success does not mean the worker is healthy. A startup crash arrives
+as a "Spawn failed" message and an exit without a report shows as GAP in `team_await`; recycle such a
+worker once with a handoff telling it to checkpoint early. If an expected `done` message never
+arrived, check `team_status` rather than waiting.
 
 Sleep protection has one holder: the launchd service `com.ycao.pi-agent-caffeinate`
 (`~/.pi/agent/bin/agent-caffeinate.sh`). Every 5s it checks for live spawned agents and for
@@ -258,10 +226,6 @@ only agents are, and releases when neither is. Dead pids are ignored and their m
 Check `~/.pi/agent/logs/agent-caffeinate.log` for HOLD/RELEASE lines, which name the reason, if a
 worker stalls. This does not
 survive a lid close — for that, `sudo pmset -a disablesleep 1` (and set it back to `0` after).
-
-Do not assume completion. A worker that goes quiet may have died without its report reaching the
-lead. When picking up results, if an expected `done` message never arrived, check `team_status`
-rather than waiting indefinitely.
 
 ## Stacked PRs
 
@@ -299,8 +263,8 @@ pass — it is easy to skim as green.
 
 **Whenever a task involves more than one dependent PR, load
 `~/.pi/agent/skills/github-stacked-prs/SKILL.md` before starting, and pass it to any worker you
-spawn.** Note that `team_recycle` does NOT carry over a worker's `skills` — re-state them in the
-recycle context.
+spawn.** `team_recycle` keeps the skills the worker was spawned with, so the replacement gets it
+too.
 
 ## PR draft state
 

@@ -1,0 +1,77 @@
+global_context: "Tiger Cao's personal knowledge: building his pi agent setup (skills, extensions, orchestrator), and personal side projects. Plans and research from the knowledge base, exported pi session transcripts (user and assistant text only), and agent handoff notes. Company work is routed to the work index, but routing is by folder and session rules, not a content guarantee: some personal plans and sessions mention company work."
+
+collections:
+  pi-plans:
+    path: "$HOME/Documents/knowledge-base-remote"
+    pattern: "{Pi,pi-extensions}/**/*.md"
+    ignore:
+      - "Pi/voice/**"
+      - "Pi/docs/plans/show-me-cleanup/*hb-*.md"
+      - "Pi/docs/plans/show-me-cleanup/showme-exec-hb-*/**"
+    context:
+      "/Pi": "Plans, research and verification reports for Tiger's pi setup: skills, extensions, orchestrator, portable setup. One folder per topic under docs/plans; RESUME.md marks paused work."
+      "/pi-extensions": "Pi extension packages and their plans (shop-pi-fy, agent-teams)."
+  pi-sessions:
+    path: "$HOME/.pi/memory/pi/sessions"
+    pattern: "**/*.md"
+    context:
+      "/": "Pi sessions about the pi setup itself, or started in the home directory without a clear project. Title is the first user line; header gives cwd, start time and session id."
+  pi-handoffs:
+    path: "$HOME/.pi/memory/pi/handoffs"
+    pattern: "**/*.md"
+    context:
+      "/": "Handoff notes: orchestrator worker handoffs (team-<id>-<agent>.md) and session-fork handoffs (fork-*.md)."
+  pi-config:
+    path: "$HOME/.pi/agent"
+    pattern: "{AGENTS.md,APPEND_SYSTEM.md,README.md,skills/**/*.md,extensions/*/README.md}"
+    context:
+      "/": "Tiger's personalized pi config: global agent rules (AGENTS.md), the appended system prompt, personal skills and extension READMEs."
+  ssms:
+    path: "$HOME/.pi/memory/ssms"
+    pattern: "**/*.md"
+    context:
+      "/": "SSMS (ssnow management system: ssms-api Rails API and ssms-portal frontend) pi sessions and handoffs."
+  ssms-notes:
+    path: "$HOME/Documents/knowledge-base-remote"
+    pattern: "{SSMS,ssnow-management-system-plan}/**/*.md"
+    context:
+      "/": "SSMS plans, reviews and research notes."
+  financial-analyst-agent:
+    path: "$HOME/.pi/memory/financial-analyst-agent"
+    pattern: "**/*.md"
+    context:
+      "/": "Financial analyst agent project pi sessions and handoffs (repo tigercao1/financial-analyst-agent, fa-* worktrees)."
+  financial-analyst-agent-notes:
+    path: "$HOME"
+    pattern: "{Documents/knowledge-base-remote/financial-analyst-agent/**/*.md,projects/*.md}"
+    context:
+      "/": "Financial analyst agent plans, decisions and run reports."
+  carpool:
+    path: "$HOME/.pi/memory/carpool"
+    pattern: "**/*.md"
+    context:
+      "/": "Carpool project pi sessions."
+  carpool-notes:
+    path: "$HOME/Documents/knowledge-base-remote/Carpool"
+    pattern: "**/*.md"
+    context:
+      "/": "Carpool project plans."
+  urban-dollop:
+    path: "$HOME/.pi/memory/urban-dollop"
+    pattern: "**/*.md"
+    context:
+      "/": "urban-dollop project pi sessions."
+  misc:
+    path: "$HOME/.pi/memory/misc"
+    pattern: "**/*.md"
+    context:
+      "/": "Pi sessions from folders that match no project."
+  misc-notes:
+    path: "$HOME/Documents/knowledge-base-remote"
+    pattern: "{growth-agent,SheepMatch,b2b-in-collective,resume-craft,interview-questions,Interview transcript}/**/*.md"
+    context:
+      "/": "Other personal notes: past-job projects, side ideas, resume and interview prep."
+models:
+  embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
+  generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
+  rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
