@@ -1,0 +1,10 @@
+{
+  "name": "pi-starter",
+  "version": "0.1.0",
+  "author": "Tiger Cao",
+  "description": "A starter set of pi extensions: an agent orchestrator for teams of pi workers (tmux/iTerm2 panes or headless), a session mailbox, session fork, tab titles, notifications, a sleep guard, /fresh with a recall skill, a lead output cap, git worktrees, and the jev evaluator.",
+  "type": "extension",
+  "tags": ["orchestration", "multi-agent", "sessions", "worktree", "notifications", "productivity"],
+  "license": "UNLICENSED",
+  "hosted": true
+}
