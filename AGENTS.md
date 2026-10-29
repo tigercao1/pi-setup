@@ -70,7 +70,7 @@ ship, figure out), load `~/.pi/agent/skills/intake/SKILL.md` and follow it, even
 
 When I ask for a review of a PR or diff ("review this PR", a PR URL, "review this as well"), do not
 review it inline on the lead's model. Spawn one worker with `profile: "code-review"`, which carries the
-model (`openai/gpt-6.1-sol`), the skills (`pr-approval-review`, `github-cli`, `tiger-voice`,
+model (the `code-review` persona in `~/.pi/agent/models.json`; `pi-models show`), the skills (`pr-approval-review`, `github-cli`, `tiger-voice`,
 `clear-message`), `extensions: ["mcp"]` for Linear, Datadog and Sentry, and `contextFiles: true`. Give it
 the PR URL, the head SHA, and the instruction to follow `pr-approval-review` and write its verdict to a
 file, and pass `gateExempt: "review requested by Tiger"`: this review sits outside the PR review gate,
@@ -162,8 +162,10 @@ Keep every PR within its ticket's intended scope.
 
 ## Linear
 
-Never set, change, or clear the `estimate` (story points) field on Linear issues. Estimates are
-set manually by the user. If a write to an issue causes Linear to reapply a team-default estimate,
+Estimates (story points): follow `~/.pi/homebase/skills/linear-estimate/SKILL.md`. Set the
+`estimate` field on issues you create, with its rubric and a one-line reason in your report. On an
+existing issue, set it only when it is empty and the user asked for it in that session. Never change
+or clear an estimate the user set. If a write causes Linear to reapply a team-default estimate,
 leave it alone and mention it rather than clearing it.
 
 ## What a spawned worker actually receives

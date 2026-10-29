@@ -1,8 +1,8 @@
 {
-  "lastChangelogVersion": "1.2.0",
+  "lastChangelogVersion": "1.4.0",
   "theme": "dark",
   "defaultProvider": "vercel-ai-gateway",
-  "defaultModel": "anthropic/claude-opus-5.5",
+  "defaultModel": "anthropic/claude-sonnet-5.5",
   "defaultThinkingLevel": "medium",
   "extensions": [
     "+extensions/ding/index.ts"
@@ -11,5 +11,41 @@
     "+codemode",
     "+tool_search"
   ],
-  "hideThinkingBlock": true
+  "hideThinkingBlock": true,
+  "contextWatcher": {
+    "enabled": true,
+    "warnTokens": 200000,
+    "suggestTokens": 250000
+  },
+  "leadOutputCap": {
+    "enabled": true,
+    "thresholdBytes": 8192,
+    "exemptTools": [],
+    "secretTools": [],
+    "retentionDays": 7
+  },
+  "leadTrial": {
+    "enabled": true,
+    "until": "2026-11-05",
+    "models": [
+      "anthropic/claude-sonnet-5.5",
+      "anthropic/claude-opus-5.5"
+    ]
+  },
+  "team": {
+    "profiles": {
+      "coder": {
+        "model": "anthropic/claude-opus-5.5",
+        "provider": "vercel-ai-gateway"
+      },
+      "pr-author": {
+        "model": "anthropic/claude-opus-5.5",
+        "provider": "vercel-ai-gateway"
+      },
+      "tester": {
+        "model": "anthropic/claude-opus-5.5",
+        "provider": "vercel-ai-gateway"
+      }
+    }
+  }
 }
