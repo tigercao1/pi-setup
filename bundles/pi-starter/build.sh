@@ -3,8 +3,17 @@
 # allowlist, then check it against the registry's hosted-package rules and for personal strings.
 #
 #   ./build.sh            build dist/ and check it
-#   (cd dist && hb-registry publish --dry-run)
+#   ./build.sh --stage    also copy dist/ to a temp folder outside any git checkout and print it;
+#                         publish from there (hb-registry skips git-ignored files, and dist/ is ignored)
 set -euo pipefail
+
+STAGE=0
+for arg in "$@"; do
+  case "$arg" in
+    --stage) STAGE=1 ;;
+    *) echo "usage: $0 [--stage]" >&2; exit 2 ;;
+  esac
+done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -171,3 +180,11 @@ if [ "${#PROBLEMS[@]}" -gt 0 ]; then
   exit 1
 fi
 echo "checks: passed (allowlist, pi.extensions, imports, no symlinks/node_modules/.git, personal strings, registry limits)"
+
+if [ "$STAGE" = 1 ]; then
+  STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-starter-stage.XXXXXX")/pi-starter"
+  cp -Rp "$OUT" "$STAGE_DIR"
+  ! git -C "$STAGE_DIR" rev-parse --git-dir >/dev/null 2>&1 || die "stage dir $STAGE_DIR is inside a git checkout"
+  echo "staged: $STAGE_DIR"
+  echo "next: (cd $STAGE_DIR && hb-registry publish --dry-run)"
+fi
