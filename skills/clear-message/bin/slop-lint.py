@@ -28,7 +28,7 @@ CHECKS = [
     (8, words("serves as", "stands as", "boasts?"), "say 'is' or 'has'", ()),
     (9, re.compile(r"\bnot (?:just|only)\b[^.?!\n]{1,60}?,? but\b", I), "'not just X, but Y'", ()),
     (13, re.compile(r"[\u2014\u2013]"), "em/en dash", ()),
-    (13, re.compile(r"(?<=\S) (?:-|--) (?=\S)"), "spaced hyphen used as a dash", ()),
+    (13, re.compile(r"(?<=\S) (?:-|--) (?=\S)"), "spaced hyphen used as a dash", ("tiger",)),
     (16, re.compile(r"\*\*[^*\n]+(?::\*\*|\*\*:)"), "bold inline label", ()),
     (19, re.compile(r"[\u201c\u201d\u2018\u2019]"), "curly quote", ()),
     (20, re.compile(r"\b(?:I hope this helps|of course!|certainly!|happy to help|feel free to)", I),

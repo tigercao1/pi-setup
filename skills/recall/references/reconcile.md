@@ -30,8 +30,8 @@ find <folder> -type f | sort            # every file, every depth
 ```
 
 Read every text file in scope, including `evidence/`, `build/`, `prod-run/`-style subfolders,
-`report.md` files, JSON results and generated HTML pages. Write the inventory into the claim file
-first: path, line count, read or skipped. A skipped file needs a reason ("binary", "vendored
+`report.md` files, JSON results and generated HTML pages. Write the inventory first, in its own
+file (`inventory.md` beside the claim file, not inside it): path, line count, read or skipped. A skipped file needs a reason ("binary", "vendored
 copy of X"). "Background" is not a reason; the hand run skipped `evidence/` and `build/` as
 background and missed 15 claim groups.
 
@@ -40,15 +40,60 @@ data source feeds each tick or status cell.
 
 ## b. Extract claims, one per row
 
-Claim file columns: `# | claim | source file:line | kind | pointer | label now | label proposed`.
+Write two files. The working notes (`claims.md`: the claim, its evidence kind, `label now`,
+`label proposed`, remarks) are for you and the verifier. The machine claim file (`claims.tsv`) is
+what `reconcile-check` reads, and it has exactly this schema, nothing more:
+
+```text
+id	claim	source	kind	pointer	expect	state
+c1	PR 123 merged	notes/plan.md:14	pr	OWNER/REPO#123	merged	proposed
+c2	the guard is on line 40	notes/plan.md:15	path	app/guard.rb:40	def guard	proposed
+c3	reply posted on #123	notes/plan.md:16	sent	OWNER/REPO#123	Thanks, fixed in abc123	acted
+c4	ticket moved to Done	notes/plan.md:17	mcp	ABC-12		proposed
+c5	Tiger emailed the vendor	notes/plan.md:18	prose			acted
+```
+
+- Tab-separated, UTF-8. The first line is that header, exactly; every other non-blank line has
+  seven fields. No `#` comment lines, no extra columns. Empty fields are allowed except `claim` and
+  `kind`.
+- `id` is your row number (`c1`), `source` the note's `file:line`, `state` the claim's label now
+  (`proposed`, `acted`, `confirmed`, `superseded`, `transcript`; empty means `proposed`).
+- `expect` is what the source must show for the claim to hold: a PR state (`open`, `merged`,
+  `closed`, `draft`, `approved`), body text for `pr-body` (`!text` for must-not), `on:<ref>` for a
+  SHA, the text a `path` or `path:line[-line]` must contain (only those lines are read), the
+  drafted text for `sent`. A row with no `expect` can at best come back `resolved`, never
+  `confirmed`.
+- JSON is the same schema: a list of objects with those keys (any subset, string values, `claim`
+  and `kind` required).
+- `reconcile-check` refuses (exit 2, nothing on stdout) an empty file, a missing or different
+  header, a wrong field count, an unknown key, kind or state, or a file with no claims. Fix the file;
+  never read an empty result as "nothing drifted".
+
+Map each claim's evidence kind to the machine `kind` like this:
+
+| What can check it | `kind` | `pointer` |
+|---|---|---|
+| PR state | `pr` | URL, `OWNER/REPO#N`, `#N` |
+| PR body text | `pr-body` | same |
+| GitHub issue | `issue` | URL, `OWNER/REPO#N` |
+| commit | `sha` | SHA or `DIR@SHA` |
+| file in a repo or on disk | `path` | `path` or `path:line[-line]` |
+| a draft that may have been posted | `sent` | target (`OWNER/REPO#N`, channel id, ticket id, `clipboard`) or empty |
+| ticket, chat, doc, meeting, dashboard | `mcp` | its URL or ID |
+| statement by Tiger, number, local database, anything with no pointer | `prose` | empty |
+
+`auto` infers the kind from the pointer; prefer naming it.
 
 - One claim per row. Split a row that bundles several claims ("restart, login and reorg are all
   open"), a status plus a date, or an action plus its provenance. A bundled row cannot hold one
   state.
-- `kind` is what can check it: `pr`, `sha`, `path`, `ticket`, `chat`, `doc`, `meeting`, `metric`,
-  `local` (database, file system), `sent` (a draft that may have been posted), `statement` (Tiger
-  said he did it), `number` (a figure copied between notes).
-- `label now` comes from the note's front matter or meta tags; unlabelled is `proposed`.
+- In the working notes, record the evidence kind in words: PR, SHA, path, ticket, chat, doc,
+  meeting, metric, local (database, file system), sent (a draft that may have been posted),
+  statement (Tiger said he did it), number (a figure copied between notes). The table above maps it
+  to the machine `kind`.
+- `label now` comes from the claim's own line or element, else the note's front matter or meta tags
+  in `<head>`; unlabelled, and any unlabelled tick, is `proposed`. A label on a neighbouring line
+  never applies.
 - **Generated-page ticks are agent output, not Tiger's claims.** Trace every "done" tick to a line
   where Tiger says he did it (state `acted`) or to a source of truth (state `confirmed`). A tick with
   neither stays `proposed`, and the generator is suspect: the hand run's monitor tick came from a
@@ -58,10 +103,22 @@ Claim file columns: `# | claim | source file:line | kind | pointer | label now |
 
 ## c. Deterministic checks first
 
-Run `~/.pi/agent/qmd/reconcile-check` over the claim file (`--help` gives the input columns).
+Run `~/.pi/agent/qmd/reconcile-check claims.tsv` (plus the overlay's `--repo`/`--gh-repo`;
+`--help` repeats the schema). `--note FILE` adds a note's own labelled claims and ticks.
 It resolves PR state and bodies, SHAs, paths and the exporter's sent-evidence rows
 (`~/.pi/memory/<segment>/evidence.tsv`) without a model. Rows it marks `needs-mcp` go to the
 investigators. Ledger pointers can also go through `~/.pi/agent/skills/intake/scripts/ledger-check.py`.
+
+Verdicts: `confirmed` and `contradicted` decide the claim. `resolved` means the pointer exists but the
+claim named no expected state, so it is not confirmed. `needs-mcp` goes to an investigator,
+`needs-verifier` goes to the verifier with no pointer to check. For drafts, `sent` means an
+evidence row shows that write's own success (exit status or output) on exactly that target (`#7`
+never matches `#70`); confirm it by resolving the posted item itself with a `pr`/`issue` row and an
+`expect`. `candidate` (the call ran inside a pipe, script, branch, codemode or `--web`, so its
+success was not observed), `clipboard` (copied only), `drafted`, `attempted` (the call failed or
+had no result) and `not-found` are not proof. Only a `confirmed` row with a satisfied `expect` is
+marked for the automatic change. Exit 1 means something was contradicted or unresolved; exit 2
+means the claim file is malformed or empty.
 
 ## d. One investigator per source
 

@@ -27,8 +27,11 @@ apply to his drafts while you write them, except these:
 - 22: his openers "Great question," and "Good callout," are fine.
 - 33: short fragments are fine ("Primary key is UUID", "Updating.").
 
-Rule 13 is not exempt: **[confirmed 2026-10-22]** no em dash, en dash or spaced hyphen used as a
-dash in his drafts, even though one curated example has them (those came from the agent draft).
+Rule 13 is only partly exempt: **[confirmed 2026-10-26]** no em dash or en dash in his drafts, even
+though one curated example has them (those came from the agent draft). A spaced hyphen is fine as a
+separator after a link or a label, in lists and in Slack lines ("<PR link> - consolidate different ways
+to close a job through Close", "TL;DR of the above - contributions are welcome…"). Don't use it
+to join two clauses in a review comment.
 Rule 28 is not exempt (see the run-on rule below). Rule 24 bans only stacked hedges, so keep his
 single hedges. `clear-message/bin/slop-lint.py --voice tiger` skips the same patterns.
 
@@ -67,6 +70,10 @@ Every reply is in his voice, whoever the reviewer is.
 - **[confirmed 2026-10-21]** When disagreeing about a name or design, say what the thing is or does ("This is
   recording the user's decision…"), then how the alternative reads to him ("I find X feels more like…").
   Don't write "I'd keep X". The posted original is in the curated examples (PR #79300 rename reply).
+- **[confirmed 2026-10-26]** Notes he leaves on his own PR for reviewers: one sentence that says what the
+  line gives us or why it's there ("This gives us all the interviews if there is ever an reactivated job,
+  from the reactivation group.", "The purpose of this lock is for us to ensure…"). No link unless it
+  points at another PR.
 - **[confirmed 2026-10-21]** Cite evidence as a link to the PR or source ("[create_schedule_builder_availability_templates](…/pull/77385)"),
   not as a backticked filename.
 
@@ -85,6 +92,15 @@ Every reply is in his voice, whoever the reviewer is.
 - **[confirmed 2026-10-15]** A message to a person opens warmly ("Hey <name>,", ":wave: <name>, thanks for
   running the session!") and uses Slack emoji codes for tone (`:pray:`, `:sweat_smile:`,
   `:rolling_on_the_floor_laughing:`). Light humour is fine.
+- **[confirmed 2026-10-26]** The warm opener is for starting a conversation. A reply in a thread opens with
+  the point or where it came from: "From the design, there's no popup on the job page…", "On the same
+  note, there are a few edge cases…", "Completely crossed my mind, …".
+- **[confirmed 2026-10-26]** A longer Slack message puts each idea in its own short paragraph, with a blank
+  line between, and the ask alone at the end ("Can you take it?", "is that right?"), then any cc on its
+  own line.
+- **[confirmed 2026-10-26]** A list of PRs: a one-line opener ("Hey team I have a few PRs for the <project>
+  work ready for some :eyes:"), then one PR per line in merge order: the link, " - ", and a short
+  lowercase description ("consolidate different ways to close a job through Close").
 - **[confirmed 2026-10-15]** Cut what the reader did not ask for: summary lines ("I have 12 PRs open"),
   asides, rationale paragraphs and supporting stats.
 

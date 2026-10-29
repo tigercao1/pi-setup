@@ -22,7 +22,11 @@ put company text in `personal`. Treat both indexes as private to this machine.
 
 - `personal` (from `~/.pi/agent/qmd/personal.yml.tmpl`): pi setup plans, sessions and handoffs, pi
   config, and one collection per personal project (`-c <project>`, plus `<project>-notes` for its
-  knowledge-base notes).
+  knowledge-base notes and `<project>-repo` for docs in its `~/files` checkout). `ssms-reports`
+  holds the worker reports and reviews at the top of `~/files/wt`; `pstack` is the upstream pstack
+  source in `~/files/pstack-src`.
+  `pages` in either index holds the knowledge-base HTML pages converted to text (labels and
+  rules in `references/validity.md`, "Converted HTML pages").
 - The work index (overlay): the layer's plans, daily notes, the layer's rules and skills, and the
   work sessions and handoffs (a machine-local addition: `qmd/local/<index>.local.yml.tmpl` in the
   layer, gitignored, or `~/.pi/agent/qmd/<index>.local.yml.tmpl`; see `~/.pi/agent/qmd/README.md`).
@@ -70,7 +74,7 @@ and `/private/var` are skipped.
    `qmd --index <index> get <path>` on the top hits. Read the hit, not the whole session;
    `get <path>:<line>:<count>` reads a slice.
 2. **query** only when step 1 gave fewer than 3 useful hits or the topic is plain prose:
-   `qmd --index <index> query "<question>" -n 8 --format json`. A cold query takes 15-30 s and about
+   `~/.pi/agent/qmd/search --index <index> --query -n 8 "<question>"` (labels shown, as in step 1). A cold query takes 15-30 s and about
    4 GB of RAM, all local. Do not leave a qmd daemon running; start `qmd mcp --http --daemon` only for
    a burst of queries and stop it after.
 3. **RESUME.md and ledger.md** in the matching plans topic folder, if present. The newest `pause`
@@ -113,7 +117,7 @@ Every note claim has one state. The front matter, HTML meta tags and evidence fo
 | `acted` | Tiger says he did it, and no source can show it. |
 | `confirmed` | visible in a source of truth, and the evidence link resolves. |
 | `superseded` | replaced by a later record, which the label points to. |
-| `transcript` | the default for exported sessions: what was said, not what is true. |
+| `transcript` | always, for exported sessions and handoffs: what was said, not what is true. A label quoted inside one is not applied. |
 
 The only automatic change is `proposed` to `confirmed`, with an evidence link that resolves. Anything
 else (to `superseded`, dropping a claim, `acted` to `confirmed` without a link) waits for Tiger's yes.
@@ -128,7 +132,9 @@ a. **Inventory every file** in scope, including `evidence/` and `build/` subfold
    pages. Skipping a file needs a reason.
 b. **Extract claims, one per row**; split compound claims. Generated-page ticks are agent output:
    trace each "done" to a statement by Tiger or to a source before calling it acted or confirmed.
-c. **Deterministic checks first.** Run `~/.pi/agent/qmd/reconcile-check` over the claim file.
+c. **Deterministic checks first.** Run `~/.pi/agent/qmd/reconcile-check` over the machine claim file
+   (`id claim source kind pointer expect state`, schema in `references/reconcile.md` § b). It refuses an
+   empty or malformed file; only a row with a satisfied `expect` can come back `confirmed`.
 d. **One investigator per source** with MCP, using the `why` skill's investigator brief
    (`~/.pi/agent/skills/why/references/investigator-prompt.md`) and its source playbooks. Search
    sessions by content, not names, and fall back to raw JSONL.
@@ -143,26 +149,42 @@ one or two sources holding most claims). Then wait.
 
 ## Pause
 
-Only when asked ("pause", "stop here, I'll pick it up tomorrow"). "Keep going" is not a pause.
+Only when asked ("pause", "stop here, I'll pick it up tomorrow", or `/fresh`). "Keep going" is not a
+pause.
 
+`/fresh` (the `context-watcher` extension) is the normal way to pause a long interactive session.
+The watcher shows the context size and per-call cost in the status line from 200k tokens and
+suggests `/fresh` once at 250k (`contextWatcher` in `~/.pi/agent/settings.json`: `warnTokens`,
+`suggestTokens`, `enabled`). `/fresh` runs `pi-pause-facts`, sends you one message with its output,
+and after your turn opens a new session in the same cwd seeded with `resume <topic>` and the
+RESUME.md path. End that turn with the line `RESUME: <absolute path>` (or `RESUME: none` and why);
+without a freshly written RESUME.md the old session stays as it is.
+
+0. Run `~/.pi/agent/bin/pi-pause-facts` first (`/fresh` has already run it and pasted the output).
+   It prints the deterministic facts: cwd, repo, branch, HEAD SHA, dirty files, ahead/behind, open
+   PRs, this session's live orchestrator agents, the mission folder and RESUME.md path when the cwd
+   or branch names a ticket, the last 5 ledger rows, context size and session cost. Copy its output
+   verbatim into RESUME.md; never retype or edit it. If step 2 makes a commit, run it again after
+   the commit and use the newer output.
 1. Finish the current atomic step or back out of it. Start nothing new. Tell running workers to
    checkpoint (`team_write_handoff`) and stop.
 2. Commit uncommitted edits as one `wip: <topic> paused` commit on the current branch. If the tree
    is broken, say so in one line of the commit body. No push and no PR unless one already exists.
 3. Write `RESUME.md` in the plans topic folder (the mission folder for an intake mission, otherwise
-   `<plans>/<topic>/` with the branch name or a short slug). Overwrite it; it is a pointer to now.
+   `<plans>/<topic>/` with the branch name or a short slug; the facts name it when they can).
+   Overwrite it; it is a pointer to now. You write only goal, done and verified, not yet verified,
+   next step, key files and gotchas; the rest is the facts block.
 
    ```
    # Resume: <topic>
-   - Paused: <ISO ts>, session <id>
    - Goal: <one line>
    - Done and verified: <bullets, each with its evidence>
    - Not yet verified: <bullets>
-   - Repo / worktree / branch / wip SHA: <...>
-   - Open PRs: <#N state>
    - Next step: <the first action on resume>
    - Key files: <paths>
    - Gotchas: <what will bite the next session>
+
+   <pi-pause-facts output, verbatim>
    ```
 
 4. Append one row to the topic's `ledger.md` (create it with that row if absent), in the intake

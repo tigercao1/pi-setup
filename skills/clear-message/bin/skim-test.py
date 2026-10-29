@@ -23,7 +23,23 @@ import re
 import subprocess
 import sys
 
-MODEL = "vercel-ai-gateway/anthropic/claude-haiku-5.5"
+FALLBACK_MODEL = "vercel-ai-gateway/anthropic/claude-haiku-5.5"
+PI_MODELS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", "bin", "pi_models.py")
+
+
+def persona_model(persona, fallback):
+    try:
+        spec = importlib.util.spec_from_file_location("pi_models", PI_MODELS)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ref = mod.persona_ref(persona)
+    except Exception as exc:
+        print(f"warning: persona models unavailable ({exc}); using {fallback}", file=sys.stderr)
+        return fallback
+    return f"{ref[1]}/{ref[0]}" if ref else fallback
+
+
+MODEL = persona_model("skim-test", FALLBACK_MODEL)
 OPENING_WORDS = 25
 KINDS = {
     "approve": "approve or reject a change to how things work today",
@@ -117,10 +133,17 @@ def evaluate(text, view, args):
         "ASK: what Tiger is telling or asking you, in one sentence\n"
         "REPLY: what you would reply right now"
     )
+    compares_today = args.kind in ("approve", "confirm")
+    full_questions = (
+        "1) What would change compared to today, if anything? "
+        "2) Which parts already happen today? 3) What are they asking you to decide?"
+        if compares_today else
+        "1) What is the news or the main point? 2) What are they asking you to decide or do, if anything? "
+        "3) Who is asked?"
+    )
     full_prompt = (
         "You are " + args.reader + ". Tiger sent you this Slack message. Read it once.\n\n---\n" + text + "\n---\n\n"
-        "Answer in at most three short lines. 1) What would change compared to today, if anything? "
-        "2) Which parts already happen today? 3) What are they asking you to decide?"
+        "Answer in at most three short lines. " + full_questions
     )
     with cf.ThreadPoolExecutor() as pool:
         skim_answer, full_answer = pool.map(run_reader, [skim_prompt, full_prompt])
@@ -131,9 +154,14 @@ def evaluate(text, view, args):
         "A reader who read everything understood:\n" + full_answer + "\n\n"
         "Reply with JSON only: {\"skim_pass\": true/false, \"full_pass\": true/false, \"why\": \"<one sentence>\"}. "
         "skim_pass is true if the skimmer's ASK is the same decision or action as the intent; the skimmer "
-        "is not expected to know details or mechanism, only what reply is wanted. "
-        "full_pass is true only if the full reader got the intended decision and did not mistake an "
-        "existing behaviour for the proposed change or vice versa."
+        "is not expected to know details or mechanism, only what reply is wanted. A skimmer whose REPLY "
+        "already picks an option or agrees, or asks to see the rest of the message before answering, still "
+        "passes, as long as the ASK names the right decision. "
+        + ("full_pass is true only if the full reader got the intended decision and did not mistake an "
+           "existing behaviour for the proposed change or vice versa."
+           if compares_today else
+           "full_pass is true if the full reader got the main point and the intended decision or action. "
+           "A reader who goes on to pick an option or agree has understood the ask; that is a pass.")
     )
     verdict_raw = run_reader(judge_prompt)
     match = re.search(r"\{.*\}", verdict_raw, re.S)
