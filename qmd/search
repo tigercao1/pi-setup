@@ -4,10 +4,13 @@
   search [--index NAME] [--query] [-c COLLECTION]... [-n N] [--all] [--json] TERMS... [-- QMD ARGS]
 
 Runs `qmd search` (BM25, default) or `qmd query` (--query) with --format json, reads each hit's
-label from the file on disk (front matter, a claim comment on the hit line, HTML show-me meta tags,
-or the default: transcript under the memory dir, otherwise proposed), and prints the hits ranked
-confirmed > acted > proposed > transcript, qmd's order within a state. Superseded hits are hidden
-unless --all. Labels: ~/.pi/agent/skills/recall/references/validity.md.
+label from the file on disk (front matter, the claim comment or data-state element on the hit line
+itself, HTML show-me meta tags in <head>, or the default: proposed), and prints the hits ranked
+confirmed > acted > proposed > transcript, qmd's order within a state. Anything under the memory dir
+is transcript whatever it quotes; a quoted label is shown, not applied. An unlabelled tick or item
+on the hit line is proposed. A converted HTML page (<memory>/pages/) is labelled by its own front
+matter and claim comments, and its source HTML path is printed. Evidence is printed, not checked. Superseded hits are hidden unless
+--all. Labels: ~/.pi/agent/skills/recall/references/validity.md.
 
 Environment: QMD_BIN (default: qmd on PATH, then nvm), PI_MEMORY_DIR (default ~/.pi/memory),
 QMD_CONFIG_DIR / XDG_CONFIG_HOME as qmd reads them.
@@ -21,6 +24,7 @@ import shutil
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import labels  # noqa: E402
 
@@ -99,12 +103,12 @@ def run_qmd(args, terms, extra):
     return json.loads(out[start:]) if start >= 0 else []
 
 
-def label_hits(hits, roots, memory_dir):
+def label_hits(hits, roots, memory_dir, terms=None):
     labelled = []
     for order, hit in enumerate(hits):
         display = hit.get("file", "")
         path = disk_path(display, roots)
-        found = labels.file_labels(path, memory_dir, hit.get("line")) if path else dict(
+        found = labels.file_labels(path, memory_dir, hit.get("line"), terms) if path else dict(
             labels.normalise({}, "proposed"), source="unresolved path", claims={})
         collection = display[len("qmd://"):].split("/", 1)[0] if display.startswith("qmd://") else ""
         labelled.append(dict(hit, path=path, collection=collection, order=order, **{"label": found}))
@@ -133,7 +137,13 @@ def render(hits, hidden):
         evidence = ", ".join(lab["evidence"]) or "none"
         extra = f"  as of {lab['as_of']}" if lab["as_of"] else ""
         extra += f"  superseded by {lab['superseded_by']}" if lab["superseded_by"] else ""
-        out.append(f"   evidence: {evidence}{extra}  [{lab['source']}]")
+        out.append(f"   evidence (not checked): {evidence}{extra}  [{lab['source']}]")
+        if lab.get("page_source"):
+            out.append(f"   converted page; source: {lab['page_source']}")
+        if lab.get("asserted"):
+            quoted = lab["asserted"]
+            out.append(f"   quoted label, not applied: {quoted['state']}"
+                       + (f" evidence {', '.join(quoted['evidence'])}" if quoted["evidence"] else ""))
         if lab["claims"]:
             out.append("   claims in file: " + ", ".join(f"{k} {v}" for k, v in sorted(lab["claims"].items())))
         if lab["note"]:
@@ -164,7 +174,7 @@ def main(argv=None):
     ap.add_argument("terms", nargs="+")
     args = ap.parse_args(argv)
     hits = run_qmd(args, args.terms, extra)
-    labelled = label_hits(hits, collection_paths(config_path(args.index)), MEMORY_DIR)
+    labelled = label_hits(hits, collection_paths(config_path(args.index)), MEMORY_DIR, args.terms)
     shown, hidden = ranked(labelled, args.all)
     if args.json:
         print(json.dumps(shown, indent=1))

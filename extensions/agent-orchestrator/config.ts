@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnEnv } from "../_shared/spawn-env.ts";
+import { loadModels, type ModelRef, type ModelsConfig, personaModel } from "./personas.ts";
 import type { Role, TaskContract } from "./state.ts";
 
 export const EXT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -65,7 +66,7 @@ interface Settings {
 	};
 }
 
-function readSettings(): Settings {
+export function readSettings(): Settings {
 	try {
 		return JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as Settings;
 	} catch {
@@ -83,17 +84,24 @@ export function setOrchLevel(level: OrchLevel): void {
 }
 
 /**
- * Built-ins plus `team.profiles` from settings. Settings win for every field
+ * Built-ins, then each profile's persona model from models.json, then
+ * `team.profiles` from settings. Settings win for every field
  * except `skills`, which are added to the built-in profile's skills
  * (deduplicated, built-ins first). A new profile can be added without touching
  * this file. Read at tool registration, so edits need a /reload.
  */
 export function allProfiles(
 	custom: Record<string, Partial<Profile>> = readSettings().team?.profiles ?? {},
+	models: ModelsConfig = loadModels(),
 ): Record<string, Profile> {
-	const merged: Record<string, Profile> = { ...NAMED_PROFILES };
+	const withPersona = (name: string, profile: Profile): Profile => {
+		const ref = personaModel(name, models);
+		return ref ? { ...profile, model: ref.model, provider: ref.provider } : profile;
+	};
+	const merged: Record<string, Profile> = {};
+	for (const [name, profile] of Object.entries(NAMED_PROFILES)) merged[name] = withPersona(name, profile);
 	for (const [name, profile] of Object.entries(custom)) {
-		const base = merged[name] ?? { role: "worker", description: name };
+		const base = merged[name] ?? withPersona(name, { role: "worker", description: name });
 		const next: Profile = { ...base, ...profile };
 		if (base.skills || profile.skills) {
 			next.skills = [...new Set([...(base.skills ?? []), ...(profile.skills ?? [])])];
@@ -202,8 +210,6 @@ export const NAMED_PROFILES: Record<string, Profile> = {
 	},
 	reviewer: {
 		role: "worker",
-		model: "openai/gpt-6.1-sol",
-		provider: "vercel-ai-gateway",
 		thinkingLevel: "medium",
 		skills: ["pr-approval-review"],
 		contextFiles: true,
@@ -212,20 +218,16 @@ export const NAMED_PROFILES: Record<string, Profile> = {
 	},
 	"code-review": {
 		role: "worker",
-		model: "openai/gpt-6.1-sol",
-		provider: "vercel-ai-gateway",
 		thinkingLevel: "medium",
 		skills: ["pr-approval-review", "github-cli", "tiger-voice", "clear-message"],
 		extensions: ["mcp"],
 		contextFiles: true,
 		description:
-			"Second-opinion PR/code review on gpt-6.1-sol with the pr-approval-review rubric, github-cli, MCP for tickets/logs, " +
+			"Second-opinion PR/code review with the pr-approval-review rubric, github-cli, MCP for tickets/logs, " +
 			"and tiger-voice + clear-message for drafted comments",
 	},
 	verifier: {
 		role: "worker",
-		model: "openai/gpt-6.1-sol",
-		provider: "vercel-ai-gateway",
 		thinkingLevel: "high",
 		// Deliberately bare: a verifier must not inherit the conventions,
 		// skills or repo framing that shaped the work it is judging.
@@ -236,8 +238,6 @@ export const NAMED_PROFILES: Record<string, Profile> = {
 	},
 	"verifier-mcp": {
 		role: "worker",
-		model: "openai/gpt-6.1-sol",
-		provider: "vercel-ai-gateway",
 		thinkingLevel: "high",
 		skills: [],
 		extensions: ["mcp"],
@@ -290,8 +290,10 @@ export interface ResolvedRuntime {
 }
 
 /**
- * Resolution order: explicit args, then profile, then settings defaults, then
- * hard-coded defaults. `undefined` means "inherit whatever pi would pick".
+ * Resolution order: explicit args, then the profile's model (settings
+ * `team.profiles`, else its models.json persona), then the unprofiled worker's
+ * routed model, then settings defaults, then hard-coded defaults. `undefined`
+ * means "inherit whatever pi would pick".
  */
 export function resolveRuntime(options: {
 	role: Role;
@@ -309,6 +311,7 @@ export function resolveRuntime(options: {
 	slim: boolean;
 	/** The spawning agent's own model, used when nothing else specifies one. */
 	inherit?: { model: string; provider: string };
+	routed?: ModelRef;
 }): ResolvedRuntime {
 	const profile = options.profile ? allProfiles()[options.profile] : undefined;
 	const settingsDefault = readSettings().team?.modelDefaults?.[options.role] ?? {};
@@ -321,10 +324,16 @@ export function resolveRuntime(options: {
 
 	// Model and provider travel together: a bare model id can match a different
 	// provider in the child process and fail on auth.
-	// Precedence: explicit spawn args > profile > settings role defaults >
+	// Precedence: explicit spawn args > profile > routed > settings role defaults >
 	// inherit the spawning agent's own model.
+	const routed = profile ? undefined : options.routed;
 	const model =
-		options.model ?? profile?.model ?? settingsDefault.model ?? hard.model ?? options.inherit?.model;
+		options.model ??
+		profile?.model ??
+		routed?.model ??
+		settingsDefault.model ??
+		hard.model ??
+		options.inherit?.model;
 	const pinned = (id: string | undefined): string | undefined => {
 		if (!id) return undefined;
 		if (id === options.inherit?.model) return options.inherit?.provider;
@@ -335,7 +344,9 @@ export function resolveRuntime(options: {
 		? (options.provider ?? pinned(options.model))
 		: model === profile?.model
 			? profile?.provider
-			: (settingsDefault.model ? settingsDefault.provider : undefined) ?? pinned(model);
+			: model === routed?.model
+				? routed?.provider
+				: (settingsDefault.model ? settingsDefault.provider : undefined) ?? pinned(model);
 
 	return {
 		model,

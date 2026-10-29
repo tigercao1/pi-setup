@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Make a show-me HTML page self-contained: inline local images (img src, CSS url()) as data URIs.
+Usage: show-me-bundle <page.html> [-o out.html] [--max-width 1600]
+Default output: <page>.shareable.html next to the source. Prints the absolute path and size."""
+import argparse, base64, mimetypes, re, subprocess, sys, tempfile
+from pathlib import Path
+
+ap = argparse.ArgumentParser()
+ap.add_argument("page"); ap.add_argument("-o"); ap.add_argument("--max-width", type=int, default=1600)
+a = ap.parse_args()
+src = Path(a.page).resolve(); base = src.parent
+out = Path(a.o).resolve() if a.o else src.with_suffix(".shareable.html")
+html = src.read_text(); missing = []; cache = {}
+
+def uri(ref):
+    if re.match(r"(data:|https?:|//|#|mailto:)", ref): return None
+    p = (base / ref.split("?")[0].split("#")[0]).resolve()
+    if not p.is_file(): missing.append(ref); return None
+    if p in cache: return cache[p]
+    mime = mimetypes.guess_type(p)[0] or "application/octet-stream"
+    data = p.read_bytes()
+    if mime.startswith("image/") and mime != "image/svg+xml":
+        with tempfile.NamedTemporaryFile(suffix=p.suffix) as t:
+            r = subprocess.run(["magick", str(p), "-resize", f"{a.max_width}x>", "-strip", "-quality", "85", t.name])
+            if r.returncode == 0 and Path(t.name).stat().st_size < len(data): data = Path(t.name).read_bytes()
+    cache[p] = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+    return cache[p]
+
+def sub(m):
+    u = uri(m.group(2)); return m.group(1) + (u or m.group(2)) + m.group(3)
+
+html = re.sub(r'(<(?:img|source|video|audio)\b[^>]*?\bsrc=")([^"]+)(")', sub, html)
+html = re.sub(r'(url\(["\']?)([^)"\']+)(["\']?\))', sub, html)
+remote = re.findall(r'(?:src|href)="(https?://[^"]+\.(?:js|css))"', html)
+out.write_text(html)
+print(out); print(f"{out.stat().st_size/1e6:.2f} MB, {len(cache)} images inlined")
+for m in missing: print("MISSING:", m, file=sys.stderr)
+for r in remote: print("WARN remote asset (needs network):", r, file=sys.stderr)

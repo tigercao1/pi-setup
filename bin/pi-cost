@@ -1,0 +1,1160 @@
+#!/usr/bin/env python3
+"""pi-cost: a deduplicated per-call cost ledger over pi session files, with reports and counterfactuals.
+
+Read-only over ~/.pi/agent/sessions, ~/.pi/orchestrator-teams and ~/.pi/memory/.export-state.json.
+Writes only the files named by its own flags (reports, baseline, ledger dump).
+
+  pi-cost ledger   [--since 30d] [--until ISO] --out ledger.jsonl
+  pi-cost report   [--since 7d]  [--baseline PATH] [--out-dir DIR]
+  pi-cost baseline [--since 30d] [--date YYYY-MM-DD] [--out-dir DIR]
+  pi-cost reprice  --model anthropic/claude-sonnet-5.5 [--since 30d]
+
+Dedup: a forked session copies its parent's entries with the same id and timestamp, so (id, timestamp)
+is the key and the session file that started first owns the entry (its "origin session").
+Worker logs under orchestrator-teams/*/logs add only calls absent from every session file
+(--worker-logs; matched on message timestamp plus output, cacheRead and cacheWrite tokens).
+Prices: a saved copy of https://ai-gateway.vercel.sh/v1/models (--pricing, default the newest
+pricing/gateway-models-*.json in the measure directory). A one-hour cache write is not listed there;
+--write-1h-multiplier (default 2.0 x input, Anthropic's published rate) sets it.
+Company values come from the layer's pi-cost.json (PI_LAYER_DIR, default ~/.pi/<layer>): ghRepo,
+ghAuthor, ticketPrefix (a regex), worktreeTicketPattern (two groups: prefix, number) and workSegment.
+Without it merged PRs are skipped and any PREFIX-123 id counts as a ticket.
+"""
+import argparse
+import collections
+import datetime as dt
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+
+HOME = os.path.expanduser("~")
+AGENT_DIR = os.environ.get("PI_AGENT_DIR") or os.path.join(HOME, ".pi", "agent")
+SESSIONS_DIR = os.environ.get("PI_SESSIONS_DIR") or os.path.join(AGENT_DIR, "sessions")
+TEAMS_DIR = os.environ.get("PI_TEAMS_DIR") or os.path.join(HOME, ".pi", "orchestrator-teams")
+EXPORT_STATE = os.environ.get("PI_EXPORT_STATE") or os.path.join(HOME, ".pi", "memory", ".export-state.json")
+MEASURE_DIR = os.environ.get("PI_COST_MEASURE_DIR") or os.path.join(
+    HOME, "Documents", "knowledge-base-remote", "Pi", "docs", "plans", "model-routing", "measure")
+LAYER_DIR = os.environ.get("PI_LAYER_DIR") or os.path.normpath(os.path.join(AGENT_DIR, "../homebase"))
+
+
+def _layer_config():
+    try:
+        with open(os.path.join(LAYER_DIR, "pi-cost.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+LAYER = _layer_config()
+GH_REPO = os.environ.get("PI_COST_GH_REPO") or LAYER.get("ghRepo") or ""
+GH_AUTHOR = os.environ.get("PI_COST_GH_AUTHOR") or LAYER.get("ghAuthor") or "@me"
+WORK_SEGMENT = LAYER.get("workSegment") or "work"
+WORKER_KICKOFF = "Begin the assignment"
+IDLE_SECONDS = 300
+TTL_1H_SECONDS = 3600
+CONTEXT_BANDS = (200_000, 400_000, 600_000)
+CAP_LEVELS = (150_000, 250_000, 400_000)
+HANDOFF_TOKENS = (20_000, 60_000)
+IDLE_BANDS = ((300, 3600, "5-60 min"), (3600, None, "over 60 min"))
+REPRICE_MODELS = ("anthropic/claude-opus-5.5", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5.5",
+                  "openai/gpt-6.1-sol", "moonshotai/kimi-k3", "zai/glm-5.3")
+BYTES_PER_TOKEN = 4.0
+TOKENS_PER_IMAGE = 1600
+TICKET_RE = re.compile(r"\b(%s)-(\d{2,6})\b" % (LAYER.get("ticketPrefix") or "[A-Z][A-Z0-9]{1,9}"), re.I)
+WORKTREE_TICKET_RE = re.compile(LAYER["worktreeTicketPattern"], re.I) if LAYER.get("worktreeTicketPattern") else None
+TITLE_AGENT_RE = re.compile(r"^(team-[0-9]{14}-[a-z0-9]+):(.+)$")
+
+PROFILE_ROLE = {
+    "coder": "coder", "pr-author": "coder", "docs-writer": "coder",
+    "code-review": "reviewer", "reviewer": "reviewer",
+    "verifier": "verifier", "verifier-mcp": "verifier", "tester": "verifier",
+    "researcher": "researcher",
+    "manager": "other",
+}
+ROLES = ("lead", "coder", "reviewer", "verifier", "researcher", "other")
+
+
+def parse_ts(value):
+    if isinstance(value, (int, float)):
+        return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc)
+    return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def parse_since(text, now):
+    m = re.fullmatch(r"(\d+)([dh])", text or "")
+    if m:
+        n = int(m.group(1))
+        return now - (dt.timedelta(days=n) if m.group(2) == "d" else dt.timedelta(hours=n))
+    t = parse_ts(text)
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def role_from_name(name, task):
+    n = (name or "").lower()
+    t = (task or "")[:4000].lower()
+    if re.search(r"verif|skeptic|adversar|tester", n):
+        return "verifier"
+    if re.search(r"review|gate|approval|convention|necessity|blast|^(appr|conv|nec)-", n):
+        return "reviewer"
+    if re.search(r"recon|spike|research|investig|mechanism|comparison|testaudit|desc-check|-ticket$|^mr-|^why-", n):
+        return "researcher"
+    if "ticket-to-pr" in t or re.search(r"impl|build|coder|fix|unit|^u\d|hir-?\d|exec|-pr$|^pr\d|migration|^c-\d|^split-|reland|rebase|restack|reorder|boost-activation|sandbox-runner|-guard$", n):
+        return "coder"
+    if re.search(r"recon|research|investig|survey|mr-|why-", n):
+        return "researcher"
+    if re.search(r"review|verdict", t[:600]):
+        return "reviewer"
+    return "other"
+
+
+def role_for(agent, kickoff_seen):
+    if agent is None:
+        return "other" if kickoff_seen else "lead"
+    profile = agent.get("profile")
+    if profile in PROFILE_ROLE:
+        return PROFILE_ROLE[profile]
+    return role_from_name(agent.get("name"), agent.get("task"))
+
+
+def role_source(agent, kickoff_seen):
+    if agent is None:
+        return "worker kickoff, no agent record" if kickoff_seen else "lead: in no team"
+    if agent.get("profile") in PROFILE_ROLE:
+        return "profile (%s)" % (agent.get("profileSource") or "config.json")
+    return "name/task regex" + (" (agent from session title)" if agent.get("source") == "session title" else "")
+
+
+def load_agents(teams_dir=TEAMS_DIR):
+    agents = {}
+    for path in sorted(glob.glob(os.path.join(teams_dir, "*", "archive", "agents.jsonl"))):
+        team = path.split(os.sep)[-3]
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        for line in lines:
+            try:
+                a = json.loads(line)
+            except ValueError:
+                continue
+            if a.get("sessionId"):
+                a["team"] = team
+                agents[a["sessionId"]] = a
+    for path in sorted(glob.glob(os.path.join(teams_dir, "*", "config.json"))):
+        team = path.split(os.sep)[-2]
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for a in cfg.get("agents") or []:
+            sid = a.get("sessionId")
+            if not sid:
+                continue
+            merged = dict(agents.get(sid) or {})
+            merged.update({k: v for k, v in a.items() if v is not None})
+            merged["team"] = team
+            agents[sid] = merged
+    return agents
+
+
+def attach_spawn_profiles(agents, spawns, window_s=600):
+    by_name = collections.defaultdict(list)
+    for s in spawns:
+        if s.get("profile"):
+            by_name[s["name"]].append(s)
+    for a in agents.values():
+        if a.get("profile") or not a.get("name") or not a.get("createdAt"):
+            continue
+        created = parse_ts(a["createdAt"])
+        best = None
+        for s in by_name.get(a["name"], []):
+            lag = (created - s["ts"]).total_seconds()
+            if -5 <= lag <= window_s and (best is None or lag < best[0]):
+                best = (lag, s)
+        if best:
+            a["profile"] = best[1]["profile"]
+            a["profileSource"] = "team_spawn call"
+    return agents
+
+
+class Pricing:
+    def __init__(self, models, write_1h_multiplier=2.0):
+        self.models = models
+        self.write_1h_multiplier = write_1h_multiplier
+
+    @classmethod
+    def load(cls, path, write_1h_multiplier=2.0):
+        data = read_json(path)
+        rows = data.get("data", data) if isinstance(data, dict) else data
+        return cls({m["id"]: m.get("pricing") or {} for m in rows if m.get("id")}, write_1h_multiplier)
+
+    def has(self, model):
+        return bool(self.models.get(model))
+
+    @staticmethod
+    def _tiered(p, key, ctx):
+        tiers = p.get(key + "_tiers")
+        if tiers:
+            chosen = None
+            for t in tiers:
+                if ctx >= t.get("min", 0) and (chosen is None or t.get("min", 0) >= chosen.get("min", 0)):
+                    chosen = t
+            if chosen:
+                return float(chosen["cost"])
+        if p.get(key) is not None:
+            return float(p[key])
+        return None
+
+    def rates(self, model, ctx=0):
+        p = self.models.get(model)
+        if not p:
+            return None
+        inp = self._tiered(p, "input", ctx) or 0.0
+        out = self._tiered(p, "output", ctx) or 0.0
+        read = self._tiered(p, "input_cache_read", ctx)
+        write = self._tiered(p, "input_cache_write", ctx)
+        write_1h = self._tiered(p, "input_cache_write_1h", ctx)
+        return {
+            "input": inp, "output": out,
+            "cacheRead": inp if read is None else read,
+            "cacheWrite": inp if write is None else write,
+            "cacheWrite1h": write_1h if write_1h is not None else inp * self.write_1h_multiplier,
+            "assumed": [k for k, v in (("cacheRead", read), ("cacheWrite", write), ("cacheWrite1h", write_1h))
+                        if v is None],
+        }
+
+    def cost(self, model, tokens, ctx=None):
+        ctx = context_of(tokens) if ctx is None else ctx
+        r = self.rates(model, ctx)
+        if r is None:
+            return None
+        w1h = tokens.get("cacheWrite1h", 0) or 0
+        w5m = (tokens.get("cacheWrite", 0) or 0) - w1h
+        parts = {
+            "input": tokens.get("input", 0) * r["input"],
+            "output": tokens.get("output", 0) * r["output"],
+            "cacheRead": tokens.get("cacheRead", 0) * r["cacheRead"],
+            "cacheWrite": w5m * r["cacheWrite"] + w1h * r["cacheWrite1h"],
+        }
+        parts["total"] = sum(parts.values())
+        return parts
+
+
+def context_of(row):
+    return (row.get("input", 0) or 0) + (row.get("cacheRead", 0) or 0) + (row.get("cacheWrite", 0) or 0)
+
+
+def content_bytes(content):
+    if isinstance(content, str):
+        return len(content.encode("utf-8", "replace")), 0
+    total = images = 0
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            total += len((block.get("text") or "").encode("utf-8", "replace"))
+        elif block.get("type") == "image":
+            images += 1
+        else:
+            total += len(json.dumps(block, ensure_ascii=False).encode("utf-8", "replace"))
+    return total, images
+
+
+def user_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text") or "" for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
+
+
+def tool_label(name, args):
+    args = args or {}
+    if name == "bash":
+        return (args.get("command") or "").strip().splitlines()[0][:100] if args.get("command") else ""
+    if name in ("read", "write", "edit"):
+        return args.get("path") or ""
+    if name.startswith("mcp") or name == "codemode":
+        return json.dumps(args, ensure_ascii=False)[:100]
+    return json.dumps(args, ensure_ascii=False)[:80]
+
+
+def tool_family(name):
+    if name.startswith("mcp"):
+        return "mcp"
+    if name in ("team_status", "team_diagnose", "team_await", "team_read_report"):
+        return "team status/diagnose"
+    if name.startswith("team_"):
+        return "team (other)"
+    return name
+
+
+class SegmentRouter:
+    def __init__(self, export_state=EXPORT_STATE, agent_dir=AGENT_DIR):
+        self.by_path, self.by_sid = {}, {}
+        try:
+            state = read_json(export_state)
+        except (OSError, ValueError):
+            state = {}
+        for path, v in state.items():
+            if isinstance(v, dict) and "/sessions/" in path:
+                self.by_path[path] = v.get("segment")
+                if v.get("sid"):
+                    self.by_sid[v["sid"]] = v.get("segment")
+        self.module, self.rules = None, None
+        exporter = os.path.join(agent_dir, "bin", "pi-memory-export")
+        if os.path.isfile(exporter):
+            try:
+                loader = importlib.machinery.SourceFileLoader("pi_memory_export_for_cost", exporter)
+                spec = importlib.util.spec_from_loader(loader.name, loader)
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                self.module, self.rules = mod, mod.load_rules()
+            except Exception:
+                self.module = None
+
+    def segment(self, path, sid, cwd, signal_text):
+        if path in self.by_path:
+            return self.by_path[path] or "unrouted"
+        if sid in self.by_sid:
+            return self.by_sid[sid] or "unrouted"
+        if self.module is not None:
+            try:
+                return self.module.classify(cwd, signal_text, self.rules) or "unrouted"
+            except Exception:
+                pass
+        return "unknown"
+
+
+def session_files(sessions_dir=SESSIONS_DIR):
+    files = []
+    for path in glob.glob(os.path.join(sessions_dir, "*", "*.jsonl")):
+        base = os.path.basename(path)
+        files.append((base.split("_")[0], path))
+    files.sort()
+    return [p for _, p in files]
+
+
+def build_ledger(since=None, until=None, sessions_dir=SESSIONS_DIR, agents=None, router=None,
+                 pricing=None, worker_logs_dir=None):
+    agents = load_agents() if agents is None else agents
+    seen = {}
+    calls, tool_results, compactions, sessions, spawns = [], [], [], {}, []
+    known = set()
+    for path in session_files(sessions_dir):
+        state = scan_file(path, seen, since, until, calls, tool_results, compactions, spawns, known)
+        if state:
+            sessions[state["sid"]] = state
+    for s in sessions.values():
+        m = TITLE_AGENT_RE.match(s.get("title") or "")
+        if s["sid"] not in agents and s["kickoff"] and m:
+            agents[s["sid"]] = {"team": m.group(1), "name": m.group(2), "createdAt": s["started"],
+                                 "source": "session title"}
+    attach_spawn_profiles(agents, spawns)
+    if worker_logs_dir:
+        added = add_worker_log_calls(worker_logs_dir, calls, since, until, known)
+        sys.stderr.write("worker logs: %d calls absent from session files added\n" % added)
+    for s in sessions.values():
+        a = agents.get(s["sid"])
+        s["agent"] = a
+        s["role"] = role_for(a, s["kickoff"])
+        s["role_source"] = role_source(a, s["kickoff"])
+        s["profile"] = (a or {}).get("profile")
+        s["name"] = (a or {}).get("name") or s.get("title")
+        s["team"] = (a or {}).get("team")
+        text = s.pop("signal_text")
+        if a and a.get("task"):
+            text = a["task"] + "\n" + text
+        s["segment"] = router.segment(s["path"], s["sid"], s["cwd"], text) if router else "unknown"
+        s["ticket"] = ticket_for(s["cwd"], text)
+    for c in calls:
+        s = sessions.get(c["session"])
+        if s:
+            for k in ("role", "role_source", "profile", "name", "team", "segment", "ticket", "cwd"):
+                c[k] = s.get(k)
+        else:
+            a = agents.get(c["session"])
+            c.update(role=role_for(a, True), role_source=role_source(a, True), profile=(a or {}).get("profile"), name=(a or {}).get("name"),
+                     team=(a or {}).get("team"), segment="unknown", ticket=None, cwd=(a or {}).get("cwd"))
+        if pricing is not None:
+            rp = pricing.cost(c["model"], c, c["context"])
+            c["repriced_self"] = rp["total"] if rp else None
+    for t in tool_results:
+        t["role"] = (sessions.get(t["session"]) or {}).get("role")
+    return {"calls": calls, "tool_results": tool_results, "compactions": compactions, "sessions": sessions}
+
+
+def ticket_for(cwd, text):
+    m = WORKTREE_TICKET_RE.search(cwd or "") if WORKTREE_TICKET_RE else None
+    if m:
+        return "%s-%s" % (m.group(1).upper(), m.group(2))
+    counts = collections.Counter("%s-%s" % (p.upper(), n) for p, n in TICKET_RE.findall(text or ""))
+    if not counts:
+        return None
+    top, n = counts.most_common(1)[0]
+    if n >= 3 and n >= 0.6 * sum(counts.values()):
+        return top
+    return None
+
+
+def scan_file(path, seen, since, until, calls, tool_results, compactions, spawns, known=None):
+    header = None
+    sid = None
+    prev_call = None
+    prev_msg_ts = None
+    thinking = None
+    pending_bytes = 0
+    pending_tools = []
+    tool_args = {}
+    call_index = 0
+    file_tools = []
+    title = None
+    kickoff = False
+    signal = []
+    own_calls = 0
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            etype = e.get("type")
+            if etype == "session":
+                header = e
+                sid = e.get("id")
+                continue
+            if etype == "thinking_level_change":
+                thinking = e.get("thinkingLevel")
+                continue
+            if etype == "session_info" and e.get("name"):
+                title = e["name"]
+                signal.append(title)
+                continue
+            key = (e.get("id"), e.get("timestamp"))
+            duplicate = key[0] is not None and key in seen
+            if not duplicate and key[0] is not None:
+                seen[key] = sid
+            if etype == "compaction":
+                if not duplicate:
+                    compactions.append({"session": sid, "ts": e.get("timestamp"),
+                                        "tokensBefore": e.get("tokensBefore"),
+                                        "context_before": context_of(prev_call) if prev_call else None})
+                continue
+            if etype != "message":
+                continue
+            m = e.get("message") or {}
+            ts = parse_ts(e["timestamp"])
+            role = m.get("role")
+            if role == "user":
+                text = user_text(m.get("content"))
+                if text.startswith(WORKER_KICKOFF):
+                    kickoff = True
+                signal.append(text[:4000])
+            elif role == "toolResult":
+                b, images = content_bytes(m.get("content"))
+                pending_bytes += b
+                name = m.get("toolName") or "?"
+                if not duplicate and in_window(ts, since, until):
+                    rec = {"session": sid, "ts": e["timestamp"], "tool": name, "family": tool_family(name),
+                           "bytes": b, "images": images, "label": tool_label(name, tool_args.get(m.get("toolCallId"))),
+                           "after_call": call_index}
+                    tool_results.append(rec)
+                    file_tools.append(rec)
+            elif role == "assistant" and isinstance(m.get("usage"), dict):
+                u = m["usage"]
+                if known is not None:
+                    known.add(call_key(m))
+                for block in m.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "toolCall":
+                        tool_args[block.get("id")] = block.get("arguments")
+                        if block.get("name") == "team_spawn" and not duplicate:
+                            a = block.get("arguments") or {}
+                            if a.get("name"):
+                                spawns.append({"name": a["name"], "profile": a.get("profile"), "ts": ts,
+                                               "session": sid})
+                        if block.get("name") and block["name"] != "team_spawn":
+                            signal.append("%s %s" % (block["name"], json.dumps(block.get("arguments"),
+                                                                                ensure_ascii=False)[:300]))
+                cost = u.get("cost") or {}
+                row = {
+                    "id": e.get("id"), "ts": e["timestamp"], "session": sid, "file": path,
+                    "model": m.get("model"), "provider": m.get("provider"),
+                    "thinking": m.get("thinkingLevel") or thinking,
+                    "input": u.get("input", 0) or 0, "output": u.get("output", 0) or 0,
+                    "cacheRead": u.get("cacheRead", 0) or 0, "cacheWrite": u.get("cacheWrite", 0) or 0,
+                    "cacheWrite1h": u.get("cacheWrite1h", 0) or 0,
+                    "cost_input": cost.get("input", 0) or 0, "cost_output": cost.get("output", 0) or 0,
+                    "cost_cacheRead": cost.get("cacheRead", 0) or 0,
+                    "cost_cacheWrite": cost.get("cacheWrite", 0) or 0,
+                    "cost": cost.get("total", 0) or 0,
+                    "stop": m.get("stopReason"), "durationMs": m.get("durationMs"),
+                }
+                row["context"] = context_of(row)
+                start = ts - dt.timedelta(milliseconds=row["durationMs"] or 0)
+                row["gap_prev_msg_s"] = (start - prev_msg_ts).total_seconds() if prev_msg_ts else None
+                row["gap_prev_call_s"] = (start - parse_ts(prev_call["ts"])).total_seconds() if prev_call else None
+                row["prev_context"] = prev_call["context"] if prev_call else None
+                row["tool_bytes_since_prev"] = pending_bytes
+                row["idle_rewrite_tokens"] = idle_rewrite_tokens(row)
+                pending_bytes = 0
+                call_index += 1
+                if not duplicate and in_window(ts, since, until):
+                    calls.append(row)
+                    own_calls += 1
+                prev_call = row
+            prev_msg_ts = ts
+    if header is None:
+        return None
+    for rec in file_tools:
+        rec["calls_after"] = max(0, call_index - rec["after_call"])
+    return {"sid": sid, "path": path, "cwd": header.get("cwd", ""), "started": header.get("timestamp"),
+            "title": title, "kickoff": kickoff, "signal_text": "\n".join(signal)[:200_000],
+            "own_calls": own_calls}
+
+
+def idle_rewrite_tokens(row, idle_s=IDLE_SECONDS):
+    gap = row.get("gap_prev_call_s")
+    prev = row.get("prev_context")
+    if gap is None or prev is None or gap <= idle_s or not row.get("cacheWrite"):
+        return 0
+    if row["cacheRead"] >= 0.5 * prev:
+        return 0
+    return min(row["cacheWrite"], prev)
+
+
+def in_window(ts, since, until):
+    return (since is None or ts >= since) and (until is None or ts < until)
+
+
+def call_key(message):
+    u = message.get("usage") or {}
+    return (message.get("timestamp"), u.get("output", 0), u.get("cacheRead", 0), u.get("cacheWrite", 0))
+
+
+def add_worker_log_calls(logs_dir, calls, since, until, known):
+    added = 0
+    for path in glob.glob(os.path.join(logs_dir, "*", "logs", "*.log")):
+        sid = None
+        try:
+            fh = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if sid is None and line.startswith('{"type":"session"'):
+                    try:
+                        sid = json.loads(line).get("id")
+                    except ValueError:
+                        pass
+                    continue
+                if not line.startswith('{"type":"message_end"') or '"role":"assistant"' not in line[:200]:
+                    continue
+                try:
+                    m = json.loads(line)["message"]
+                except (ValueError, KeyError):
+                    continue
+                u = m.get("usage")
+                if not isinstance(u, dict) or not m.get("timestamp"):
+                    continue
+                ts = parse_ts(m["timestamp"])
+                if not in_window(ts, since, until):
+                    continue
+                k = call_key(m)
+                if k in known:
+                    continue
+                known.add(k)
+                cost = u.get("cost") or {}
+                row = {"id": m.get("responseId"), "ts": ts.isoformat().replace("+00:00", "Z"), "session": sid,
+                       "file": path, "model": m.get("model"), "provider": m.get("provider"),
+                       "thinking": m.get("thinkingLevel"), "input": u.get("input", 0) or 0,
+                       "output": u.get("output", 0) or 0, "cacheRead": u.get("cacheRead", 0) or 0,
+                       "cacheWrite": u.get("cacheWrite", 0) or 0, "cacheWrite1h": u.get("cacheWrite1h", 0) or 0,
+                       "cost_input": cost.get("input", 0) or 0, "cost_output": cost.get("output", 0) or 0,
+                       "cost_cacheRead": cost.get("cacheRead", 0) or 0,
+                       "cost_cacheWrite": cost.get("cacheWrite", 0) or 0, "cost": cost.get("total", 0) or 0,
+                       "stop": m.get("stopReason"), "durationMs": m.get("durationMs"), "gap_prev_msg_s": None,
+                       "gap_prev_call_s": None, "prev_context": None, "tool_bytes_since_prev": None,
+                       "idle_rewrite_tokens": 0, "source": "worker-log"}
+                row["context"] = context_of(row)
+                calls.append(row)
+                added += 1
+    return added
+
+
+def ttl_counterfactual(calls, pricing, roles=None, ttl_s=TTL_1H_SECONDS):
+    out = {"actual": 0.0, "one_hour": 0.0, "idle_calls": 0, "idle_rewrite_tokens": 0, "write_tokens": 0,
+           "idle_rewrite_cost_actual": 0.0, "assumed_rates": set()}
+    for c in calls:
+        if not (c.get("model") or "").startswith("anthropic/"):
+            continue
+        if roles and c.get("role") not in roles:
+            continue
+        r = pricing.rates(c["model"], c["context"])
+        if r is None:
+            continue
+        out["assumed_rates"].update(k for k in r["assumed"] if k == "cacheWrite1h")
+        base = pricing.cost(c["model"], c, c["context"])["total"]
+        writes = c["cacheWrite"]
+        saved = c["idle_rewrite_tokens"] if (c.get("gap_prev_call_s") or 0) <= ttl_s else 0
+        alt = base - writes * r["cacheWrite"] + (writes - saved) * r["cacheWrite1h"] + saved * r["cacheRead"]
+        out["actual"] += base
+        out["one_hour"] += alt
+        out["write_tokens"] += writes
+        if c["idle_rewrite_tokens"]:
+            out["idle_calls"] += 1
+            out["idle_rewrite_tokens"] += c["idle_rewrite_tokens"]
+            out["idle_rewrite_cost_actual"] += c["idle_rewrite_tokens"] * r["cacheWrite"]
+    out["delta"] = out["one_hour"] - out["actual"]
+    out["assumed_rates"] = sorted(out["assumed_rates"])
+    return out
+
+
+def cap_counterfactual(session_calls, pricing, cap, handoff_tokens=20_000, base_cap=50_000):
+    calls = sorted(session_calls, key=lambda c: c["ts"])
+    if not calls:
+        return {"actual": 0.0, "capped": 0.0, "restarts": 0, "priced": False}
+    base = min(calls[0]["context"], base_cap) + handoff_tokens
+    offset = 0
+    restarts = 0
+    actual = capped = 0.0
+    prev_ctx = None
+    for c in calls:
+        own = pricing.cost(c["model"], c, c["context"])
+        if own is None:
+            return {"actual": 0.0, "capped": 0.0, "restarts": 0, "priced": False}
+        actual += own["total"]
+        ctx = c["context"]
+        if offset and ctx - offset < base:
+            offset = max(0, ctx - base)
+        tokens = {"input": c["input"], "output": c["output"], "cacheRead": c["cacheRead"],
+                  "cacheWrite": c["cacheWrite"], "cacheWrite1h": 0}
+        if ctx - offset > cap and prev_ctx is not None and prev_ctx > base:
+            offset = prev_ctx - base
+            restarts += 1
+            new_ctx = ctx - offset
+            tokens = {"input": c["input"], "output": c["output"], "cacheRead": 0,
+                      "cacheWrite": max(0, new_ctx - c["input"]), "cacheWrite1h": 0}
+        else:
+            cut = offset
+            for k in ("cacheRead", "cacheWrite", "input"):
+                take = min(tokens[k], cut)
+                tokens[k] -= take
+                cut -= take
+        priced = pricing.cost(c["model"], tokens, context_of(tokens))
+        capped += priced["total"]
+        prev_ctx = ctx
+    return {"actual": actual, "capped": capped, "restarts": restarts, "priced": True}
+
+
+def reprice(calls, pricing, target):
+    total, missing = 0.0, 0
+    parts = collections.Counter()
+    for c in calls:
+        p = pricing.cost(target, c, c["context"])
+        if p is None:
+            missing += 1
+            continue
+        total += p["total"]
+        for k in ("input", "output", "cacheRead", "cacheWrite"):
+            parts[k] += p[k]
+    return {"model": target, "total": total, "parts": dict(parts), "unpriced_calls": missing,
+            "assumed": pricing.rates(target, 0)["assumed"] if pricing.has(target) else ["no price"]}
+
+
+def gh_merged_prs(since, until):
+    if not GH_REPO:
+        return None, "skipped (no repo: set PI_COST_GH_REPO or ghRepo in the layer's pi-cost.json)"
+    q = "merged:%s..%s" % (since.date().isoformat(), until.date().isoformat())
+    cmd = ["gh", "pr", "list", "-R", GH_REPO, "--author", GH_AUTHOR, "--state", "merged", "--search", q,
+           "--limit", "500", "--json", "number,title,mergedAt,headRefName"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "gh failed: %s" % exc
+    if res.returncode != 0:
+        return None, "gh failed: %s" % res.stderr.strip()[:200]
+    prs = []
+    for pr in json.loads(res.stdout or "[]"):
+        merged = parse_ts(pr["mergedAt"])
+        if since <= merged < until:
+            m = TICKET_RE.search(pr.get("title") or "") or TICKET_RE.search(pr.get("headRefName") or "")
+            pr["ticket"] = "%s-%s" % (m.group(1).upper(), m.group(2)) if m else None
+            prs.append(pr)
+    return prs, " ".join(cmd)
+
+
+def summarise(ledger, pricing, since, until, prs=None, pr_source=None):
+    calls = ledger["calls"]
+    sessions = ledger["sessions"]
+    total = sum(c["cost"] for c in calls)
+    agg = lambda key: dict(sorted(group_cost(calls, key).items(), key=lambda kv: -kv[1]["cost"]))
+    days = collections.defaultdict(float)
+    weeks = collections.defaultdict(float)
+    for c in calls:
+        t = local_day(c["ts"])
+        days[t.isoformat()] += c["cost"]
+        iso = t.isocalendar()
+        weeks["%d-W%02d" % (iso[0], iso[1])] += c["cost"]
+    comp = {k: sum(c["cost_" + k] for c in calls) for k in ("input", "output", "cacheRead", "cacheWrite")}
+    comp_by_model = {}
+    for model, rows in by(calls, "model").items():
+        comp_by_model[model] = {k: sum(c["cost_" + k] for c in rows) for k in ("input", "output", "cacheRead",
+                                                                               "cacheWrite")}
+        comp_by_model[model]["total"] = sum(c["cost"] for c in rows)
+    tokens = {k: sum(c[k] for c in calls) for k in ("input", "output", "cacheRead", "cacheWrite")}
+    per_session = session_table(calls, sessions)
+    big = [s for s in per_session if s["max_context"] > 200_000]
+    tools = tool_tables(ledger["tool_results"], calls, pricing)
+    selfcheck = [c for c in calls if c.get("repriced_self") is not None]
+    reprice_err = (sum(c["repriced_self"] for c in selfcheck) - sum(c["cost"] for c in selfcheck))
+    counter = {
+        "reprice": [reprice(calls, pricing, m) for m in REPRICE_MODELS if pricing.has(m)],
+        "reprice_selfcheck": {"calls": len(selfcheck), "recorded": sum(c["cost"] for c in selfcheck),
+                              "repriced": sum(c["repriced_self"] for c in selfcheck), "diff": reprice_err},
+        "ttl_1h_all": ttl_counterfactual(calls, pricing),
+        "ttl_1h_lead_only": ttl_counterfactual(calls, pricing, roles={"lead"}),
+        "context_cap": [],
+    }
+    by_sess = by(calls, "session")
+    for cap in CAP_LEVELS:
+        for handoff in HANDOFF_TOKENS:
+            act = cap_cost = 0.0
+            restarts = touched = 0
+            for sid, rows in by_sess.items():
+                r = cap_counterfactual(rows, pricing, cap, handoff_tokens=handoff)
+                if not r["priced"]:
+                    continue
+                act += r["actual"]
+                cap_cost += r["capped"]
+                restarts += r["restarts"]
+                touched += 1 if r["restarts"] else 0
+            counter["context_cap"].append({"cap": cap, "handoff_tokens": handoff, "actual_repriced": act,
+                                           "capped": cap_cost, "delta": cap_cost - act, "restarts": restarts,
+                                           "sessions_restarted": touched})
+    active_days = len([d for d, v in days.items() if v > 0])
+    n_sessions = len({c["session"] for c in calls})
+    lead_sessions = len({c["session"] for c in calls if c["role"] == "lead"})
+    units = {"active_days": active_days, "sessions_with_calls": n_sessions, "lead_sessions": lead_sessions,
+             "cost_per_active_day": total / active_days if active_days else None,
+             "cost_per_session": total / n_sessions if n_sessions else None,
+             "lead_cost_per_lead_session": (sum(c["cost"] for c in calls if c["role"] == "lead") / lead_sessions
+                                            if lead_sessions else None)}
+    work_cost = sum(c["cost"] for c in calls if c.get("segment") == WORK_SEGMENT)
+    tickets = None
+    if prs is not None:
+        units["merged_prs"] = len(prs)
+        units["cost_per_merged_pr_all_spend"] = total / len(prs) if prs else None
+        units["cost_per_merged_pr_work_segment_spend"] = work_cost / len(prs) if prs else None
+        tickets = ticket_table(calls, prs)
+        att = [t for t in tickets["rows"] if t["merged_prs"] and t["cost"] > 0]
+        units["ticket_missions_with_merged_pr"] = len(att)
+        units["tickets_with_merged_pr_no_attributed_spend"] = sum(1 for t in tickets["rows"]
+                                                                 if t["merged_prs"] and not t["cost"])
+        units["cost_per_ticket_mission_attributed"] = (sum(t["cost"] for t in att) / len(att)) if att else None
+    units["work_segment_cost"] = work_cost
+    band = {}
+    for b in CONTEXT_BANDS:
+        band[str(b)] = sum(c["cost"] for c in calls if c["context"] > b)
+    return {
+        "window": {"since": since.isoformat(), "until": until.isoformat()},
+        "generated": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "method": {
+            "source": SESSIONS_DIR + "/*/*.jsonl assistant messages, usage.cost as recorded by pi",
+            "dedupe": "(entry id, timestamp); the earliest-started session file owns the entry",
+            "role": "profile from config.json agents[] or the spawning team_spawn call; else name/task regex; "
+                    "sessions in no team and without a worker kickoff are lead",
+            "segment": "pi-memory-export state (~/.pi/memory/.export-state.json), else its classify()",
+            "idle_rewrite": "gap since previous call > 300 s and cacheRead < half of previous context; "
+                            "rewritten tokens = min(cacheWrite, previous context)",
+            "pr_source": pr_source,
+        },
+        "totals": {"cost": total, "calls": len(calls), "tokens": tokens,
+                   "raw_assistant_entries_seen_incl_duplicates": None},
+        "by_day": dict(sorted(days.items())), "by_week": dict(sorted(weeks.items())),
+        "by_role": agg("role"), "by_model": agg("model"), "by_segment": agg("segment"),
+        "by_role_model": agg(lambda c: "%s | %s" % (c["role"], c["model"])),
+        "by_role_source": agg("role_source"),
+        "components": comp, "components_by_model": comp_by_model,
+        "cost_above_context": band,
+        "big_sessions": {"sessions_over_200k": len(big), "sessions": len(per_session),
+                         "cost_over_200k_sessions": sum(s["cost"] for s in big),
+                         "max_context": max((c["context"] for c in calls), default=0)},
+        "idle_rewrites": {"calls": sum(1 for c in calls if c["idle_rewrite_tokens"]),
+                          "tokens": sum(c["idle_rewrite_tokens"] for c in calls),
+                          "cost_recorded_of_those_calls_cacheWrite": sum(c["cost_cacheWrite"] for c in calls
+                                                                         if c["idle_rewrite_tokens"]),
+                          "bands": idle_bands(calls)},
+        "sessions": per_session,
+        "tools": tools,
+        "compactions": ledger["compactions"],
+        "counterfactuals": counter,
+        "units": units,
+        "tickets": tickets,
+    }
+
+
+def idle_bands(calls):
+    out = {}
+    for lo, hi, label in IDLE_BANDS:
+        rows = [c for c in calls if c["idle_rewrite_tokens"] and c["gap_prev_call_s"] > lo
+                and (hi is None or c["gap_prev_call_s"] <= hi)]
+        out[label] = {"calls": len(rows), "tokens": sum(c["idle_rewrite_tokens"] for c in rows),
+                      "cacheWrite_cost": sum(c["cost_cacheWrite"] for c in rows)}
+    return out
+
+
+def local_day(ts):
+    return parse_ts(ts).astimezone().date()
+
+
+def by(calls, key):
+    out = collections.defaultdict(list)
+    for c in calls:
+        out[key(c) if callable(key) else c.get(key)].append(c)
+    return out
+
+
+def group_cost(calls, key):
+    out = {}
+    for k, rows in by(calls, key).items():
+        out[str(k)] = {"cost": sum(c["cost"] for c in rows), "calls": len(rows),
+                       "sessions": len({c["session"] for c in rows})}
+    return out
+
+
+def session_table(calls, sessions):
+    rows = []
+    for sid, cs in by(calls, "session").items():
+        s = sessions.get(sid) or {}
+        cost = sum(c["cost"] for c in cs)
+        row = {"session": sid, "name": s.get("name") or s.get("title"), "role": cs[0].get("role"),
+               "segment": cs[0].get("segment"), "ticket": cs[0].get("ticket"), "cwd": s.get("cwd"),
+               "cost": cost, "calls": len(cs), "max_context": max(c["context"] for c in cs),
+               "models": sorted({c["model"] for c in cs if c["model"]}),
+               "idle_rewrites": sum(1 for c in cs if c["idle_rewrite_tokens"]),
+               "idle_rewrite_cost": sum(c["cost_cacheWrite"] for c in cs if c["idle_rewrite_tokens"])}
+        for b in CONTEXT_BANDS:
+            row["share_above_%dk" % (b // 1000)] = (sum(c["cost"] for c in cs if c["context"] > b) / cost
+                                                    if cost else 0.0)
+        rows.append(row)
+    rows.sort(key=lambda r: -r["cost"])
+    return rows
+
+
+def tool_tables(tool_results, calls, pricing):
+    model_of = {}
+    for c in calls:
+        model_of.setdefault(c["session"], c["model"])
+    blank = lambda: {"calls": 0, "bytes": 0, "images": 0, "est_tokens": 0.0, "est_carry_cost": 0.0}
+    fam = collections.defaultdict(blank)
+    tools = collections.defaultdict(blank)
+    top = []
+    for t in tool_results:
+        model = model_of.get(t["session"])
+        r = pricing.rates(model, 0) if model else None
+        tok = t["bytes"] / BYTES_PER_TOKEN + t.get("images", 0) * TOKENS_PER_IMAGE
+        carry = tok * (r["cacheWrite"] + r["cacheRead"] * max(0, t.get("calls_after", 1) - 1)) if r else 0.0
+        t["est_tokens"] = tok
+        t["est_carry_cost"] = carry
+        for d, k in ((fam, t["family"]), (tools, t["tool"])):
+            d[k]["calls"] += 1
+            d[k]["bytes"] += t["bytes"]
+            d[k]["images"] += t.get("images", 0)
+            d[k]["est_tokens"] += tok
+            d[k]["est_carry_cost"] += carry
+        top.append(t)
+    top.sort(key=lambda t: -t["est_carry_cost"])
+    order = lambda d: dict(sorted(d.items(), key=lambda kv: -kv[1]["est_carry_cost"]))
+    return {"by_family": order(fam), "by_tool": order(tools),
+            "top_calls": [{k: t.get(k) for k in ("ts", "session", "tool", "label", "bytes", "images", "est_tokens",
+                                                  "calls_after", "est_carry_cost", "role")} for t in top[:25]]}
+
+
+def ticket_table(calls, prs):
+    pr_by_ticket = collections.Counter(p["ticket"] for p in prs if p.get("ticket"))
+    cost = collections.defaultdict(float)
+    for c in calls:
+        if c.get("ticket"):
+            cost[c["ticket"]] += c["cost"]
+    rows = [{"ticket": t, "cost": v, "merged_prs": pr_by_ticket.get(t, 0)} for t, v in cost.items()]
+    for t, n in pr_by_ticket.items():
+        if t not in cost:
+            rows.append({"ticket": t, "cost": 0.0, "merged_prs": n})
+    rows.sort(key=lambda r: -r["cost"])
+    return {"rows": rows, "attributed_cost": sum(cost.values()),
+            "prs_without_ticket": sum(1 for p in prs if not p.get("ticket"))}
+
+
+def money(v):
+    return "n/a" if v is None else "$%s" % format(round(v, 2), ",.2f")
+
+
+def pct(a, b):
+    return "n/a" if not b else "%.1f%%" % (100.0 * a / b)
+
+
+def table(headers, rows):
+    out = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
+    out += ["| " + " | ".join(str(x) for x in r) + " |" for r in rows]
+    return "\n".join(out)
+
+
+def render_markdown(s, title, baseline=None, pricing_path=None, limit_sessions=25):
+    t = s["totals"]["cost"]
+    L = ["---", "state: proposed", "author: pi-cost (agent tool)", "as_of: %s" % s["generated"][:10],
+         "---", "# %s" % title, "",
+         "Window: %s to %s (UTC). Generated %s by `~/.pi/agent/bin/pi-cost`."
+         % (s["window"]["since"][:19], s["window"]["until"][:19], s["generated"][:19]),
+         "Usage-reported cost as pi recorded it per call, not a gateway invoice. Prices for counterfactuals: `%s`."
+         % pricing_path, ""]
+    u = s["units"]
+    L += ["## Headline", "",
+          table(["measure", "value"], [
+              ["total cost", money(t)], ["calls (deduplicated)", "{:,}".format(s["totals"]["calls"])],
+              ["active days", u["active_days"]], ["cost per active day", money(u["cost_per_active_day"])],
+              ["sessions with calls", u["sessions_with_calls"]], ["cost per session", money(u["cost_per_session"])],
+              ["lead sessions", u["lead_sessions"]],
+              ["lead cost per lead session", money(u["lead_cost_per_lead_session"])],
+              ["merged PRs (%s, author %s)" % (GH_REPO, GH_AUTHOR), u.get("merged_prs", "n/a")],
+              ["cost per merged PR, all spend", money(u.get("cost_per_merged_pr_all_spend"))],
+              ["cost per merged PR, %s segment spend" % WORK_SEGMENT, money(u.get("cost_per_merged_pr_work_segment_spend"))],
+              ["ticket missions with a merged PR and attributed spend", u.get("ticket_missions_with_merged_pr", "n/a")],
+              ["cost per ticket mission (attributed only)", money(u.get("cost_per_ticket_mission_attributed"))],
+              ["tickets with a merged PR but no attributed spend", u.get("tickets_with_merged_pr_no_attributed_spend",
+                                                                       "n/a")],
+              ["sessions whose context passed 200k", "%d of %d (%s)" % (
+                  s["big_sessions"]["sessions_over_200k"], s["big_sessions"]["sessions"],
+                  pct(s["big_sessions"]["sessions_over_200k"], s["big_sessions"]["sessions"]))],
+              ["cost of those sessions", "%s (%s)" % (money(s["big_sessions"]["cost_over_200k_sessions"]),
+                                                     pct(s["big_sessions"]["cost_over_200k_sessions"], t))],
+              ["largest context", "{:,}".format(s["big_sessions"]["max_context"])],
+              ["idle rewrites (>5 min)", "%d calls, %s of cache-write cost" % (
+                  s["idle_rewrites"]["calls"], money(s["idle_rewrites"]["cost_recorded_of_those_calls_cacheWrite"]))],
+          ]), ""]
+    if baseline:
+        L += ["## Compared with baseline", "", compare_table(s, baseline), ""]
+    comp = s["components"]
+    L += ["## Cost by component", "",
+          table(["component", "cost", "share"], [[k, money(v), pct(v, t)] for k, v in comp.items()]), ""]
+    rows = []
+    for model, v in s["components_by_model"].items():
+        if v["total"] >= 1:
+            rows.append([model, money(v["total"])] + [pct(v[k], v["total"]) for k in ("cacheWrite", "cacheRead",
+                                                                                         "output", "input")])
+    rows.sort(key=lambda r: -float(r[1][1:].replace(",", "")))
+    L += [table(["model", "cost", "cache write", "cache read", "output", "input"], rows), ""]
+    for key, label in (("by_role", "role"), ("by_role_source", "role evidence"), ("by_model", "model"),
+                       ("by_segment", "segment")):
+        L += ["## By %s" % label, "", table([label, "cost", "share", "calls", "sessions"], [
+            [k, money(v["cost"]), pct(v["cost"], t), "{:,}".format(v["calls"]), v["sessions"]]
+            for k, v in s[key].items() if v["cost"] >= 0.5]), ""]
+    L += ["## By week", "", table(["ISO week (local)", "cost"], [[k, money(v)] for k, v in s["by_week"].items()]),
+          "", "## By day", "", table(["day (local)", "cost"], [[k, money(v)] for k, v in s["by_day"].items()]), ""]
+    L += ["## Cost by call context size", "", table(["calls whose context exceeded", "cost", "share"], [
+        ["{:,}".format(int(b)), money(v), pct(v, t)] for b, v in s["cost_above_context"].items()]), ""]
+    L += ["## Sessions (top %d by cost)" % limit_sessions, "",
+          table(["session", "name", "role", "segment", "cost", "calls", "max ctx", ">200k", ">400k", ">600k",
+                 "idle rewrites", "idle cost"],
+                [[r["session"][:13], (r["name"] or "")[:40].replace("|", "/"), r["role"], r["segment"],
+                  money(r["cost"]), r["calls"], "{:,}".format(r["max_context"]),
+                  "%.0f%%" % (100 * r["share_above_200k"]), "%.0f%%" % (100 * r["share_above_400k"]),
+                  "%.0f%%" % (100 * r["share_above_600k"]), r["idle_rewrites"], money(r["idle_rewrite_cost"])]
+                 for r in s["sessions"][:limit_sessions]]), ""]
+    tl = s["tools"]
+    tb = sum(v["est_tokens"] for v in tl["by_family"].values())
+    L += ["## What fills the context: tool results", "",
+          "Estimated tokens = text bytes / %.0f + %d per image. Estimated carry cost = those tokens written once at "
+          "the session model's cache-write price, then read at the cache-read price on every later call in that "
+          "session (compactions ignored). An estimate, not recorded cost." % (BYTES_PER_TOKEN, TOKENS_PER_IMAGE), "",
+          table(["tool family", "results", "text MB", "images", "est. tokens", "share", "est. carry cost"], [
+              [k, "{:,}".format(v["calls"]), "%.1f" % (v["bytes"] / 1e6), v["images"],
+               "{:,.0f}".format(v["est_tokens"]), pct(v["est_tokens"], tb), money(v["est_carry_cost"])]
+              for k, v in list(tl["by_family"].items())[:15]]), "",
+          "Single results with the highest estimated carry cost:", "",
+          table(["ts", "session", "tool", "what", "KB", "later calls", "est. carry"], [
+              [r["ts"][:16], (r["session"] or "")[:13], r["tool"], (r["label"] or "")[:60].replace("|", "/"),
+               "%.0f" % (r["bytes"] / 1000), r["calls_after"], money(r["est_carry_cost"])]
+              for r in tl["top_calls"][:15]]), ""]
+    L += ["## Compactions", "", "%d compaction entries in the window (pi writes `type: compaction`)." %
+          len(s["compactions"]), ""]
+    cf = s["counterfactuals"]
+    sc = cf["reprice_selfcheck"]
+    L += ["## Counterfactuals (no second model run)", "",
+          "### Re-price the same tokens", "",
+          "Exact for price; says nothing about quality or whether another model would use the same tokens. "
+          "Self-check: re-pricing every call at its own model's gateway price gives %s vs %s recorded "
+          "(difference %s over %s calls)." % (money(sc["repriced"]), money(sc["recorded"]), money(sc["diff"]),
+                                             "{:,}".format(sc["calls"])), "",
+          table(["all calls priced as", "cost", "vs recorded", "assumed rates"], [
+              [r["model"], money(r["total"]), pct(r["total"], t), ", ".join(r["assumed"]) or "none"]
+              for r in cf["reprice"]]), ""]
+    L += ["### One-hour cache", "",
+          "Anthropic calls only. Every cache write priced at the one-hour rate; a rewrite after an idle gap of "
+          "5 to 60 min becomes a cache read. Gaps over 60 min still rewrite. The gateway price list has no "
+          "one-hour write rate, so it is taken as %.1fx input (Anthropic's published multiplier); "
+          "the 5 min write is 1.25x." % s.get("write_1h_multiplier", 2.0), ""]
+    ttl_rows = []
+    for key, label in (("ttl_1h_all", "all sessions"), ("ttl_1h_lead_only", "lead sessions only")):
+        r = cf[key]
+        ttl_rows.append([label, money(r["actual"]), money(r["one_hour"]), money(r["delta"]), r["idle_calls"],
+                         "{:,}".format(r["idle_rewrite_tokens"])])
+    L += [table(["scope", "repriced 5 min", "with 1 h", "change", "idle rewrites", "rewritten tokens"], ttl_rows), "",
+          table(["idle gap before the rewrite", "calls", "rewritten tokens", "cache-write cost of those calls"], [
+              [k, v["calls"], "{:,}".format(v["tokens"]), money(v["cacheWrite_cost"])]
+              for k, v in s["idle_rewrites"]["bands"].items()]), ""]
+    L += ["### Context cap with handoff", "",
+          "Model-based estimate. When a session's context would pass N, it restarts with a handoff: new context = "
+          "min(first-call context, 50k) + H handoff tokens (H = 20k or 60k), written fresh; later calls keep the "
+          "session's own per-turn growth. Ignores quality loss and any re-reading beyond H.", "",
+          table(["cap N", "handoff H", "repriced actual", "with cap", "change", "restarts", "sessions restarted"], [
+              ["{:,}".format(r["cap"]), "{:,}".format(r["handoff_tokens"]), money(r["actual_repriced"]),
+               money(r["capped"]), "%s (%s)" % (money(r["delta"]), pct(r["delta"], r["actual_repriced"])),
+               r["restarts"], r["sessions_restarted"]] for r in cf["context_cap"]]), ""]
+    if s.get("tickets"):
+        tk = s["tickets"]
+        L += ["## Ticket missions (heuristic attribution)", "",
+              "Session ticket = a worktree cwd matching the layer's worktreeTicketPattern, else a ticket id that is at least 60%% of 3+ mentions in "
+              "the session's own turns and task. Attributed %s; %d merged PRs carry no ticket id."
+              % (money(tk["attributed_cost"]), tk["prs_without_ticket"]), "",
+              table(["ticket", "cost", "merged PRs"], [[r["ticket"], money(r["cost"]), r["merged_prs"]]
+                                                       for r in tk["rows"][:25]]), ""]
+    L += ["## Method", ""] + ["- %s: %s" % (k, v) for k, v in s["method"].items()] + [""]
+    return "\n".join(L)
+
+
+def compare_table(s, b):
+    rows = []
+    span = lambda x: (parse_ts(x["window"]["until"]) - parse_ts(x["window"]["since"])).total_seconds() / 86400
+    pairs = [
+        ("cost per calendar day", s["totals"]["cost"] / span(s), b["totals"]["cost"] / span(b)),
+        ("cost per active day", s["units"]["cost_per_active_day"], b["units"]["cost_per_active_day"]),
+        ("cost per session", s["units"]["cost_per_session"], b["units"]["cost_per_session"]),
+        ("lead cost per lead session", s["units"]["lead_cost_per_lead_session"],
+         b["units"]["lead_cost_per_lead_session"]),
+        ("cost per merged PR (all spend)", s["units"].get("cost_per_merged_pr_all_spend"),
+         b["units"].get("cost_per_merged_pr_all_spend")),
+        ("cost per ticket mission", s["units"].get("cost_per_ticket_mission_attributed"),
+         b["units"].get("cost_per_ticket_mission_attributed")),
+    ]
+    for label, now, base in pairs:
+        change = "n/a" if not now or not base else "%+.0f%%" % (100 * (now / base - 1))
+        rows.append([label, money(now), money(base), change])
+    st, bt = s["totals"]["cost"] or 1, b["totals"]["cost"] or 1
+    for k in ("cacheWrite", "cacheRead", "output"):
+        rows.append(["share: %s" % k, pct(s["components"][k], st), pct(b["components"][k], bt), ""])
+    rows.append(["share: lead role", pct(s["by_role"].get("lead", {}).get("cost", 0), st),
+                 pct(b["by_role"].get("lead", {}).get("cost", 0), bt), ""])
+    rows.append(["share: calls above 200k context", pct(s["cost_above_context"]["200000"], st),
+                 pct(b["cost_above_context"]["200000"], bt), ""])
+    rows.append(["idle-rewrite write cost per calendar day",
+                 money(s["idle_rewrites"]["cost_recorded_of_those_calls_cacheWrite"] / span(s)),
+                 money(b["idle_rewrites"]["cost_recorded_of_those_calls_cacheWrite"] / span(b)), ""])
+    return table(["unit", "this period", "baseline", "change"], rows)
+
+
+def default_pricing():
+    found = sorted(glob.glob(os.path.join(MEASURE_DIR, "pricing", "gateway-models-*.json")))
+    return found[-1] if found else None
+
+
+def run(args):
+    now = dt.datetime.now(dt.timezone.utc)
+    until = parse_since(args.until, now) if args.until else now
+    since = parse_since(args.since, until)
+    pricing_path = args.pricing or default_pricing()
+    if not pricing_path:
+        sys.exit("no pricing file; pass --pricing (a saved https://ai-gateway.vercel.sh/v1/models)")
+    pricing = Pricing.load(pricing_path, args.write_1h_multiplier)
+    ledger = build_ledger(since, until, router=SegmentRouter(), pricing=pricing,
+                          worker_logs_dir=TEAMS_DIR if args.worker_logs else None)
+    return now, since, until, pricing, pricing_path, ledger
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pi-cost", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("command", choices=("ledger", "report", "baseline", "reprice"))
+    ap.add_argument("--since", default=None)
+    ap.add_argument("--until", default=None)
+    ap.add_argument("--pricing", default=None)
+    ap.add_argument("--write-1h-multiplier", type=float, default=2.0)
+    ap.add_argument("--worker-logs", action="store_true")
+    ap.add_argument("--no-gh", action="store_true")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--baseline", default=None)
+    ap.add_argument("--date", default=None)
+    ap.add_argument("--model", default=None)
+    args = ap.parse_args(argv)
+    args.since = args.since or ("7d" if args.command == "report" else "30d")
+    now, since, until, pricing, pricing_path, ledger = run(args)
+    calls = ledger["calls"]
+    if args.command == "ledger":
+        out = open(args.out, "w", encoding="utf-8") if args.out else sys.stdout
+        for c in calls:
+            out.write(json.dumps({k: v for k, v in c.items() if k != "file"}) + "\n")
+        if args.out:
+            out.close()
+            print("wrote %d calls to %s" % (len(calls), args.out))
+        return 0
+    if args.command == "reprice":
+        r = reprice(calls, pricing, args.model)
+        print(json.dumps(r, indent=1))
+        print("recorded %s" % money(sum(c["cost"] for c in calls)))
+        return 0
+    prs, pr_source = (None, "skipped (--no-gh)") if args.no_gh else gh_merged_prs(since, until)
+    if prs is None and not args.no_gh:
+        pr_source, prs = pr_source, None
+    s = summarise(ledger, pricing, since, until, prs, pr_source)
+    s["pricing_file"] = pricing_path
+    s["write_1h_multiplier"] = args.write_1h_multiplier
+    out_dir = args.out_dir or MEASURE_DIR
+    date = args.date or dt.datetime.now().astimezone().date().isoformat()
+    if args.command == "baseline":
+        os.makedirs(out_dir, exist_ok=True)
+        base = os.path.join(out_dir, "baseline-%s" % date)
+        write_text(base + ".json", json.dumps(s, indent=1, default=str))
+        write_text(base + ".md", render_markdown(s, "pi cost baseline, %s (frozen)" % date, pricing_path=pricing_path))
+        print("wrote %s.json and %s.md; total %s" % (base, base, money(s["totals"]["cost"])))
+        return 0
+    baseline_path = args.baseline or latest_baseline(out_dir)
+    baseline = read_json(baseline_path) if baseline_path else None
+    weekly = os.path.join(out_dir, "weekly")
+    os.makedirs(weekly, exist_ok=True)
+    path = os.path.join(weekly, "%s.md" % date)
+    md = render_markdown(s, "pi cost report, %s (since %s)" % (date, args.since), baseline=baseline,
+                         pricing_path=pricing_path, limit_sessions=15)
+    if baseline_path:
+        md = md.replace("## Compared with baseline", "## Compared with baseline (`%s`)" % baseline_path, 1)
+    write_text(path, md)
+    write_text(path[:-3] + ".json", json.dumps(s, indent=1, default=str))
+    print("wrote %s; total %s" % (path, money(s["totals"]["cost"])))
+    return 0
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def write_text(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def latest_baseline(out_dir):
+    found = sorted(glob.glob(os.path.join(out_dir, "baseline-*.json")))
+    return found[-1] if found else None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

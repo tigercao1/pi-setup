@@ -36,6 +36,26 @@ collections:
     pattern: "{SSMS,ssnow-management-system-plan}/**/*.md"
     context:
       "/": "SSMS plans, reviews and research notes."
+  ssms-repo:
+    path: "$HOME/files"
+    pattern: "{ssms-api,ssms-portal}/**/*.md"
+    ignore:
+      - "**/node_modules/**"
+      - "ssms-portal/wt/**"
+    context:
+      "/": "SSMS repo docs (main checkouts of tigercao1/ssms-api and tigercao1/ssms-portal): READMEs, docs, supabase notes."
+  ssms-reports:
+    path: "$HOME/files/wt"
+    pattern: "*.md"
+    context:
+      "/": "SSMS ticket worker output from ~/files/wt: *.report.md (coder reports), review-*.md and *-review.md (reviews), *-verifier.md (verifier verdicts). The per-ticket worktree folders are not indexed; they duplicate the repo docs."
+  pstack:
+    path: "$HOME/files/pstack-src"
+    pattern: "**/*.md"
+    ignore:
+      - "**/node_modules/**"
+    context:
+      "/": "pstack source (Lauren Tan, MIT): the upstream skills, agents, automations and docs that Tiger's pi skills were adapted from."
   financial-analyst-agent:
     path: "$HOME/.pi/memory/financial-analyst-agent"
     pattern: "**/*.md"
@@ -51,6 +71,20 @@ collections:
     pattern: "**/*.md"
     context:
       "/": "Carpool project pi sessions."
+  carpool-repo:
+    path: "$HOME/files/carpool"
+    pattern: "**/*.md"
+    ignore:
+      - "**/node_modules/**"
+    context:
+      "/": "Carpool repo docs (bwuzhang/carpool): webapp, portal and docs folders."
+  urban-dollop-repo:
+    path: "$HOME/files/urban-dollop"
+    pattern: "**/*.md"
+    ignore:
+      - "**/node_modules/**"
+    context:
+      "/": "urban-dollop repo docs."
   carpool-notes:
     path: "$HOME/Documents/knowledge-base-remote/Carpool"
     pattern: "**/*.md"
@@ -71,6 +105,14 @@ collections:
     pattern: "{growth-agent,SheepMatch,b2b-in-collective,resume-craft,interview-questions,Interview transcript}/**/*.md"
     context:
       "/": "Other personal notes: past-job projects, side ideas, resume and interview prep."
+  pages:
+    path: "$HOME/.pi/memory/pages"
+    pattern: "{pi,ssms,financial-analyst-agent,carpool,urban-dollop,misc}/**/*.md"
+    ignore:
+      - "pi/Pi/docs/plans/show-me-cleanup/*hb-*.md"
+      - "pi/Pi/docs/plans/show-me-cleanup/showme-exec-hb-*/**"
+    context:
+      "/": "Converted HTML pages; source path in front matter; open the source for layout"
 models:
   embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
   generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"

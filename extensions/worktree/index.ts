@@ -116,23 +116,36 @@ export default function (pi: ExtensionAPI) {
     return;
   }
 
+  let generation = 0;
+
   const refreshStatus = async (ctx: ExtensionContext) => {
+    const started = generation;
+    const setStatus = (text: string | undefined) => {
+      if (started !== generation) return;
+      try {
+        ctx.ui.setStatus(STATUS_KEY, text);
+      } catch {}
+    };
     try {
       const worktrees = await list(ctx.cwd, false);
       const here = worktrees.find((w) => w.current);
       if (!here || here.main) {
-        ctx.ui.setStatus(STATUS_KEY, undefined);
+        setStatus(undefined);
         return;
       }
       const dirty = here.dirty === 0 ? "" : ` ~${here.dirty}`;
-      ctx.ui.setStatus(STATUS_KEY, `wt:${here.name}${dirty}`);
+      setStatus(`wt:${here.name}${dirty}`);
     } catch {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      setStatus(undefined);
     }
   };
 
   pi.on("session_start", async (_event, ctx) => {
     await refreshStatus(ctx);
+  });
+
+  pi.on("session_shutdown", async () => {
+    generation++;
   });
 
   // Workers spawned without an explicit cwd inherit the orchestrator's checkout and

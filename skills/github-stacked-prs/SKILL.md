@@ -32,6 +32,45 @@ gh ext install github/gh-stack
 | `gh stack view` / `checkout` / `modify` | Inspect, switch, interactively restructure (TUI — unusable headless). |
 | `gh stack rebase` / `submit` / `sync` / `merge` | Remote operations on the whole stack. |
 
+## Step 0: check the stack's real state before touching it
+
+Do this before any rebase, restack or push on a chain of PRs, every time, even if you were just
+working on it. People merge lower PRs, click "update branch" in the UI, or rebase from another
+machine, and your local branches go stale silently.
+
+```bash
+git fetch origin
+for b in <each stack branch>; do
+  echo "$b local=$(git rev-parse --short=10 $b) origin=$(git rev-parse --short=10 origin/$b)"
+done
+for n in <each PR number>; do
+  gh pr view $n --json number,state,mergeable,baseRefName,headRefOid \
+    -q '[.number,.state,.mergeable,.baseRefName,.headRefOid[0:10]]|@tsv'
+done
+gh stack view          # look for "merged" markers and "Needs rebase"
+```
+
+Read it like this:
+
+- **`state` MERGED on a lower PR:** the stack must be rebased onto trunk. Use `gh stack checkout <stack>`
+  then `gh stack rebase`; it skips merged branches and replays only each remaining branch's own
+  commits. Do not replay the merged commits by hand, the squash commit on trunk will collide with them.
+- **Local and origin heads differ:** someone moved the remote. `gh stack checkout` printing "Local stack
+  matches remote" only compares the stack's tracking, not commit hashes, so do not trust it. Compare
+  the hashes yourself. Fetch first, rebase, and `gh stack push` (its lease is against the fetched
+  remote). Never push with an explicit `--force-with-lease=<branch>:<old head>` built from stale
+  local heads. Compare `git diff <base> <branch> | git patch-id --stable` against the remote's to
+  confirm the content is the same before overwriting it.
+- **`mergeable` CONFLICTING:** expect a conflict in the rebase; see the recipe below.
+
+## Prefer `gh stack`; hand-restack only when tracking is broken
+
+`gh stack checkout / rebase / push` is the default, including after lower PRs merge. Restack by hand
+with `git rebase --onto <new parent> <old parent head> <branch>` only when GitHub's stack tracking is
+out of sync (symptoms: `gh stack rebase` replays commits that are already merged, or the stack on
+GitHub lists the wrong branches). When you do, say why in the report, verify own-diff patch-ids, and
+push each branch with an explicit lease on the remote head you just fetched.
+
 ## Do not hand-rebase a stack — one command does it
 
 If you changed a PR low in the stack and everything above needs updating, **do not** loop
@@ -272,3 +311,19 @@ Headless workers cannot use `gh stack modify` (TUI). Give them `link` / `unstack
 and require them to re-assert draft status afterwards. Also require:
 `export GIT_EDITOR=true` before any rebase/amend, and `git commit -m`/`-F` only — an
 interactive editor will hang a headless agent indefinitely.
+
+## Recipe: a shared list file conflicts on rebase onto trunk
+
+Typical after lower PRs merge: trunk and your branch each appended to the same file (an `errors.rb`
+class list, `package_todo.yml`, a locale file). Resolve as a union, trunk's entries first, your
+entries after, one conflict at a time. Check `grep -c '<<<<<<<\|>>>>>>>\|=======' <file>` is 0 and the
+file parses (`ruby -c`), `git add`, `gh stack rebase --continue`, then verify.
+
+## After rebasing onto a moved trunk
+
+Trunk may have moved to newer private gems or migrations. Before running specs: `bundle install`
+(a `GemNotFound` from `bundle exec` means this), then on a PRIVATE database copy (never the shared
+test database) `bin/rails db:migrate`. Run the specs in the diff plus the neighbouring spec
+directories, `bin/packs check` and `bin/codeownership validate`, then `gh stack push`. After the push
+GitHub can show the old head for up to a minute; re-check `gh pr view` before concluding the push
+failed.

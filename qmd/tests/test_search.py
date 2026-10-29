@@ -75,7 +75,7 @@ class Labels(unittest.TestCase):
         path = self.file("a.md", "---\nstate: superseded\n---\n# A\n"
                                  "- merged <!-- claim state=confirmed evidence=https://x/1,o/r#2 as_of=2026-10-22 -->\n"
                                  "- monitor <!-- claim state=proposed -->\n")
-        got = labels.file_labels(path, self.memory, line=5, span=1)
+        got = labels.file_labels(path, self.memory, line=5)
         self.assertEqual((got["effective"], got["evidence"], got["source"]), ("confirmed", ["https://x/1", "o/r#2"], "line label"))
         self.assertEqual(got["claims"], {"confirmed": 1, "proposed": 1})
         self.assertEqual(labels.file_labels(path, self.memory)["effective"], "superseded")
@@ -91,9 +91,99 @@ class Labels(unittest.TestCase):
         self.assertEqual((got["state"], got["evidence"], got["as_of"], got["source"]),
                          ("acted", ["https://x/1", "o/r#2"], "2026-10-21", "html meta"))
         self.assertEqual(got["claims"], {"confirmed": 1})
-        line = labels.file_labels(path, self.memory, line=6, span=1)
+        line = labels.file_labels(path, self.memory, line=6)
         self.assertEqual((line["effective"], line["evidence"]), ("confirmed", ["https://x/3"]))
-        self.assertEqual(labels.file_labels(path, self.memory, line=7, span=1)["effective"], "acted")
+        tick = labels.file_labels(path, self.memory, line=7)
+        self.assertEqual((tick["effective"], tick["evidence"], tick["source"]), ("proposed", [], "unlabelled item"))
+        self.assertEqual(labels.file_labels(path, self.memory, line=2)["effective"], "acted")
+
+    def test_label_is_never_borrowed_from_a_neighbouring_line(self):
+        path = self.file("adjacent.md", "# Claims\n- not verified unverifiedquokka\n"
+                                        "- merged <!-- claim state=confirmed evidence=https://x/1 -->\n")
+        got = labels.file_labels(path, self.memory, line=2, terms=["unverifiedquokka"])
+        self.assertEqual((got["effective"], got["evidence"], got["source"]), ("proposed", [], "unlabelled"))
+        self.assertEqual(labels.file_labels(path, self.memory, line=3)["effective"], "confirmed")
+        self.assertEqual(labels.file_labels(path, self.memory, line=1)["effective"], "proposed")
+
+    def test_transcript_stays_transcript_whatever_it_quotes(self):
+        path = os.path.join(self.memory, "pi", "sessions", "t.md")
+        write(path, "---\nstate: confirmed\nevidence: https://x/0\n---\n# Session\nuser pasted:\n"
+                    "- transcriptquokka <!-- claim state=confirmed evidence=https://x/1 -->\n")
+        line = labels.file_labels(path, self.memory, line=7)
+        self.assertEqual((line["state"], line["effective"], line["evidence"], line["source"]),
+                         ("transcript", "transcript", [], "path default"))
+        self.assertEqual((line["asserted"]["state"], line["asserted"]["evidence"]), ("confirmed", ["https://x/1"]))
+        self.assertIn("not applied", line["note"])
+        whole = labels.file_labels(path, self.memory)
+        self.assertEqual((whole["effective"], whole["asserted"]["evidence"]), ("transcript", ["https://x/0"]))
+        html = os.path.join(self.memory, "pi", "p.html")
+        write(html, "<html><head><meta name=\"show-me:state\" content=\"confirmed\">"
+                    "<meta name=\"show-me:evidence\" content=\"https://x/2\"></head><body>\n"
+                    "<li data-state=\"confirmed\" data-evidence=\"https://x/3\">x</li>\n</body></html>\n")
+        self.assertEqual(labels.file_labels(html, self.memory, line=2)["effective"], "transcript")
+        self.assertEqual(labels.file_labels(html, self.memory)["effective"], "transcript")
+
+    def test_unlabelled_ticks_and_items_are_proposed(self):
+        page = self.file("tick.html", "<html><head>\n<meta name=\"show-me:state\" content=\"confirmed\">\n"
+                                      "<meta name=\"show-me:evidence\" content=\"https://x/1\">\n</head><body>\n"
+                                      "<li class=\"done\">untraceable tickquokka</li>\n"
+                                      "<input type=\"checkbox\" checked> monitor\n"
+                                      "<p>\u2713 shipped</p>\n"
+                                      "<li data-state=\"acted\"><span class=\"done\">\u2713</span> emailed</li>\n"
+                                      "<p>prose under the page label</p>\n</body></html>\n")
+        for line in (5, 6, 7):
+            got = labels.file_labels(page, self.memory, line=line)
+            self.assertEqual((line, got["effective"], got["evidence"]), (line, "proposed", []))
+        self.assertEqual(labels.file_labels(page, self.memory, line=8)["effective"], "acted")
+        self.assertEqual(labels.file_labels(page, self.memory, line=9)["effective"], "confirmed")
+        note = self.file("ticks.md", "---\nstate: confirmed\nevidence: https://x/1\n---\n- [x] monitor created\n"
+                                     "- [x] merged <!-- claim state=confirmed evidence=https://x/2 -->\n")
+        self.assertEqual(labels.file_labels(note, self.memory, line=5)["effective"], "proposed")
+        self.assertEqual(labels.file_labels(note, self.memory, line=6)["evidence"], ["https://x/2"])
+
+    def test_empty_evidence_is_no_evidence(self):
+        variants = {"flow.md": "---\nstate: confirmed\nevidence: [\"\"]\n---\n",
+                    "scalar.md": "---\nstate: confirmed\nevidence: \"\"\n---\n",
+                    "spaces.md": "---\nstate: confirmed\nevidence: [ , '  ' ]\n---\n",
+                    "items.md": "---\nstate: confirmed\nevidence:\n  - \"\"\n  - ''\n---\n"}
+        for name, text in variants.items():
+            got = labels.file_labels(self.file(name, text), self.memory)
+            self.assertEqual((name, got["effective"], got["evidence"]), (name, "proposed", []))
+        comment = self.file("c.md", "- x <!-- claim state=confirmed evidence=\"\" -->\n- y <!-- claim state=confirmed evidence=, -->\n")
+        for line in (1, 2):
+            self.assertEqual(labels.file_labels(comment, self.memory, line=line)["effective"], "proposed")
+        page = self.file("m.html", "<html><head><meta name=\"show-me:state\" content=\"confirmed\">"
+                                   "<meta name=\"show-me:evidence\" content=\" \"></head><body>\n"
+                                   "<li data-state=\"confirmed\" data-evidence=\"\">x</li>\n</body></html>\n")
+        self.assertEqual(labels.file_labels(page, self.memory)["effective"], "proposed")
+        self.assertEqual(labels.file_labels(page, self.memory, line=2)["effective"], "proposed")
+
+    def test_bom_before_front_matter(self):
+        path = self.file("bom.md", "\ufeff---\nstate: superseded\nsuperseded_by: newer.md\n---\n# old\n- line five\n")
+        got = labels.file_labels(path, self.memory)
+        self.assertEqual((got["effective"], got["superseded_by"]), ("superseded", "newer.md"))
+        self.assertEqual(labels.front_matter("\ufeff---\nstate: acted\n---\n")["state"], "acted")
+        page = self.file("bom.html", "\ufeff<!doctype html><html><head><meta name=\"show-me:state\" content=\"acted\"></head></html>")
+        self.assertEqual(labels.file_labels(page, self.memory)["effective"], "acted")
+        numbered = self.file("bomline.md", "\ufeff# t\n- x <!-- claim state=acted -->\n")
+        self.assertEqual(labels.file_labels(numbered, self.memory, line=2)["effective"], "acted")
+
+    def test_meta_only_from_head_and_items_only_their_own_attributes(self):
+        body_meta = self.file("body.html", "<html><head></head><body>\n<meta name=\"show-me:state\" content=\"confirmed\">"
+                                           "<meta name=\"show-me:evidence\" content=\"https://x/1\">\n</body></html>")
+        self.assertEqual(labels.file_labels(body_meta, self.memory)["effective"], "proposed")
+        same = self.file("same.html", "<html><head></head><body>\n<ul><li data-state=\"proposed\">first quokka</li>"
+                                      "<li data-state=\"confirmed\" data-evidence=\"https://x/1\">second item</li></ul>\n</body></html>")
+        ambiguous = labels.file_labels(same, self.memory, line=2)
+        self.assertEqual((ambiguous["effective"], ambiguous["evidence"]), ("proposed", []))
+        self.assertIn("different labels", ambiguous["note"])
+        first = labels.file_labels(same, self.memory, line=2, terms=["quokka"])
+        self.assertEqual((first["effective"], first["evidence"]), ("proposed", []))
+        second = labels.file_labels(same, self.memory, line=2, terms=["second"])
+        self.assertEqual((second["effective"], second["evidence"]), ("confirmed", ["https://x/1"]))
+        two = self.file("two.md", "- a quokka <!-- claim state=proposed --> - b merged <!-- claim state=confirmed evidence=https://x/1 -->\n")
+        self.assertEqual(labels.file_labels(two, self.memory, line=1, terms=["quokka"])["evidence"], [])
+        self.assertEqual(labels.file_labels(two, self.memory, line=1, terms=["merged"])["evidence"], ["https://x/1"])
 
     def test_unreadable_file(self):
         got = labels.file_labels(os.path.join(self.root, "gone.md"), self.memory)
@@ -136,11 +226,17 @@ class Wrapper(unittest.TestCase):
         order = [line.split("]")[0].split("[")[1] for line in out.stdout.splitlines() if line[:1].isdigit()]
         self.assertEqual(order, ["confirmed", "acted", "proposed", "proposed", "transcript"])
         self.assertIn("1 superseded hit hidden", out.stdout)
-        self.assertIn("evidence: https://x/pull/1", out.stdout)
+        self.assertIn("evidence (not checked): https://x/pull/1", out.stdout)
         self.assertIn("[unresolved path]", out.stdout)
         with open(os.path.join(self.root, "args"), encoding="utf-8") as fh:
             self.assertEqual(fh.read().split(), ["--index", "t", "search", "disposition", "monitor", "--format", "json",
                                                  "-n", "7", "-c", "docs", "--min-score", "0.2"])
+
+    def test_transcript_quote_is_shown_not_applied(self):
+        write(os.path.join(self.memory, "pi", "sessions", "t.md"), "- x <!-- claim state=confirmed evidence=https://x/9 -->\n")
+        out = self.run_search("--index", "t", "x").stdout
+        self.assertIn("[transcript] qmd://sess/pi/sessions/t.md", out)
+        self.assertIn("quoted label, not applied: confirmed evidence https://x/9", out)
 
     def test_all_shows_superseded_last_and_json(self):
         out = json.loads(self.run_search("--index", "t", "--all", "--json", "--query", "x").stdout)
@@ -178,6 +274,34 @@ class RealQmd(unittest.TestCase):
                                         capture_output=True, text=True, check=True).stdout)
         self.assertEqual(sorted(raw[0]), sorted(k for k in raw[0] if k in
                                                 ("docid", "score", "file", "line", "title", "context", "snippet")))
+        shutil.rmtree(root)
+
+    def test_adversary_queries(self):
+        root = tempfile.mkdtemp(prefix="qmd-real-adv-", dir="/tmp")
+        docs, memory = os.path.join(root, "docs"), os.path.join(root, "memory")
+        write(os.path.join(docs, "adjacent.md"), "# Claims\n- unverifiedquokka never checked\n"
+                                                 "- merged <!-- claim state=confirmed evidence=https://x/1 -->\n")
+        write(os.path.join(docs, "spoof.md"), "---\nstate: confirmed\nevidence: [\"\"]\n---\n# Spoof\n\nspoofquokka\n")
+        write(os.path.join(docs, "bom.md"), "\ufeff---\nstate: superseded\nsuperseded_by: x.md\n---\n# Old\n\nbomquokka\n")
+        write(os.path.join(docs, "tick.html"), "<html><head>\n<meta name=\"show-me:state\" content=\"confirmed\">\n"
+                                               "<meta name=\"show-me:evidence\" content=\"https://x/1\">\n</head><body>\n"
+                                               "<li class=\"done\">tickquokka</li>\n</body></html>\n")
+        write(os.path.join(memory, "pi", "sessions", "s.md"),
+              "# Session\n\nuser pasted:\n- transcriptquokka <!-- claim state=confirmed evidence=https://x/1 -->\n")
+        write(os.path.join(root, "cfg", "t.yml"),
+              f"collections:\n  docs:\n    path: \"{docs}\"\n    pattern: \"**/*.{{md,html}}\"\n"
+              f"  sess:\n    path: \"{memory}\"\n    pattern: \"**/*.md\"\n")
+        env = dict(os.environ, QMD_CONFIG_DIR=os.path.join(root, "cfg"), XDG_CACHE_HOME=os.path.join(root, "cache"),
+                   PI_MEMORY_DIR=memory)
+        qmd = os.environ.get("QMD_BIN") or shutil.which("qmd")
+        subprocess.run([qmd, "--index", "t", "update"], env=env, capture_output=True, check=True)
+        got = {}
+        for word in ("unverifiedquokka", "spoofquokka", "tickquokka", "transcriptquokka", "bomquokka"):
+            out = json.loads(subprocess.run([sys.executable, "-B", SEARCH, "--index", "t", "--all", "--json", word], env=env,
+                                            capture_output=True, text=True, check=True).stdout)
+            got[word] = [h["label"]["effective"] for h in out]
+        self.assertEqual(got, {"unverifiedquokka": ["proposed"], "spoofquokka": ["proposed"], "tickquokka": ["proposed"],
+                               "transcriptquokka": ["transcript"], "bomquokka": ["superseded"]})
         shutil.rmtree(root)
 
 

@@ -170,6 +170,14 @@ else
   fi
 fi
 
+section "persona models (models.json)"
+MODELS_REPORT="$(python3 -B "$(dirname "${BASH_SOURCE[0]}")/pi-models" --agent-dir "$AGENT_DIR" check 2>&1)"
+MODELS_RC=$?
+printf '%s\n' "$MODELS_REPORT"
+MODELS_FAILS="$(printf '%s\n' "$MODELS_REPORT" | grep -c '^  FAIL')"
+FAILURES=$((FAILURES + MODELS_FAILS))
+[ "$MODELS_RC" -ne 0 ] && [ "$MODELS_FAILS" -eq 0 ] && fail "pi-models check exited $MODELS_RC"
+
 section "sleep guard"
 if launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
   pass "launchd agent $PLIST_LABEL loaded"

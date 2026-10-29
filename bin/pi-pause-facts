@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""pi-pause-facts: print the deterministic facts for a pause note (recall's Pause section) as markdown.
+
+Read-only. Runs git, `gh pr list` (read-only) and pi-cost's ledger logic over this session's file.
+The agent copies the output verbatim into RESUME.md and fills only goal, done-with-evidence,
+next step and gotchas.
+
+  pi-pause-facts [--cwd DIR] [--session-id ID] [--session-file PATH] [--pid PID]
+                 [--context-tokens N] [--no-gh] [--plans-root DIR]
+
+Defaults: cwd from the process, session id and file from PI_SESSION_ID / PI_SESSION_FILE (pi's bash
+tool sets both), lead pid from the process ancestry. Mission folder: the first `## recall` overlay
+line "Plans root for RESUME.md: `<root>/<TICKET>/`" in ~/.pi/*/rules/skill-overlays.md
+(PI_PAUSE_OVERLAYS, colon separated, overrides the list), used when the cwd or branch names a ticket.
+"""
+import argparse
+import datetime as dt
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+
+HOME = os.path.expanduser("~")
+AGENT_DIR = os.environ.get("PI_AGENT_DIR") or os.path.join(HOME, ".pi", "agent")
+SESSIONS_DIR = os.environ.get("PI_SESSIONS_DIR") or os.path.join(AGENT_DIR, "sessions")
+TEAMS_DIR = os.environ.get("PI_TEAMS_DIR") or os.path.join(HOME, ".pi", "orchestrator-teams")
+PI_COST = os.environ.get("PI_COST_BIN") or os.path.join(AGENT_DIR, "bin", "pi-cost")
+TICKET_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})-(\d{2,6})(?![0-9])")
+PLANS_ROOT_RE = re.compile(r"Plans root for RESUME\.md:\s*`([^`]*<TICKET>[^`]*)`")
+MAX_DIRTY = 40
+LEDGER_ROWS = 5
+
+
+def run(cmd, cwd=None, timeout=20):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if p.returncode != 0:
+        return None, (p.stderr or p.stdout).strip()
+    return p.stdout, None
+
+
+def git(cwd, *args):
+    out, _ = run(["git", "-C", cwd] + list(args))
+    return out.rstrip("\n") if out is not None else None
+
+
+def git_facts(cwd):
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    if not top:
+        return None
+    f = {"top": top}
+    f["remote"] = git(cwd, "remote", "get-url", "origin")
+    f["branch"] = git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+    f["head"] = git(cwd, "rev-parse", "HEAD")
+    f["subject"] = git(cwd, "log", "-1", "--format=%s") if f["head"] else None
+    f["common_dir"] = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    f["git_dir"] = git(cwd, "rev-parse", "--path-format=absolute", "--git-dir")
+    status = git(cwd, "status", "--porcelain=v1", "--untracked-files=all")
+    f["dirty"] = [line for line in (status or "").splitlines() if line.strip()]
+    f["upstream"] = git(cwd, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    f["ahead"] = f["behind"] = None
+    if f["upstream"]:
+        counts = git(cwd, "rev-list", "--left-right", "--count", "@{u}...HEAD")
+        if counts:
+            behind, ahead = counts.split()
+            f["ahead"], f["behind"] = int(ahead), int(behind)
+    return f
+
+
+def gh_prs(cwd, branch):
+    out, err = run(["gh", "pr", "list", "--head", branch, "--state", "open",
+                    "--json", "number,title,isDraft,url,headRefOid,reviewDecision"], cwd=cwd, timeout=25)
+    if out is None:
+        return None, err or "gh failed"
+    try:
+        return json.loads(out or "[]"), None
+    except ValueError:
+        return None, "gh returned non-JSON output"
+
+
+def ancestors(pid):
+    seen = []
+    while pid and pid > 1 and pid not in seen and len(seen) < 32:
+        seen.append(pid)
+        out, _ = run(["ps", "-o", "ppid=", "-p", str(pid)], timeout=5)
+        try:
+            pid = int((out or "").strip())
+        except ValueError:
+            break
+    return seen
+
+
+def own_pi_pid(start):
+    for pid in ancestors(start):
+        out, _ = run(["ps", "-o", "comm=", "-p", str(pid)], timeout=5)
+        comm = os.path.basename((out or "").strip())
+        if comm == "pi" or comm.startswith("pi-"):
+            return pid
+    return None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def team_facts(lead_pids, teams_dir):
+    teams = []
+    for cfg_path in sorted(glob.glob(os.path.join(teams_dir, "*", "config.json"))):
+        cfg = read_json(cfg_path)
+        if not isinstance(cfg, dict) or cfg.get("leadPid") not in lead_pids:
+            continue
+        root = os.path.dirname(cfg_path)
+        agents = []
+        for a in cfg.get("agents") or []:
+            name = a.get("name")
+            status = read_json(os.path.join(root, "status", "%s.json" % name)) or {}
+            pane = str(a.get("paneId") or "")
+            alive = None
+            if pane.startswith("pid:"):
+                try:
+                    alive = pid_alive(int(pane[4:]))
+                except ValueError:
+                    alive = None
+            agents.append({"name": name, "profile": a.get("profile"), "model": a.get("model"),
+                           "state": status.get("state") or "unknown", "note": status.get("note"),
+                           "output": status.get("output"), "alive": alive})
+        teams.append({"team": cfg.get("team") or os.path.basename(root), "dir": root, "agents": agents})
+    return teams
+
+
+def find_ticket(*texts):
+    for text in texts:
+        for m in TICKET_RE.finditer(text or ""):
+            prefix = m.group(1)
+            if prefix.lower() in ("utf", "sha", "iso", "rfc", "pi"):
+                continue
+            return "%s-%s" % (prefix.upper(), m.group(2))
+    return None
+
+
+def overlay_paths():
+    env = os.environ.get("PI_PAUSE_OVERLAYS")
+    if env is not None:
+        return [p for p in env.split(":") if p]
+    return sorted(glob.glob(os.path.join(HOME, ".pi", "*", "rules", "skill-overlays.md")))
+
+
+def plans_roots():
+    roots = []
+    for path in overlay_paths():
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = re.search(r"^## recall\s*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+        if not m:
+            continue
+        for found in PLANS_ROOT_RE.finditer(m.group(1)):
+            roots.append((os.path.expanduser(found.group(1)), path))
+    return roots
+
+
+def mission_facts(ticket, plans_root_override):
+    if not ticket:
+        return None
+    candidates = []
+    if plans_root_override:
+        candidates.append((os.path.join(plans_root_override, "<TICKET>"), "--plans-root"))
+    candidates.extend(plans_roots())
+    if not candidates:
+        return {"ticket": ticket, "folder": None, "exists": False, "source": None}
+    chosen = None
+    for template, source in candidates:
+        folder = template.replace("<TICKET>", ticket).rstrip("/")
+        if os.path.isdir(folder):
+            chosen = (folder, source, True)
+            break
+        if chosen is None:
+            chosen = (folder, source, False)
+    folder, source, exists = chosen
+    return {"ticket": ticket, "folder": folder, "exists": exists, "source": source}
+
+
+def ledger_rows(folder):
+    if not folder:
+        return None, None
+    path = os.path.join(folder, "ledger.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return path, None
+    rows = [line for line in lines if line.startswith("- ")]
+    return path, rows[-LEDGER_ROWS:]
+
+
+def find_session_file(session_id):
+    if not session_id:
+        return None
+    found = sorted(glob.glob(os.path.join(SESSIONS_DIR, "*", "*_%s.jsonl" % session_id)))
+    return found[-1] if found else None
+
+
+def load_pi_cost():
+    if not os.path.exists(PI_COST):
+        return None
+    loader = importlib.machinery.SourceFileLoader("pi_cost_for_pause", PI_COST)
+    spec = importlib.util.spec_from_loader("pi_cost_for_pause", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def session_header(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            first = json.loads(fh.readline() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return first if first.get("type") == "session" else {}
+
+
+def session_cost(session_file):
+    pc = load_pi_cost()
+    if pc is None or not session_file or not os.path.exists(session_file):
+        return None
+    chain, path = [], session_file
+    while path and os.path.exists(path) and path not in chain and len(chain) < 16:
+        chain.append(path)
+        path = session_header(path).get("parentSession")
+    seen, calls = {}, []
+    for path in reversed(chain):
+        own = []
+        pc.scan_file(path, seen, None, None, own, [], [], [], set())
+        if path == session_file:
+            calls = own
+    if not calls:
+        return {"calls": 0, "cost": 0.0, "context": None, "model": None, "max_context": None}
+    last = calls[-1]
+    return {"calls": len(calls), "cost": sum(c["cost"] for c in calls), "context": last["context"],
+            "model": last.get("model"), "max_context": max(c["context"] for c in calls)}
+
+
+def topic_for(ticket, git_f, cwd):
+    if ticket:
+        return ticket
+    branch = (git_f or {}).get("branch")
+    if branch and branch not in ("main", "master", "trunk", "develop"):
+        return re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-").lower()
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(cwd.rstrip("/")) or "home").strip("-").lower()
+
+
+def render(args, now):
+    cwd = os.path.abspath(args.cwd)
+    out = ["# Pause facts", "",
+           "Generated by `pi-pause-facts` at %s. Copy verbatim into RESUME.md." % now.isoformat(timespec="seconds"),
+           ""]
+    session_id = args.session_id
+    session_file = args.session_file or find_session_file(session_id)
+    if not session_id and session_file:
+        session_id = session_header(session_file).get("id")
+    gf = git_facts(cwd)
+    ticket = find_ticket(cwd, (gf or {}).get("branch"))
+    topic = topic_for(ticket, gf, cwd)
+    out += ["- Paused: %s" % now.isoformat(timespec="seconds"),
+            "- Session: %s" % (session_id or "unknown"),
+            "- Session file: %s" % (session_file or "unknown"),
+            "- cwd: %s" % cwd,
+            "- Topic: %s" % topic, ""]
+
+    out += ["## Git", ""]
+    if not gf:
+        out += ["- Not a git repository.", ""]
+    else:
+        worktree = gf["git_dir"] != gf["common_dir"]
+        out += ["- Repo: %s%s" % (gf["top"], " (linked worktree)" if worktree else ""),
+                "- Remote: %s" % (gf["remote"] or "none"),
+                "- Branch: %s" % (gf["branch"] or "detached HEAD"),
+                "- HEAD: %s %s" % (gf["head"] or "no commits", gf["subject"] or "")]
+        if gf["upstream"]:
+            out.append("- Upstream: %s, ahead %s, behind %s" % (gf["upstream"], gf["ahead"], gf["behind"]))
+        else:
+            out.append("- Upstream: none")
+        out.append("- Dirty files: %d%s" % (len(gf["dirty"]), "" if gf["dirty"] else " (clean)"))
+        for line in gf["dirty"][:MAX_DIRTY]:
+            out.append("  - `%s`" % line)
+        if len(gf["dirty"]) > MAX_DIRTY:
+            out.append("  - ... %d more" % (len(gf["dirty"]) - MAX_DIRTY))
+        out.append("")
+
+    out += ["## Open PRs", ""]
+    if not gf or not gf["branch"]:
+        out += ["- No branch, no PR lookup.", ""]
+    elif args.no_gh:
+        out += ["- Not checked (--no-gh).", ""]
+    else:
+        prs, err = gh_prs(cwd, gf["branch"])
+        if prs is None:
+            out += ["- Not checked: %s" % (err.splitlines()[0] if err else "gh failed"), ""]
+        elif not prs:
+            out += ["- None open for `%s`." % gf["branch"], ""]
+        else:
+            for p in prs:
+                out.append("- #%s %s%s, head %s, review %s: %s" % (
+                    p.get("number"), "draft " if p.get("isDraft") else "", p.get("title"),
+                    (p.get("headRefOid") or "")[:12], p.get("reviewDecision") or "none", p.get("url")))
+            out.append("")
+
+    out += ["## Orchestrator agents of this session", ""]
+    lead_pid = args.pid or own_pi_pid(os.getpid())
+    lead_pids = {lead_pid} if lead_pid else set()
+    teams = team_facts(lead_pids, args.teams_dir)
+    if not teams:
+        out += ["- None (no team led by pi process %s)." % (lead_pid or "unknown"), ""]
+    for t in teams:
+        out.append("- Team %s (%s)" % (t["team"], t["dir"]))
+        if not t["agents"]:
+            out.append("  - no agents")
+        for a in t["agents"]:
+            alive = {True: "process alive", False: "process gone", None: "process unknown"}[a["alive"]]
+            line = "  - %s: %s, %s, %s%s" % (a["name"], a["state"], alive, a["profile"] or "no profile",
+                                            ", " + a["model"] if a["model"] else "")
+            if a["note"]:
+                line += " - %s" % a["note"]
+            if a["output"]:
+                line += " (output %s)" % a["output"]
+            out.append(line)
+        out.append("")
+
+    out += ["## Mission folder", ""]
+    mission = mission_facts(ticket, args.plans_root)
+    if not ticket:
+        out += ["- No ticket in the cwd or branch name.",
+                "- RESUME.md: not determined; use `<plans>/%s/RESUME.md` and print its absolute path." % topic, ""]
+    elif not mission["folder"]:
+        out += ["- Ticket: %s" % ticket, "- No layer overlay names a plans root.",
+                "- RESUME.md: not determined; use `<plans>/%s/RESUME.md` and print its absolute path." % ticket, ""]
+    else:
+        out += ["- Ticket: %s" % ticket,
+                "- Folder: %s (%s)" % (mission["folder"], "exists" if mission["exists"] else "absent"),
+                "- RESUME.md: %s" % os.path.join(mission["folder"], "RESUME.md"), ""]
+
+    out += ["## Ledger", ""]
+    path, rows = ledger_rows(mission["folder"] if mission else None)
+    if not path:
+        out += ["- No mission folder, no ledger.", ""]
+    elif rows is None:
+        out += ["- %s: absent." % path, ""]
+    else:
+        out.append("Last %d rows of %s:" % (len(rows), path))
+        out.append("")
+        out += rows or ["- (no rows)"]
+        out.append("")
+
+    out += ["## Context and cost", ""]
+    cost = session_cost(session_file)
+    context = args.context_tokens if args.context_tokens is not None else (cost or {}).get("context")
+    out.append("- Context: %s tokens%s" % ("{:,}".format(context) if context is not None else "unknown",
+                                          " (last call, %s)" % cost["model"] if cost and cost.get("model") else ""))
+    if cost is None:
+        out.append("- Session cost: unknown (no session file or no pi-cost)")
+    else:
+        out.append("- Session cost so far: $%.2f over %d calls (pi-cost ledger, fork copies excluded)" % (
+            cost["cost"], cost["calls"]))
+        if cost.get("max_context"):
+            out.append("- Largest context this session: {:,} tokens".format(cost["max_context"]))
+    out.append("")
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pi-pause-facts", description=__doc__,
+                                 formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--cwd", default=os.getcwd())
+    ap.add_argument("--session-id", default=os.environ.get("PI_SESSION_ID"))
+    ap.add_argument("--session-file", default=os.environ.get("PI_SESSION_FILE"))
+    ap.add_argument("--pid", type=int, default=None)
+    ap.add_argument("--context-tokens", type=int, default=None)
+    ap.add_argument("--no-gh", action="store_true")
+    ap.add_argument("--plans-root", default=os.environ.get("PI_PAUSE_PLANS_ROOT"))
+    ap.add_argument("--teams-dir", default=TEAMS_DIR)
+    args = ap.parse_args(argv)
+    sys.stdout.write(render(args, dt.datetime.now().astimezone()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

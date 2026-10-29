@@ -21,6 +21,31 @@ Files here:
   content. The layer's `qmd/session-overrides.tsv` is read first and wins. Changing any rules or
   overrides file makes the next export reclassify every source.
 - `tests/test_pi_memory_export.py`: exporter tests (`python3 -B tests/test_pi_memory_export.py`).
+- `html_pages.py`: the HTML page converter `bin/pi-memory-export` runs after sessions and handoffs.
+  Sources are the `*.html` files under the knowledge base (`PI_KB_DIR`, default
+  `~/Documents/knowledge-base-remote`) that some template's collection already covers with a `*.md`
+  pattern (same path, `.md` read as `.html`, same ignores; `node_modules` skipped). Each page goes to
+  `~/.pi/memory/pages/<segment>/<path under the knowledge base>.md`, with the segment from the same
+  `segments.tsv` rules applied to the page's folder. Front matter: `title` (`<title>`, else
+  `show-me:topic`, else the first `h1`, else the file name), `source` (the HTML path), the `show-me:*`
+  labels from `<head>` (unlabelled is `proposed`), `summary`, `updated`. The body keeps headings,
+  paragraphs, list items, table rows, links, code and Mermaid blocks; style, script, textarea, hidden
+  elements and collapsed older iterations are dropped, and older iterations are only listed, as
+  `superseded`, under "Superseded iterations". Items with their own `data-state`, and every tick,
+  get a claim comment (see `validity.md`, "Converted HTML pages"). Incremental like the rest: size
+  and mtime, and a change to the converter, `labels.py` or any rules file reconverts every page; a
+  page that is deleted or no longer covered loses its export. The `pages` collection in each index
+  holds its segments: `work` through the layer's local template, `personal` through
+  `personal.yml.tmpl`. Tests: `tests/test_html_pages.py`.
+- `search`: `qmd search` (or `--query`) with each hit's validity label (state, evidence, as of)
+  printed next to it, ranked confirmed > acted > proposed > transcript, superseded hidden unless
+  `--all`. Labels are read from the file on disk by `labels.py`; the format is
+  `~/.pi/agent/skills/recall/references/validity.md`.
+- `reconcile-check`: the deterministic pass of a reconcile. Resolves claim pointers with gh, git and
+  the filesystem, answers "was this sent" from `~/.pi/memory/<segment>/evidence.tsv` (the publishing
+  tool calls `bin/pi-memory-export` finds in each session), and marks tracker and chat pointers
+  `needs-mcp`.
+- Tests: `for t in tests/test_*.py; do python3 -B "$t"; done`.
 - `refresh`: export, then `qmd --index <name> update` for every index; `--embed` also embeds.
 - `com.ycao.pi-memory-index.plist.tmpl`: a launchd agent that runs `refresh --embed` at 12:30 (if the Mac is asleep then, launchd runs it once on wake). It is
   not installed by `bootstrap.sh`. To install it:

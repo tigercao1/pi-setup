@@ -22,14 +22,23 @@ the first pass.
    - **ask**: one sentence, what the reader must reply or do.
    If you cannot write the ask in one sentence, the message is not ready. Ask Tiger what he wants
    from the reader instead of drafting further.
+   If there are two asks, or the asks go to different people, plan one message per ask before
+   drafting, for example a thread post and a reply. Each message gets its own kind, ask and skim
+   test.
 3. Apply the rules below.
 4. Run the skim test. It runs the regex lint first (`bin/slop-lint.py --voice tiger`, no model),
-   then the skimmers. Fix and rerun on FAIL, at most 3 rounds. Fix lint warnings that are real
-   hits; they never fail the test.
-5. Show Tiger the draft with the skim-test line under it, then any lint warnings you left in:
+   then the skimmers. Fix lint warnings that are real hits; they never fail the test. On FAIL, fix
+   in this order and rerun, at most 3 rounds:
+   1. Structure first. If the skimmers name only one of two asks, or answer a different question,
+      split the message into one message per ask.
+   2. Then placement. Put the ask in the first 25 words, and end on it as a short question.
+   3. Only then wording.
+5. Show Tiger only a draft that passes, with the skim-test line under it, then any lint warnings
+   you left in:
    `Skim test: PASS 3/3. A skimmer reads it as: <the skimmers' ASK>`
-   On a FAIL after 3 rounds, show the best draft anyway, say it failed, and quote what the skimmer
-   understood so he can decide.
+   Never present a failing draft as ready to send. On a FAIL after 3 rounds, do not show the
+   draft. Show what the skimmers understood and what you tried, and ask Tiger what he wants from
+   the reader. Show the failing draft only if he asks for it.
 6. Only then copy it (`slack-copy`) or hand it over.
 
 ## Rules
@@ -53,8 +62,9 @@ the first pass.
    usually plain paragraphs. Never fold them into one comma-joined list.
 7. **Ask and context in about 60 words.** Supporting detail goes in a second paragraph or a thread
    reply, after the ask.
-8. **One position per message.** Do not follow up with a softer or opposite position before the
-   reader has answered the first.
+8. **One position and one ask per message.** Do not follow up with a softer or opposite position
+   before the reader has answered the first. Two decisions, or decisions owned by different people,
+   go in separate messages.
 
 ## Skim test
 

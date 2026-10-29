@@ -627,7 +627,12 @@ export default function sessionBus(pi: ExtensionAPI): void {
 			if (!request || request.trim() === "") return;
 
 			// Hand it to the agent: it has the context, so it decides what to attach.
-			pi.sendUserMessage(buildSendPrompt(chosen, request.trim()));
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(buildSendPrompt(chosen, request.trim()));
+			} else {
+				pi.sendUserMessage(buildSendPrompt(chosen, request.trim()), { deliverAs: "followUp" });
+				ctx.ui.notify("Send queued: it runs after the current turn.", "info");
+			}
 		},
 	});
 
