@@ -2,6 +2,7 @@
 """Tests for the publishing-evidence rows in bin/pi-memory-export.  Run: python3 -B ~/.pi/agent/qmd/tests/test_evidence.py"""
 import json
 import os
+import subprocess
 import sys
 import unittest
 
@@ -20,6 +21,12 @@ def result(cid, error=False):
     return {"type": "message", "timestamp": TS,
             "message": {"role": "toolResult", "toolCallId": cid, "toolName": "x", "isError": error,
                         "content": [{"type": "text", "text": "done"}]}}
+
+
+def output(cid, text, error=False):
+    entry = result(cid, error)
+    entry["message"]["content"] = [{"type": "text", "text": text}]
+    return entry
 
 
 def read(path):
@@ -105,6 +112,75 @@ class Rows(unittest.TestCase):
                          [("confluence", "atlassian.updateConfluencePage", "3654", "(body)", "codemode"),
                           ("linear", "linear.save_status_update", "Disposition", "On track", "codemode")])
 
+    def test_help_and_dry_run_are_not_rows(self):
+        rows = self.rows(bash("a", "gh pr create --help"), result("a"),
+                         bash("b", "gh pr create -R acme/app --dry-run -t Draft"), result("b"),
+                         bash("c", "gh pr comment 7 -R acme/app --help"), result("c"),
+                         bash("d", "git push --help"), result("d"),
+                         bash("e", "git push -h"), result("e"),
+                         bash("f", "gh api repos/acme/app/pulls/1/comments -f body=x --help"), result("f"),
+                         bash("g", "gh pr merge 7 -h"), result("g"))
+        self.assertEqual(rows, [])
+
+    def test_result_is_ok_only_when_that_write_decides_the_exit(self):
+        rows = self.rows(bash("a", "false && gh pr comment 8 -R acme/app -b never; true"), result("a"),
+                         bash("b", "gh pr comment 9 -R acme/app -b x || true"), result("b"),
+                         bash("c", "git push origin main 2>&1 | tail -3"), result("c"),
+                         bash("d", "if false; then gh pr comment 10 -R acme/app -b x; fi"), result("d"),
+                         bash("e", "cd /w && git fetch && gh pr comment 11 -R acme/app -b x"), result("e"),
+                         bash("f", "gh pr comment 12 -R acme/app -b x && echo posted"), result("f"),
+                         bash("g", "gh pr comment 13 -R acme/app -b x"), result("g", error=True),
+                         bash("h", "gh pr comment 14 -R acme/app -b x; gh pr comment 15 -R acme/app -b y"), result("h"),
+                         bash("i", "gh pr create -R acme/app -t T --web"), result("i"),
+                         bash("j", "true || gh pr comment 16 -R acme/app -b x"), result("j"))
+        self.assertEqual([(r["target"], r["result"]) for r in rows],
+                         [("acme/app#8", "unverified"), ("acme/app#9", "unverified"), ("agent origin main", "unverified"),
+                          ("acme/app#10", "unverified"), ("acme/app#11", "ok"), ("acme/app#12", "ok"),
+                          ("acme/app#13", "error"), ("acme/app#14", "unverified"), ("acme/app#15", "ok"),
+                          ("acme/app new", "unverified"), ("acme/app#16", "unverified")])
+
+    def test_comments_are_not_commands(self):
+        rows = self.rows(bash("a", "echo hi # ; gh pr comment 3 -R acme/app -b x\n# git push origin main"), result("a"))
+        self.assertEqual(rows, [])
+
+    def test_observed_output_proves_a_write_inside_a_script(self):
+        rows = self.rows(
+            bash("a", "git push -u origin tiger/x 2>&1 | tail -3"),
+            output("a", "To github.com:acme/app.git\n * [new branch]      tiger/x -> tiger/x\n"),
+            bash("b", "git push origin main 2>&1 | tail -2"),
+            output("b", "To github.com:acme/app.git\n ! [rejected]        main -> main (fetch first)\n"),
+            bash("c", "gh pr comment 21 -R acme/app -b x | cat; echo"),
+            output("c", "https://github.com/acme/app/pull/21#issuecomment-123\n"),
+            bash("d", "gh pr comment 22 -R acme/app -b x | cat; echo"),
+            output("d", "https://github.com/acme/app/pull/23#issuecomment-123\n"),
+            bash("e", "gh pr merge 24 -R acme/app --squash 2>&1 | tail -1; gh pr view 24 --json state"),
+            output("e", "MERGED\n"),
+            bash("f", "gh pr merge 25 -R acme/app --squash | tail -1"),
+            output("f", "\u2713 Squashed and merged pull request acme/app#25 (Title)\n"),
+            bash("g", "cd /w && gh pr create -R acme/app -t T -b body"),
+            output("g", "https://github.com/acme/app/pull/77\n"),
+            bash("h", "gh pr edit 26 -R acme/app --body-file /tmp/b.md 2>&1 | tail -1"),
+            output("h", "https://github.com/acme/app/pull/26\n"),
+            bash("i", "gh pr edit 27 -R acme/app -b x | cat; gh pr view 27 -R acme/app --json url -q .url"),
+            output("i", "https://github.com/acme/app/pull/27\n"))
+        self.assertEqual([(r["target"], r["result"]) for r in rows],
+                         [("agent origin tiger/x", "ok"), ("agent origin main", "error"), ("acme/app#21", "ok"),
+                          ("acme/app#22", "unverified"), ("acme/app#24", "unverified"), ("acme/app#25", "ok"),
+                          ("acme/app#77 new", "ok"), ("acme/app#26", "ok"), ("acme/app#27", "unverified")])
+
+    def test_codemode_writes_are_unverified_and_strings_are_not_calls(self):
+        code = ("try { await tools.mcp__linear__save_comment({issueId:\"ABC-1\",body:\"This draft was not posted\"}); }"
+                " catch(e) { return \"failed\"; }\n"
+                "const note = \"await tools.mcp__linear__save_comment({issueId: 'ABC-2'})\";\n"
+                "// await tools.mcp__slack__slack_send_message({channel_id: 'C1'})\n"
+                "/* tools.mcp__linear__save_issue({id: 'ABC-3'}) */\n"
+                "d = d.replace(/<a [^>]*href=\"[^\"]*\">/g, \"\").replace(/'/g, '');\n"
+                "await tools.mcp__linear__save_project({id: 'P-5', description: d / 2});\n")
+        rows = self.rows(call("a", "codemode", {"code": code}), result("a"),
+                         call("b", "codemode", {"code": "await tools.mcp__linear__save_comment({issueId: 'ABC-4', body: 'x'})"}),
+                         result("b", error=True))
+        self.assertEqual([(r["target"], r["result"]) for r in rows], [("ABC-1", "unverified"), ("P-5", "unverified"), ("ABC-4", "unverified")])
+
     def test_session_send(self):
         row = self.only(call("a", "session_send", {"to": "s-01a1", "note": "Tiger confirmed"}), result("a"))
         self.assertEqual((row["channel"], row["target"], row["excerpt"]), ("pi-session", "s-01a1", "Tiger confirmed"))
@@ -144,6 +220,40 @@ class Export(unittest.TestCase):
         fx.run(mod)
         self.assertFalse(os.path.exists(tsv))
         self.assertIn("\tgit push\t", read(os.path.join(fx.memory, "work", "evidence.tsv")))
+
+    def test_front_matter_groups_repeats_and_caps_the_list(self):
+        fx = Fixture()
+        entries = [bash("p1", "git push origin a"), result("p1"), bash("p2", "git push origin a"), result("p2", error=True)]
+        for n in range(35):
+            entries += [bash(f"c{n}", f"gh pr comment {n} -R acme/app -b hi"), result(f"c{n}")]
+        fx.session("many", fx.home + "/agent", ("user", "x"), extra=entries)
+        mod = fx.module()
+        fx.run(mod)
+        front = fx.exported("pi", "many").split("\n---\n")[0]
+        self.assertIn(f'  - {{at: {TS}, tool: "git push", target: "agent origin a", result: error, count: 2}}', front)
+        self.assertEqual(front.count("\n  - {"), 30)
+        self.assertTrue(front.endswith("published_more: 6"), front[-80:])
+        self.assertEqual(len(read(os.path.join(fx.memory, "pi", "evidence.tsv")).splitlines()), 38)
+
+    def test_adversary_session_never_reads_as_sent(self):
+        fx = Fixture()
+        code = ("try { await tools.mcp__linear__save_comment({issueId:\"ABC-1\",body:\"This draft was not posted because "
+                "the write failed\"}); } catch(e) { return \"failed\"; }")
+        fx.session("adversary", fx.home + "/agent", ("user", "fixture"), extra=[
+            bash("h", "gh pr comment 7 -R acme/app --help"), result("h"),
+            bash("d", "gh pr create -R acme/app --dry-run -t Draft"), result("d"),
+            bash("skip", "false && gh pr comment 8 -R acme/app -b never; true"), result("skip"),
+            call("c", "codemode", {"code": code}), result("c"),
+            call("failed", "mcp__linear__save_comment", {"issueId": "ABC-2", "body": "Failed write"}), result("failed", error=True)])
+        fx.run(fx.module())
+        claims = os.path.join(fx.root, "claims.json")
+        with open(claims, "w") as fh:
+            json.dump([{"claim": t, "kind": "sent", "pointer": t} for t in ("acme/app#7", "acme/app#8", "ABC-1", "ABC-2")], fh)
+        check = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "reconcile-check")
+        proc = subprocess.run([sys.executable, "-B", check, claims, "--evidence", os.path.join(fx.memory, "pi", "evidence.tsv"),
+                               "--format", "json"], capture_output=True, text=True)
+        self.assertEqual([r["verdict"] for r in json.loads(proc.stdout)], ["not-found", "candidate", "candidate", "attempted"],
+                         proc.stderr)
 
     def test_dry_run_writes_no_evidence(self):
         import argparse

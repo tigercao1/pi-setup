@@ -8,14 +8,23 @@ Each session JSONL under the sessions dir becomes <memory>/<segment>/sessions/<d
 Publishing tool calls (gh pr/issue writes, gh api writes, git push, pbcopy, slack-copy, session_send,
 Slack/Linear/Confluence/Google Docs/GitHub MCP writes, also inside codemode) become rows in
 <memory>/<segment>/evidence.tsv and a published: list in the session export's front matter.
+--help and --dry-run calls are not rows. A row's result is ok only when that write's own success was
+observed: its exit status decides the call's (alone, last, or followed only by &&), or its output
+shows it (a comment URL, "Merged pull request", a push's ref update), or a direct MCP/session_send
+result. A write inside a pipe, a ; or || list, a shell branch, codemode, or with --web is unverified;
+a write whose exit status decides a failed call is error; a call with no result is no-result.
 Orchestrator handoff JSON and session-fork handoff markdown become <memory>/<segment>/handoffs/*.md.
+HTML pages under the knowledge base that a qmd collection covers with a *.md pattern become
+<memory>/pages/<segment>/<path under the knowledge base>.md (qmd/html_pages.py), routed by the page's
+folder with the same segment rules; a page that is gone or no longer covered loses its export.
 Segments come from <layer>/qmd/segments.tsv, then <agent>/qmd/segments.tsv. Per-session overrides
 ("<session id>\t<segment>") come from <layer>/qmd/session-overrides.tsv, then
 <agent>/qmd/session-overrides.tsv; the first file naming a session wins. Only new or changed sources
 are rewritten; a change to any rules or overrides file reclassifies everything; --full rewrites
 everything. One export runs at a time (<memory>/.export.lock).
 
-Environment: PI_MEMORY_DIR (default ~/.pi/memory), PI_AGENT_DIR, PI_LAYER_DIR, PI_SESSIONS_DIR.
+Environment: PI_MEMORY_DIR (default ~/.pi/memory), PI_AGENT_DIR, PI_LAYER_DIR, PI_SESSIONS_DIR,
+PI_KB_DIR (default ~/Documents/knowledge-base-remote).
 """
 import argparse
 import fcntl
@@ -29,6 +38,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+
+CODE_QMD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "qmd")
+sys.path.insert(0, CODE_QMD_DIR)
+sys.dont_write_bytecode = True
+import html_pages  # noqa: E402
 
 HOME = os.path.expanduser("~")
 AGENT_DIR = os.environ.get("PI_AGENT_DIR") or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -44,6 +58,9 @@ OVERRIDE_FILES = [os.path.join(LAYER_DIR, "qmd", "session-overrides.tsv"),
                   os.path.join(AGENT_DIR, "qmd", "session-overrides.tsv")]
 WORKER_KICKOFF = "Begin the assignment"
 READ_ATTEMPTS = 5
+KB_DIR = os.environ.get("PI_KB_DIR") or os.path.join(HOME, "Documents", "knowledge-base-remote")
+PAGES_DIR = os.path.join(MEMORY_DIR, "pages")
+PAGE_CODE = [os.path.join(CODE_QMD_DIR, "html_pages.py"), os.path.join(CODE_QMD_DIR, "labels.py")]
 
 
 def load_rules():
@@ -85,7 +102,7 @@ def load_overrides():
 
 def rules_identity():
     digest = hashlib.sha256()
-    for path in SEGMENT_FILES + OVERRIDE_FILES + [os.path.realpath(__file__)]:
+    for path in SEGMENT_FILES + OVERRIDE_FILES + [os.path.realpath(__file__)] + PAGE_CODE:
         digest.update(path.encode())
         if os.path.isfile(path):
             with open(path, "rb") as fh:
@@ -172,6 +189,7 @@ def assignment_from(message):
 
 EVIDENCE_COLUMNS = ("ts", "session", "channel", "tool", "target", "result", "via", "call_id", "excerpt", "source")
 EXCERPT_CHARS = 200
+PUBLISHED_LIST = 30
 MCP_PUBLISH = {
     "slack": re.compile(r"send_message|schedule_message|post_message|reply|update_message|delete_message|add_reaction|canvas"),
     "linear": re.compile(r"^(save|create|update|delete)_"),
@@ -195,6 +213,12 @@ HEREDOC = re.compile(r"([^\n]*?)<<-?\s*(['\"]?)([A-Za-z_]\w*)\2([^\n]*)\n(.*?)\n
 CODEMODE_CALL = re.compile(r"tools(?:\.(mcp__\w+?__\w+)|\[\s*[\"'](mcp__[\w-]+?__[\w-]+)[\"']\s*\])\s*\(")
 JS_STRING = r"\s*:\s*(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$.]*)"
 REPO_SLUG = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$")
+SHELL_COMPOUND = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "function",
+                  "select", "!", "}", ")"}
+HELP_FLAGS = {"--help", "-h"}
+WEB_FLAGS = {"--web", "-w"}
+GH_READERS = re.compile(r"\bgh\s+(?:pr|issue)\s+(?:view|list|status|checks)\b|\bgh\s+api\b")
+RESULT_CHARS = 20000
 
 
 def one_line(text, limit=EXCERPT_CHARS):
@@ -252,8 +276,68 @@ def js_value(text, key):
     return f"({value})"
 
 
+def regex_can_start(code, i):
+    j = i - 1
+    while j >= 0 and code[j] in " \t\r\n":
+        j -= 1
+    if j < 0 or code[j] in "(,=:[!&|?{};+-*%<>~^":
+        return True
+    word = re.search(r"\w+$", code[max(0, j - 10):j + 1])
+    return bool(word) and word.group(0) in ("return", "typeof", "case", "in", "of")
+
+
+def js_code_only(code):
+    out, i, state = list(code), 0, None
+    while i < len(code):
+        ch = code[i]
+        if state is None:
+            if code.startswith("//", i):
+                state = "line"
+            elif code.startswith("/*", i):
+                state = "block"
+            elif ch in "'\"`":
+                state = ch
+            elif ch == "/" and regex_can_start(code, i):
+                state, in_class = "regex", False
+            i += 1
+            continue
+        if state == "regex":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "[":
+                in_class = True
+            elif ch == "]":
+                in_class = False
+            elif ch == "/" and not in_class or ch == "\n":
+                state = None
+            i += 1
+            continue
+        if state == "line" and ch == "\n":
+            state = None
+        elif state == "block" and code.startswith("*/", i):
+            out[i] = out[i + 1] = " "
+            state, i = None, i + 2
+            continue
+        elif state in "'\"`" and ch == "\\":
+            out[i] = " "
+            if i + 1 < len(code) and code[i + 1] != "\n":
+                out[i + 1] = " "
+            i += 2
+            continue
+        elif state in "'\"`" and ch == state:
+            state = None
+            i += 1
+            continue
+        if ch != "\n":
+            out[i] = " "
+        i += 1
+    return "".join(out)
+
+
 def codemode_calls(code):
-    for match in CODEMODE_CALL.finditer(code or ""):
+    code = code or ""
+    for match in CODEMODE_CALL.finditer(js_code_only(code)):
         server, tool = mcp_tool(match.group(1) or match.group(2))
         if not server or server not in MCP_PUBLISH or not MCP_PUBLISH[server].search(tool):
             continue
@@ -271,7 +355,17 @@ def codemode_calls(code):
 
 
 def split_segments(command):
-    segments, current, quote, i, piped = [], [], None, 0, False
+    segments, current, quote, i, before = [], [], None, 0, ""
+
+    def flush(sep):
+        nonlocal current, before
+        text = "".join(current).strip()
+        current = []
+        if text:
+            segments.append([text, before, sep])
+            before = sep
+        elif before not in ("&&", "||", "|"):
+            before = sep
     while i < len(command):
         ch = command[i]
         if quote:
@@ -287,17 +381,42 @@ def split_segments(command):
         elif ch == "\\" and i + 1 < len(command):
             current.append(command[i:i + 2])
             i += 1
+        elif ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+            end = command.find("\n", i)
+            i = len(command) if end < 0 else end
+            continue
         elif ch in ";\n|" or (ch == "&" and command[i - 1:i] not in ("<", ">") and command[i + 1:i + 2] != ">"):
-            segments.append(("".join(current).strip(), piped))
-            piped = ch == "|" and not command.startswith("||", i)
-            current = []
-            if command.startswith(("&&", "||"), i):
-                i += 1
+            sep = command[i:i + 2] if command.startswith(("&&", "||"), i) else ch
+            flush(sep)
+            i += len(sep) - 1
         else:
             current.append(ch)
         i += 1
-    segments.append(("".join(current).strip(), piped))
-    return [(s, p) for s, p in segments if s]
+    flush("")
+    if segments:
+        segments[-1][2] = ""
+    return [tuple(s) for s in segments]
+
+
+def exit_mode(segments, k):
+    if any(s[2] != "&&" for s in segments[k:-1]) or segments[k][2] == "|":
+        return "unverified"
+    j = k
+    while j > 0 and segments[j][1] == "|":
+        j -= 1
+    guarded = segments[j][1] == "||"
+    if k == len(segments) - 1:
+        return "last-or" if guarded else "last"
+    return "unverified" if guarded else "implied"
+
+
+def is_compound(segments):
+    for text, _, _ in segments:
+        head = text.lstrip()
+        first = (words(head) or [""])[0]
+        if first in SHELL_COMPOUND or head.startswith(("(", "{")) or re.match(r"^[\w-]+\s*\(\)", head):
+            return True
+    return False
 
 
 def words(segment):
@@ -310,7 +429,8 @@ def words(segment):
 def strip_prefix(tokens):
     while tokens:
         head = tokens[0]
-        if re.match(r"^[A-Za-z_]\w*=", head) or head in ("command", "time", "env", "exec", "sudo", "nohup", "(", "{"):
+        if re.match(r"^[A-Za-z_]\w*=", head) or head in ("command", "time", "env", "exec", "sudo", "nohup", "(", "{",
+                                                         "then", "do", "else", "!"):
             tokens = tokens[1:]
         elif head == "timeout" and len(tokens) > 1:
             tokens = tokens[2:]
@@ -349,7 +469,7 @@ def repo_slug(cwd):
 
 
 def gh_row(tokens, cwd, file_text):
-    if len(tokens) < 2:
+    if len(tokens) < 2 or HELP_FLAGS & set(tokens[1:]) or "--dry-run" in tokens:
         return None
     group = tokens[1]
     if group == "api":
@@ -407,7 +527,7 @@ def git_push_row(tokens, cwd):
     if i >= len(tokens) or tokens[i] != "push":
         return None
     rest = tokens[i + 1:]
-    if any(t in ("-n", "--dry-run") for t in rest):
+    if any(t in ("-n", "--dry-run") or t in HELP_FLAGS for t in rest):
         return None
     refs = [t for t in rest if not t.startswith("-") and not re.search(r"[<>]", t)]
     name = repo_slug(where) or os.path.basename((where or "").rstrip("/"))
@@ -436,7 +556,10 @@ def bash_rows(command, cwd, file_text):
         if len(tokens) == 2 and tokens[0] == "cat":
             return file_text(tokens[1])
         return segment
-    for segment, piped in split_segments(stripped):
+    segments = split_segments(stripped)
+    compound = is_compound(segments)
+    for k, (segment, before, _) in enumerate(segments):
+        piped, count = before == "|", len(rows)
         tokens = strip_prefix(words(segment))
         here = re.search(r"<<HEREDOC(\d+)", segment)
         here_body = bodies[int(here.group(1))] if here else ""
@@ -453,11 +576,14 @@ def bash_rows(command, cwd, file_text):
         elif tokens and tokens[0] == "gh":
             row = gh_row(tokens, cwd, file_text)
             if row:
-                rows.append(row)
+                rows.append(row + ("unverified" if WEB_FLAGS & set(tokens) and tokens[1] != "api" else None,))
         elif tokens and tokens[0] == "git":
             row = git_push_row(tokens, cwd)
             if row:
                 rows.append(row)
+        if len(rows) > count:
+            mode = rows[-1][4] if len(rows[-1]) > 4 and rows[-1][4] else ("unverified" if compound else exit_mode(segments, k))
+            rows[-1] = rows[-1][:4] + (mode,)
         previous = segment
     return rows
 
@@ -479,16 +605,67 @@ class SessionFiles:
 
 def publishing_rows(name, args, cwd, file_text):
     if name == "bash":
-        return [r + ("bash",) for r in bash_rows(str(args.get("command", "")), cwd, file_text)]
+        return [r[:4] + ("bash", r[4]) for r in bash_rows(str(args.get("command", "")), cwd, file_text)]
     if name == "session_send":
-        return [("pi-session", "session_send", one_line(args.get("to", ""), 120), args.get("note", ""), "tool")]
+        return [("pi-session", "session_send", one_line(args.get("to", ""), 120), args.get("note", ""), "tool", "last")]
     if name == "codemode":
-        return [(mcp_channel(s, t), f"{s}.{t}", mcp_target(s, a), mcp_excerpt(a), "codemode")
+        return [(mcp_channel(s, t), f"{s}.{t}", mcp_target(s, a), mcp_excerpt(a), "codemode", "unverified")
                 for s, t, a in codemode_calls(str(args.get("code", "")))]
     server, tool = mcp_tool(name)
     if server in MCP_PUBLISH and MCP_PUBLISH[server].search(tool):
-        return [(mcp_channel(server, tool), f"{server}.{tool}", mcp_target(server, args), mcp_excerpt(args), "mcp")]
+        return [(mcp_channel(server, tool), f"{server}.{tool}", mcp_target(server, args), mcp_excerpt(args), "mcp", "last")]
     return []
+
+
+def structural_result(mode, status):
+    if status not in ("ok", "error"):
+        return status
+    if mode == "last":
+        return status
+    if mode == "last-or":
+        return "error" if status == "error" else "unverified"
+    if mode == "implied" and status == "ok":
+        return "ok"
+    return "unverified"
+
+
+def pr_ref(target):
+    match = re.match(r"^([\w.-]+/[\w.-]+)#(\d+)$", target or "")
+    return (re.escape(match.group(1)), match.group(2)) if match else (None, None)
+
+
+def observed_write(tool, target, output, command, same_tool):
+    output = output or ""
+    repo, num = pr_ref(target)
+    if tool == "git push":
+        return same_tool == 1 and bool(re.search(r"^To \S+", output, re.M)) and not re.search(
+            r"\[rejected\]|\[remote rejected\]|error: failed to push|^fatal:", output, re.M) and bool(
+            re.search(r"^\s*[ +*=-]?\s*(?:\[new branch\]|\[new tag\]|[0-9a-f]{7,}\.\.\.?[0-9a-f]{7,})\s+\S+\s+->\s+\S+",
+                      output, re.M))
+    if tool in ("gh pr comment", "gh issue comment") and num:
+        return bool(re.search(rf"github\.com/{repo}/(?:pull|issues)/{num}#issuecomment-\d+", output, re.I))
+    if tool == "gh pr create":
+        return same_tool == 1 and not GH_READERS.search(command) and created_pr(target, output) is not None
+    if tool == "gh pr edit" and num:
+        return same_tool == 1 and not GH_READERS.search(command) and bool(
+            re.search(rf"^https://github\.com/{repo}/pull/{num}\s*$", output, re.M | re.I))
+    patterns = {"gh pr merge": rf"merged pull request \S*#{num}\b", "gh pr close": rf"closed pull request \S*#{num}\b",
+                "gh pr ready": rf"#{num} is marked as \"ready for review\"",
+                "gh pr review": rf"(?:approved|reviewed|requested changes to) pull request \S*#{num}\b"}
+    return bool(num and tool in patterns and re.search(patterns[tool], output, re.I))
+
+
+def observed_failure(tool, output, same_tool):
+    return tool == "git push" and same_tool == 1 and bool(
+        re.search(r"\[rejected\]|\[remote rejected\]|error: failed to push|^fatal:", output or "", re.M))
+
+
+def created_pr(target, output):
+    repo = (target or "").split(" ", 1)[0]
+    if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+        return None
+    numbers = set(re.findall(rf"https://github\.com/{re.escape(repo)}/pull/(\d+)", output or "", re.I))
+    return numbers.pop() if len(numbers) == 1 else None
 
 
 def evidence_rows(calls, results, sid, cwd, source):
@@ -501,8 +678,18 @@ def evidence_rows(calls, results, sid, cwd, source):
             found = publishing_rows(name, args if isinstance(args, dict) else {}, cwd, file_text)
         except (ValueError, TypeError, AttributeError):
             found = []
-        result = results.get(call_id, "no-result")
-        for channel, tool, target, excerpt, via in found:
+        status, output = results.get(call_id, ("no-result", ""))
+        command = str(args.get("command", "")) if isinstance(args, dict) else ""
+        for channel, tool, target, excerpt, via, mode in found:
+            result = structural_result(mode, status)
+            same_tool = sum(1 for f in found if f[1] == tool)
+            if via == "bash" and result in ("unverified", "error") and status in ("ok", "error") and observed_write(
+                    tool, target, output, command, same_tool):
+                result = "ok"
+            elif via == "bash" and result == "unverified" and observed_failure(tool, output, same_tool):
+                result = "error"
+            if tool == "gh pr create" and result == "ok" and status == "ok" and created_pr(target, output):
+                target = target.replace(" new", f"#{created_pr(target, output)} new", 1)
             rows.append({"ts": stamp, "session": sid, "channel": channel, "tool": tool, "target": one_line(target, 160),
                          "result": result, "via": via, "call_id": call_id, "excerpt": one_line(excerpt),
                          "source": f"{source}:{line_no}"})
@@ -510,10 +697,17 @@ def evidence_rows(calls, results, sid, cwd, source):
 
 
 def published_front_matter(rows):
-    lines = ["---", "published:"]
+    groups = {}
     for row in rows:
-        lines.append(f"  - {{at: {row['ts']}, tool: {json.dumps(row['tool'])}, target: {json.dumps(row['target'])}, "
-                     f"result: {row['result']}}}")
+        group = groups.setdefault((row["tool"], row["target"]), {"count": 0, "first": row["ts"]})
+        group.update(count=group["count"] + 1, last=row["ts"], result=row["result"])
+    ordered = sorted(groups.items(), key=lambda kv: kv[1]["first"])
+    lines = ["---", "published:"]
+    for (tool, target), group in ordered[:PUBLISHED_LIST]:
+        lines.append(f"  - {{at: {group['last']}, tool: {json.dumps(tool)}, target: {json.dumps(target)}, "
+                     f"result: {group['result']}" + (f", count: {group['count']}" if group["count"] > 1 else "") + "}")
+    if len(ordered) > PUBLISHED_LIST:
+        lines.append(f"published_more: {len(ordered) - PUBLISHED_LIST}")
     return lines + ["---"]
 
 
@@ -560,7 +754,8 @@ def read_session(path, tasks):
                 if role == "system" and not assignment:
                     assignment = assignment_from(message)
                 elif role == "toolResult" and message.get("toolCallId"):
-                    results[message["toolCallId"]] = "error" if message.get("isError") else "ok"
+                    results[message["toolCallId"]] = ("error" if message.get("isError") else "ok",
+                                                      "\n".join(text_blocks(message.get("content")))[:RESULT_CHARS])
                 elif role in ("user", "assistant"):
                     if role == "assistant" and isinstance(message.get("content"), list):
                         calls.extend((block.get("id", ""), entry.get("timestamp", ""), block.get("name", ""),
@@ -635,6 +830,11 @@ def read_json(path):
 
 def read_text(path):
     with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def read_bytes(path):
+    with open(path, "rb") as fh:
         return fh.read()
 
 
@@ -765,6 +965,46 @@ class Exporter:
                 body = text.rstrip("\n") + f"\n\n- source: {path}\n"
             self.record(path, segment, out, body, fp)
 
+    def pages(self):
+        colls = html_pages.collections(html_pages.template_files(AGENT_DIR, LAYER_DIR), HOME)
+        sources = html_pages.page_sources(KB_DIR, colls, MEMORY_DIR)
+        self.page_counts = {}
+        for path in sources:
+            if self.unchanged(path):
+                continue
+            try:
+                raw, fp = self.read_stable(path, lambda: read_bytes(path))
+            except OSError:
+                continue
+            segment = classify(os.path.dirname(path), "", self.rules)
+            out, text = None, None
+            if segment:
+                rel = os.path.splitext(os.path.relpath(path, os.path.abspath(KB_DIR)))[0] + ".md"
+                out = os.path.join(PAGES_DIR, segment, rel)
+                try:
+                    text = html_pages.page_markdown(path, raw, fp[1] / 1e9 if fp else None)
+                except (ValueError, RecursionError) as exc:
+                    print(f"pi-memory-export: page not converted: {path}: {exc}", file=sys.stderr)
+                    out, segment = None, "failed"
+            key = segment or "skipped"
+            self.page_counts[key] = self.page_counts.get(key, 0) + 1
+            if self.args.dry_run:
+                continue
+            prior_out = (self.state.get(path) or {}).get("out")
+            if prior_out and prior_out != out and os.path.isfile(prior_out):
+                os.remove(prior_out)
+            if out and text is not None:
+                write_atomic(out, text)
+            self.state[path] = {"fp": fp, "segment": segment, "out": out, "page": True}
+        live = set(sources)
+        for source in [s for s, e in self.state.items() if isinstance(e, dict) and e.get("page") and s not in live]:
+            self.page_counts["removed"] = self.page_counts.get("removed", 0) + 1
+            if self.args.dry_run:
+                continue
+            out = self.state.pop(source).get("out")
+            if out and os.path.isfile(out):
+                os.remove(out)
+
     def write_evidence(self):
         by_segment = {}
         for source, entry in self.state.items():
@@ -784,6 +1024,7 @@ class Exporter:
         self.sessions()
         self.team_handoffs()
         self.fork_handoffs()
+        self.pages()
         if not self.args.dry_run:
             self.write_evidence()
             self.state["__rules__"] = self.rules_id
@@ -792,6 +1033,8 @@ class Exporter:
             changed = ", ".join(f"{k} {v}" for k, v in sorted(self.counts.items())) or "nothing new"
             published = sum(self.published.values())
             changed += f"; {published} publishing call{'s' if published != 1 else ''} in re-read sessions" if published else ""
+            if self.page_counts:
+                changed += "; pages: " + ", ".join(f"{k} {v}" for k, v in sorted(self.page_counts.items()))
             print(f"pi-memory-export: {changed}{' (dry run)' if self.args.dry_run else ''}")
 
 

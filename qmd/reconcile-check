@@ -4,25 +4,41 @@
   reconcile-check CLAIMS [--note FILE]... [--repo DIR]... [--gh-repo OWNER/NAME] [--evidence TSV]...
                   [--offline] [--format md|tsv|json]
 
-CLAIMS is a TSV with a header row or a JSON list, with fields claim, kind, pointer and optionally
-expect, state (the claim's current label; empty means proposed) and id. '-' reads stdin. --note adds
-the claim comments of a markdown or HTML note (labels in ~/.pi/agent/skills/recall/references/validity.md).
+CLAIMS is the machine claim file, TSV or JSON ('-' reads stdin), in exactly this schema:
+
+  TSV   first line is the header, exactly: id<TAB>claim<TAB>source<TAB>kind<TAB>pointer<TAB>expect<TAB>state
+        then one claim per line with those seven fields (empty allowed except claim and kind).
+        No comment lines; blank lines are skipped.
+  JSON  a list of objects whose keys are a subset of those seven names, all string values,
+        each with claim and kind.
+
+id defaults to the row number; source is the note's file:line; state is the claim's current label
+(empty means proposed). An empty file, a missing or different header, a wrong field count, an unknown
+key, kind or state, or no claims at all is a usage error (exit 2), never an empty pass. --note adds
+the labelled claims and unlabelled ticks of a markdown or HTML note (labels in
+~/.pi/agent/skills/recall/references/validity.md).
 
 kind     pointer                                   expect
-pr       URL, OWNER/NAME#N, #N or N                open, merged, closed, draft, approved (optional)
+pr       URL, OWNER/NAME#N, #N, PRN or N           open, merged, closed, draft, approved (optional)
 pr-body  same                                      text the body must contain ('!text': must not)
 issue    GitHub issue URL, OWNER/NAME#N or #N      open or closed (optional)
 sha      SHA or DIR@SHA                            'on:<ref>' to require the commit on that ref
-path     path or path:line[-line]                  text the file must contain (optional)
+path     path or path:line[-line]                  text those lines (or the file) must contain
 sent     publishing target (OWNER/NAME#N, channel  the drafted text, matched against the excerpts in
-         id, ticket id, 'clipboard'; may be empty) evidence.tsv
+         id, ticket id, 'clipboard'; may be empty) evidence.tsv. Verdicts: sent, drafted (Slack draft
+                                                   or pi message), clipboard, candidate (the call ran
+                                                   but its own success was not observed), attempted
+                                                   (failed or no result), not-found
+mcp      tracker, chat or doc pointer              goes to an investigator
 auto     anything: kind inferred from the pointer
 prose    none: goes to the verifier
 
-Linear, Slack, Confluence, Granola, Datadog, Google Docs and Sentry pointers are reported needs-mcp;
-pointers with no mechanical check are needs-verifier. A pointer that exists but has no expect is
-'resolved', not confirmed. Nothing is written anywhere. Only a proposed claim whose expect matches its
-source is marked for an automatic change to confirmed; every other change is 'ask Tiger'.
+A sent target matches by identity, not substring: OWNER/NAME#7 and PR7 never match #70, and an
+API endpoint repos/OWNER/NAME/pulls/7/... counts as OWNER/NAME#7; other targets match on whole
+tokens. Linear, Slack, Confluence, Granola, Datadog, Google Docs and Sentry pointers are reported
+needs-mcp; pointers with no mechanical check are needs-verifier. A pointer that exists but has no
+expect is 'resolved', never confirmed. Nothing is written anywhere. Only a proposed claim whose expect
+matches its source is marked for an automatic change to confirmed; every other change is 'ask Tiger'.
 Exit 1 when any claim is contradicted or its pointer does not resolve, 0 otherwise, 2 on usage errors.
 
 Environment: PI_MEMORY_DIR (default ~/.pi/memory) for the default --evidence files.
@@ -30,13 +46,13 @@ Environment: PI_MEMORY_DIR (default ~/.pi/memory) for the default --evidence fil
 import argparse
 import csv
 import glob
-import io
 import json
 import os
 import re
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import labels  # noqa: E402
 
@@ -46,6 +62,7 @@ SHA = re.compile(r"^[0-9a-f]{7,40}$")
 REPO_SHA = re.compile(r"^(?P<repo>.+)@(?P<sha>[0-9a-f]{7,40})$")
 GH_URL = re.compile(r"^https://github\.com/(?P<repo>[^/]+/[^/]+)/(?P<what>pull|issues|commit)/(?P<id>[0-9a-f]+)")
 NUMBER = re.compile(r"^(?:(?P<repo>[\w.-]+/[\w.-]+))?(?:PR)?#?(?P<num>\d+)$", re.I)
+TARGET_REF = re.compile(r"^/?(?:repos/)?(?P<repo>[\w.-]+/[\w.-]+)(?:#|/(?:pulls|issues)/)(?P<num>\d+)(?![\w])", re.I)
 PATH_LINE = re.compile(r"^(?P<path>.+?):(?P<start>\d+)(?:-(?P<end>\d+))?$")
 TICKET = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d+$")
 MCP_HOSTS = (("linear.app", "linear"), ("slack.com", "slack"), ("atlassian.net", "atlassian"),
@@ -53,8 +70,12 @@ MCP_HOSTS = (("linear.app", "linear"), ("slack.com", "slack"), ("atlassian.net",
              ("sentry.io", "sentry"))
 CLIPBOARD_TOOLS = ("pbcopy", "slack-copy")
 NOT_SENT_TOOLS = re.compile(r"_draft$|^session_send$")
-MATCH_THRESHOLD = 0.5
-FIELDS = ("id", "claim", "kind", "pointer", "expect", "state", "verdict", "facts", "evidence", "label")
+MATCH_THRESHOLD = 0.6
+MIN_DRAFT_TOKENS = 6
+EXCERPT_CHARS = 200
+CLAIM_COLUMNS = ("id", "claim", "source", "kind", "pointer", "expect", "state")
+KINDS = ("auto", "pr", "pr-body", "issue", "sha", "path", "sent", "mcp", "prose")
+FIELDS = ("id", "claim", "source", "kind", "pointer", "expect", "state", "verdict", "facts", "evidence", "label")
 
 
 def run(cmd, cwd=None):
@@ -69,11 +90,15 @@ def tokens(text):
     return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) >= 3}
 
 
+def draft_tokens(draft):
+    return tokens(re.sub(r"\s+", " ", draft or "").strip()[:EXCERPT_CHARS])
+
+
 def overlap(draft, excerpt):
-    want, have = tokens(draft), tokens(excerpt)
+    want, have = draft_tokens(draft), tokens(excerpt)
     if not want or not have:
         return 0.0
-    return len(want & have) / min(len(want), len(have))
+    return len(want & have) / len(want)
 
 
 class Checker:
@@ -125,6 +150,28 @@ class Checker:
         if m:
             return m["repo"] or self.gh_repo, m["num"]
         return None, None
+
+    def target_ref(self, pointer):
+        url = GH_URL.match(pointer)
+        if url:
+            return (url["repo"].lower(), url["id"]) if url["what"] != "commit" else None
+        m = NUMBER.match(pointer)
+        if m and ("#" in pointer or pointer[:2].lower() == "pr"):
+            repo = m["repo"] or self.gh_repo
+            return (repo.lower() if repo else None, m["num"])
+        return None
+
+    def target_matches(self, pointer, ref, row):
+        target = (row.get("target") or "").strip()
+        if pointer.lower() == "clipboard":
+            return row.get("channel") == "clipboard"
+        if ref:
+            m = TARGET_REF.match(target)
+            return bool(m) and m["num"] == ref[1] and (ref[0] is None or m["repo"].lower() == ref[0])
+        word = pointer.lower()
+        pattern = (r"(?<![\w-])" if re.match(r"[\w-]", word) else "") + re.escape(word) + \
+            (r"(?![\w-])" if re.search(r"[\w-]$", word) else "")
+        return re.search(pattern, target.lower()) is not None
 
     def gh_view(self, what, pointer, fields):
         repo, num = self.number(pointer)
@@ -184,6 +231,8 @@ class Checker:
         data, err = self.gh_view("pr", pointer, "body,url")
         if data is None:
             return ("skipped", "gh skipped (--offline)", pointer) if err == "offline" else ("unresolved", err, pointer)
+        if not expect:
+            return "resolved", f"body is {len(data.get('body') or '')} characters; no expect given", data.get("url", pointer)
         absent = expect.startswith("!")
         text = expect[1:] if absent else expect
         found = text in (data.get("body") or "")
@@ -238,34 +287,38 @@ class Checker:
         for path in candidates:
             if not os.path.exists(path):
                 continue
+            where, scope = path, "file"
             if m or expect:
-                with open(path, encoding="utf-8", errors="replace") as fh:
+                with open(path, encoding="utf-8-sig", errors="replace") as fh:
                     text = fh.read()
-                count = len(text.splitlines())
             if m:
+                lines = text.splitlines()
                 start, end = int(m["start"]), int(m["end"] or m["start"])
-                if not 1 <= start <= end <= count:
-                    return "unresolved", f"line out of range ({count} lines)", path
+                if not 1 <= start <= end <= len(lines):
+                    return "unresolved", f"line out of range ({len(lines)} lines)", path
+                text = "\n".join(lines[start - 1:end])
+                where = f"{path}:{start}" + (f"-{end}" if end != start else "")
+                scope = f"line {start}" if end == start else f"lines {start}-{end}"
             if expect:
                 found = expect in text
-                return ("confirmed" if found else "contradicted"), ("contains" if found else "lacks") + f" {expect[:60]!r}", pointer
-            return "resolved", "exists", pointer
+                return ("confirmed" if found else "contradicted"), f"{scope} {'contains' if found else 'lacks'} {expect[:60]!r}", where
+            return "resolved", f"{scope} exists", where
         return "unresolved", "path not found", pointer
 
     def check_sent(self, pointer, expect):
         rows = self.evidence()
         scope = f"searched {len(rows)} rows in {len(self.evidence_files)} evidence file(s)"
         if pointer:
-            url = GH_URL.match(pointer)
-            wanted = (f"{url['repo']}#{url['id']}" if url and url["what"] != "commit" else pointer).lower()
-            scope += f", target ~ {wanted!r}"
-            rows = [r for r in rows if wanted in (r.get("target") or "").lower()
-                    or (wanted == "clipboard" and r.get("channel") == "clipboard")]
+            ref = self.target_ref(pointer)
+            scope += f", target = {ref[0] or '*'}#{ref[1]}" if ref else f", target token {pointer!r}"
+            rows = [r for r in rows if self.target_matches(pointer, ref, r)]
         if expect:
-            scope += f", text overlap >= {MATCH_THRESHOLD}"
+            scope += f", {MATCH_THRESHOLD:.0%} of the draft's opening words in the excerpt"
             rows = [r for r in rows if overlap(expect, r.get("excerpt")) >= MATCH_THRESHOLD]
         if not pointer and not expect:
             return "unresolved", "sent needs a target, the drafted text, or both", ""
+        if not pointer and len(draft_tokens(expect)) < MIN_DRAFT_TOKENS:
+            return "unresolved", f"drafted text too short to match on its own (under {MIN_DRAFT_TOKENS} words); add a target", ""
         if not rows:
             return "not-found", scope + "; not proof it was never sent", ""
         sent = [r for r in rows if r.get("result") == "ok" and r.get("tool") not in CLIPBOARD_TOOLS
@@ -274,21 +327,28 @@ class Checker:
         describe = lambda r: f"{r.get('tool')} -> {r.get('target')} at {r.get('ts')} ({r.get('result')}), session {r.get('session')}"
         if sent:
             row = pick(sent)
-            return "confirmed", f"{describe(row)}; {len(sent)} matching publishing row(s)", row.get("source", "")
-        drafts = [r for r in rows if NOT_SENT_TOOLS.search(r.get("tool") or "") and r.get("result") == "ok"]
+            return "sent", f"{describe(row)}; {len(sent)} matching publishing row(s)", row.get("source", "")
+        drafts = [r for r in rows if NOT_SENT_TOOLS.search(r.get("tool") or "") and r.get("result") in ("ok", "unverified")]
         if drafts:
             row = pick(drafts)
             return "drafted", f"{describe(row)}; a draft or a local pi message, not a sent post", row.get("source", "")
-        copies = [r for r in rows if r.get("tool") in CLIPBOARD_TOOLS and r.get("result") == "ok"]
+        copies = [r for r in rows if r.get("tool") in CLIPBOARD_TOOLS and r.get("result") in ("ok", "unverified")]
         if copies:
             row = pick(copies)
             return "clipboard", f"{describe(row)}; pasting it is only Tiger's word", row.get("source", "")
+        unverified = [r for r in rows if r.get("result") == "unverified"]
+        if unverified:
+            row = pick(unverified)
+            return "candidate", (f"{describe(row)}; the call ran, but this write's own success was not observed "
+                                  "(a script, pipe, branch, try/catch or --web); find the posted item"), row.get("source", "")
         row = pick(rows)
         return "attempted", f"{describe(row)}; every matching call failed or has no result", row.get("source", "")
 
 
-def label_change(state, verdict, evidence):
+def label_change(state, verdict, evidence, expect=""):
     state = (state or "proposed").strip().lower()
+    if verdict == "confirmed" and not expect:
+        verdict = "resolved"
     if verdict == "confirmed":
         if state == "proposed":
             return f"auto: proposed -> confirmed ({evidence})" if evidence else "ask Tiger: resolves but no evidence link"
@@ -299,25 +359,75 @@ def label_change(state, verdict, evidence):
         return f"ask Tiger: source disagrees; supersede or drop ({state} now)"
     if verdict == "unresolved":
         return "fix the pointer"
+    if verdict == "sent":
+        return f"resolve the posted item with a pr/issue claim and an expect; only that can confirm it, not the session log (keep {state})" \
+            if state == "proposed" else f"ask Tiger: {state} -> confirmed once the posted item resolves"
     if verdict == "resolved":
         return f"compare the facts with the claim; an automatic change needs an expect (keep {state})"
-    if verdict in ("drafted", "clipboard"):
-        return f"ask Tiger whether he sent it (keep {state})"
+    if verdict in ("drafted", "clipboard", "candidate"):
+        return f"ask Tiger whether he sent it, or find the posted item (keep {state})"
     if verdict in ("needs-mcp", "needs-verifier", "skipped"):
         return f"pending (keep {state})"
     return f"keep {state}"
 
 
+class ClaimError(ValueError):
+    pass
+
+
+def claim_rows(text, name):
+    if not text.strip():
+        raise ClaimError(f"{name}: empty claim file")
+    if text.lstrip().startswith(("[", "{")):
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise ClaimError(f"{name}: not valid JSON ({exc})")
+        if not isinstance(data, list):
+            raise ClaimError(f"{name}: JSON claims must be a list of objects")
+        rows = []
+        for n, row in enumerate(data, 1):
+            if not isinstance(row, dict):
+                raise ClaimError(f"{name}: item {n} is not an object")
+            unknown = sorted(set(row) - set(CLAIM_COLUMNS))
+            if unknown:
+                raise ClaimError(f"{name}: item {n} has unknown key(s) {', '.join(unknown)}; keys: {', '.join(CLAIM_COLUMNS)}")
+            if any(v is not None and not isinstance(v, str) for v in row.values()):
+                raise ClaimError(f"{name}: item {n} has a non-string value")
+            rows.append((f"item {n}", {c: row.get(c) or "" for c in CLAIM_COLUMNS}))
+    else:
+        lines = text.split("\n")
+        header = tuple(h.strip() for h in lines[0].rstrip("\r").split("\t"))
+        if header != CLAIM_COLUMNS:
+            raise ClaimError(f"{name}: line 1 must be the header, exactly: {chr(9).join(CLAIM_COLUMNS)} (tab-separated)")
+        rows = []
+        for n, line in enumerate(lines[1:], 2):
+            line = line.rstrip("\r")
+            if not line.strip():
+                continue
+            cells = line.split("\t")
+            if len(cells) != len(CLAIM_COLUMNS):
+                raise ClaimError(f"{name}: line {n} has {len(cells)} fields, want {len(CLAIM_COLUMNS)}")
+            rows.append((f"line {n}", dict(zip(CLAIM_COLUMNS, (c.strip() for c in cells)))))
+    out = []
+    for where, row in rows:
+        if not row["claim"]:
+            raise ClaimError(f"{name}: {where} has no claim")
+        if row["kind"].lower() not in KINDS:
+            raise ClaimError(f"{name}: {where} has kind {row['kind']!r}; kinds: {', '.join(KINDS)}")
+        if row["state"] and row["state"].lower() not in labels.STATES:
+            raise ClaimError(f"{name}: {where} has state {row['state']!r}; states: {', '.join(labels.STATES)}")
+        out.append(row)
+    if not out:
+        raise ClaimError(f"{name}: no claims")
+    return out
+
+
 def read_claims(path):
     if path == "-":
-        text = sys.stdin.read()
-    else:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-    if text.lstrip().startswith("["):
-        return json.loads(text)
-    lines = [l for l in text.splitlines() if l.strip() and not l.startswith("#")]
-    return list(csv.DictReader(io.StringIO("\n".join(lines)), delimiter="\t", quoting=csv.QUOTE_NONE))
+        return claim_rows(sys.stdin.read().lstrip("\ufeff"), "stdin")
+    with open(path, encoding="utf-8-sig") as fh:
+        return claim_rows(fh.read(), path)
 
 
 def note_claims(path):
@@ -325,15 +435,20 @@ def note_claims(path):
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().split("\n")
     html = labels.is_html(path, "\n".join(lines[:5]))
+    in_head = html
     for no, line in enumerate(lines, 1):
-        tag = labels.claim_tag(line) or (labels.data_tag(line) if html else None)
-        if not tag:
+        if in_head and re.search(r"</head\s*>|<body\b", line, re.I):
+            in_head = False
+        elif in_head:
             continue
-        text = re.sub(r"<[^>]+>", "", labels.CLAIM.sub("", line)).strip(" -*\t")
-        pointers = tag.get("evidence") or [""]
-        for pointer in pointers:
-            out.append({"id": f"{path}:{no}", "claim": text, "kind": "auto", "pointer": pointer,
-                        "state": tag.get("state", "")})
+        elements = labels.line_elements(line, html)
+        for n, element in enumerate(elements, 1):
+            tag = element["labels"] or {}
+            where = f"{path}:{no}" + (f"#{n}" if len(elements) > 1 else "")
+            for pointer in labels.clean_evidence(tag.get("evidence")) or [""]:
+                out.append({"id": where, "claim": element["text"] or labels.plain(line), "source": f"{path}:{no}",
+                            "kind": "auto", "pointer": pointer, "expect": "",
+                            "state": (tag.get("state") or "proposed") if element["labels"] else "proposed"})
     return out
 
 
@@ -373,6 +488,8 @@ def main(argv=None):
         claims = read_claims(a.claims) if a.claims else []
         for note in a.note:
             claims += note_claims(note)
+        if not claims:
+            raise ClaimError("no claims: the notes carry no claim labels or ticks")
     except (OSError, ValueError) as exc:
         print(f"reconcile-check: {exc}", file=sys.stderr)
         return 2
@@ -381,10 +498,13 @@ def main(argv=None):
     results = []
     for i, claim in enumerate(claims, 1):
         verdict, facts, pointer = checker.check(claim)
-        results.append({"id": claim.get("id") or str(i), "claim": claim.get("claim", ""), "kind": claim.get("kind") or "auto",
-                        "pointer": claim.get("pointer", ""), "expect": claim.get("expect", ""),
+        expect = (claim.get("expect") or "").strip()
+        if verdict == "confirmed" and not expect:
+            verdict = "resolved"
+        results.append({"id": claim.get("id") or str(i), "claim": claim.get("claim", ""), "source": claim.get("source", ""),
+                        "kind": claim.get("kind") or "auto", "pointer": claim.get("pointer", ""), "expect": expect,
                         "state": claim.get("state", ""), "verdict": verdict, "facts": facts, "evidence": pointer,
-                        "label": label_change(claim.get("state"), verdict, pointer)})
+                        "label": label_change(claim.get("state"), verdict, pointer, expect)})
     print(render(results, a.format))
     return 1 if any(r["verdict"] in ("contradicted", "unresolved") for r in results) else 0
 
