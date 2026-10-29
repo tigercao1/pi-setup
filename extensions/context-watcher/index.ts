@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export interface WatcherConfig {
@@ -11,16 +12,26 @@ export interface WatcherConfig {
 	startTimeoutMs: number;
 }
 
+const PACKAGE_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const AGENT_DIR = join(homedir(), ".pi/agent");
+
+export function firstExisting(paths: string[]): string {
+	return paths.find((path) => existsSync(path)) ?? paths[paths.length - 1]!;
+}
+
 export const DEFAULT_CONFIG: WatcherConfig = {
 	enabled: true,
 	warnTokens: 200_000,
 	suggestTokens: 250_000,
-	factsScript: join(homedir(), ".pi/agent/bin/pi-pause-facts"),
+	factsScript: firstExisting([join(PACKAGE_DIR, "bin", "pi-pause-facts"), join(AGENT_DIR, "bin", "pi-pause-facts")]),
 	startTimeoutMs: 60_000,
 };
 
 const STATUS_KEY = "context-watcher";
-const RECALL_SKILL = join(homedir(), ".pi/agent/skills/recall/SKILL.md");
+const RECALL_SKILL = firstExisting([
+	join(PACKAGE_DIR, "skills", "recall", "SKILL.md"),
+	join(AGENT_DIR, "skills", "recall", "SKILL.md"),
+]);
 const WORKER_ENV_KEYS = ["PI_ORCH_AGENT_NAME", "PI_ORCH_TEAM_NAME", "PI_ORCH_AGENT_ROLE", "PI_ORCH_PARENT_NAME"];
 
 const positive = (value: unknown, fallback: number): number =>
@@ -54,6 +65,24 @@ function loadSettings(pi: ExtensionAPI): unknown {
 		} catch {
 			return undefined;
 		}
+	}
+}
+
+/** The command that runs `script`: itself when executable, else the interpreter its shebang names (python3 without one). */
+export function scriptCommand(script: string, args: string[]): { command: string; args: string[] } {
+	try {
+		accessSync(script, constants.X_OK);
+		return { command: script, args };
+	} catch {
+		let shebang: string[] = [];
+		try {
+			const first = readFileSync(script, "utf8").split("\n", 1)[0] ?? "";
+			if (first.startsWith("#!")) shebang = first.slice(2).trim().split(/\s+/).filter(Boolean);
+		} catch {
+			shebang = [];
+		}
+		const [command = "python3", ...rest] = shebang;
+		return { command, args: [...rest, script, ...args] };
 	}
 }
 
@@ -350,7 +379,8 @@ export default function contextWatcher(pi: ExtensionAPI) {
 				if (sessionFile) args.push("--session-file", sessionFile);
 				if (typeof tokens === "number") args.push("--context-tokens", String(tokens));
 				if (!existsSync(config.factsScript)) return fail(`facts script not found at ${config.factsScript}`);
-				const facts = await pi.exec(config.factsScript, args, { timeout: 90_000, cwd: ctx.cwd });
+				const run = scriptCommand(config.factsScript, args);
+				const facts = await pi.exec(run.command, run.args, { timeout: 90_000, cwd: ctx.cwd });
 				if (facts.code !== 0 || !facts.stdout.trim()) {
 					return fail(`pi-pause-facts exited ${facts.code}: ${(facts.stderr || facts.stdout).trim().split("\n")[0] ?? ""}`);
 				}
