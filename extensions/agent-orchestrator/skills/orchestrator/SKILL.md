@@ -27,7 +27,10 @@ You are headless unless you were given a visible pane: your process exits when y
 you spawn children and then finish your turn, you die before they report and their work is orphaned.
 
 `team_await` is how you stay alive. It blocks inside a single tool call until your children reach a
-terminal state, then hands you their outcomes and deliverable paths:
+terminal state, then hands you their outcomes, deliverable paths, and each done deliverable's
+`## Answer` section (up to 25 lines; the first 20 lines with a note when the section is missing).
+Read the full file only for the part the Answer does not settle. Your own deliverable starts with
+a `## Answer` section too, and it is attached to your first message to your parent after `done`:
 
 ```
 team_spawn(...) x N        →  team_await({})        →  read deliverables

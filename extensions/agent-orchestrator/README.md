@@ -217,6 +217,12 @@ Each orchestrator session sees its own level of the tree:
   `team_message` from a non-lead agent to an ancestor above its parent is rerouted to the parent;
   `team_broadcast` reaches the sender's subtree and siblings, never up the chain; and
   `team_recycle` keeps the original parent instead of re-parenting under the caller.
+- **Answer by section.** Deliverables start with a `## Answer` section (up to ~25 lines).
+  `team_await` returns, for each done deliverable, that section plus the path; a file without one
+  comes back as its first 20 lines and a note. Each block, header and notice included, is cut at
+  3,000 characters with a pointer to the file, and only the first 512 KiB of the file is read. A non-lead agent's first `team_message` to its parent
+  after `done` gets the same block appended (once per process), so the parent rarely needs to open
+  the whole file. Code: `answer.ts`.
 
 ## Widget bounding
 
@@ -271,8 +277,10 @@ Design choices that matter:
   review — one worker asserted "all 20 symbols fetched, no nulls" while its own data held seven.
 - **Blocking on purpose.** Verification is a decision point, not background work.
 
-The `verifier` profile (`openai/gpt-5.5`, thinking `high`, `skills: []`, `contextFiles: false`)
-is deliberately bare so it cannot inherit the framing that shaped the work.
+The `verifier` profile (model from the `verifier` persona in `~/.pi/agent/models.json`, thinking
+`high`, `skills: []`, `contextFiles: false`) is deliberately bare so it cannot inherit the framing
+that shaped the work. `team_verify` resolves its model through the same `resolveRuntime` path as a
+`profile: "verifier"` spawn.
 
 ```bash
 node --experimental-strip-types tests/live-verify.mjs   # true claim survives, false claim dies
@@ -364,31 +372,78 @@ genuinely needs your full environment.
 
 ## Model selection
 
-Resolution order, first match wins:
+Every persona's model lives in one file, `~/.pi/agent/models.json` (beside pi's own `providers`
+key): `aliases` name each model once with its provider, `personas` map a profile name to an alias
+or to `inherit`. `pi-models show` prints the persona -> alias -> model table; change it with
+`pi-models set-alias` / `pi-models set-persona`, never by editing ids into code or settings.
 
-1. explicit `model` / `provider` / `thinkingLevel` on `team_spawn`
-2. `profile`'s thinking level
-3. `team.modelDefaults[role]` in `~/.pi/agent/settings.json`
-4. **inherit the spawning agent's own model and provider** (default)
+Model resolution order, first match wins:
+
+1. explicit `model` / `provider` on `team_spawn`
+2. a `model` in settings `team.profiles.<profile>` (an override; `pi-doctor` warns about it)
+3. the profile's persona in `models.json` (`inherit` falls through)
+4. an unprofiled worker's jev route (below)
+5. `team.modelDefaults[role]` in `~/.pi/agent/settings.json`
+6. **inherit the spawning agent's own model and provider** (default)
+
+Thinking level: explicit, then the profile's, then `team.modelDefaults[role]`, then the role default.
+A missing or invalid `models.json` falls back to the built-in persona table and the next spawn
+result carries one `WARNING`; a spawn never fails on it.
 
 Inheriting is deliberate: a bare model id can resolve to a different provider in the child process
 and fail on auth. Pass `provider` whenever you pass `model`.
 
+### Unprofiled workers (`unprofiled` in `models.json`)
+
+A spawn whose resolved role is worker, with no `profile` and no explicit `model`, asks jev (via
+`extensions/jev/client.ts`) one boolean question over the task text: is this implementation work
+(code, tests, commits, PRs)? Implementation gets `unprofiled.implementation`; other work gets
+`unprofiled.other` only when jev puts at least `minConfidence` on it. Low confidence, a jev error,
+a missing key or no answer within `timeoutMs` gets `unprofiled.fallback`. The result shows it on
+the Model line (`Model: anthropic/claude-opus-5.5 (jev: implementation, 0.93)` or
+`(jev fallback: timeout)`), and the agent record keeps it as `routing`. The timeout covers the API
+key lookup too. With `models.json` missing or invalid, every unprofiled worker gets Opus without a
+jev call (`(fallback: no routing config)`). Orchestrator-role spawns,
+evaluators and profiled spawns never call jev. Code: `route.ts`, `personas.ts`.
+
+### Lead orchestration trial (`leadTrial`)
+
+While `leadTrial.enabled` is true and today (local date) is on or before `leadTrial.until`, a spawn
+whose **resolved** role is orchestrator (after `orchestrator.level`, the depth cap and 2-tier
+promotion), with no explicit `model`, no profile that sets its own model, and no role override,
+gets one of `leadTrial.models` from settings, else the `leadTrial` aliases in `models.json`
+(`pi-models show` lists them), on `leadTrial.provider` (default the settings `defaultProvider`, or
+the alias provider when the arms come from `models.json`). The `manager` and
+`batch-orchestrator` personas stay `inherit`, so they remain in the trial. A
+request that ends up as a worker (1-tier, depth cap, a `manager` profile without `canSpawn`) gets no
+arm. The arm is `models[sha256(team + NUL + agent)[0] % models.length]`, so it is stable for a team
+and agent name and splits about evenly across spawns. The arm lands on the agent record as `trial`
+together with `baseModel`/`baseProvider`, the model the spawn would have had without the trial
+(falling back to the settings `defaultModel`; with neither there is no arm). A trial orchestrator's
+descendants inherit that base model, not the arm, so they resolve exactly as they would without the
+trial. The arm is shown in the spawn result (`Lead trial arm: ...`) and written as one row in
+`~/.pi/agent/run/lead-trial.tsv` (`ts team agent arm model task-first-line`). If the log cannot be
+written before the spawn, no arm is assigned; if the row fails after launch, the spawn result warns
+and the report lists the agent from its record as UNLOGGED. `team_recycle` keeps the arm and writes
+no new row. Interactive sessions and resolved workers are never touched.
+Report: `~/.pi/agent/bin/pi-cost-trial` (cost per agent and subtree, per arm, merged PRs and gate
+rounds where attributable). Code: `trial.ts`.
+
 ## Profiles
 
 `profile: "<name>"` applies a bundle of **model, provider, thinking level, skills, extensions and
-context-file policy**. Precedence: explicit `team_spawn` args > profile > `team.modelDefaults` >
-inherit the spawning agent's model.
+context-file policy**. The model comes from the profile's persona in `~/.pi/agent/models.json`
+(see Model selection; `pi-models show` for the current table).
 
-| Profile | Model | Carries |
-|---|---|---|
-| `code-review` | `openai/gpt-6.1-sol` | `pr-approval-review`, `github-cli`, `tiger-voice`, `clear-message`, `extensions: ["mcp"]`, `AGENTS.md` conventions |
-| `verifier` | `openai/gpt-6.1-sol` | nothing: bare context, the model `team_verify` skeptics use |
-| `verifier-mcp` | `openai/gpt-6.1-sol` | `extensions: ["mcp"]` + `AGENTS.md`: a spawned verifier for claims behind Linear/Confluence/Slack/Sentry/web |
-| `reviewer` | `openai/gpt-6.1-sol` | `pr-approval-review` + `AGENTS.md` conventions |
-| `pr-author` | inherit | `AGENTS.md` conventions (add the repo's ticket-to-PR skill via `team.profiles`) |
-| `researcher` / `coder` / `tester` / `docs-writer` | inherit | thinking level only |
-| `batch-orchestrator` | inherit | sub-orchestrator role |
+| Profile | Carries |
+|---|---|
+| `code-review` | `pr-approval-review`, `github-cli`, `tiger-voice`, `clear-message`, `extensions: ["mcp"]`, `AGENTS.md` conventions |
+| `verifier` | nothing: bare context, the model `team_verify` skeptics use |
+| `verifier-mcp` | `extensions: ["mcp"]` + `AGENTS.md`: a spawned verifier for claims behind Linear/Confluence/Slack/Sentry/web |
+| `reviewer` | `pr-approval-review` + `AGENTS.md` conventions |
+| `pr-author` | `AGENTS.md` conventions (add the repo's ticket-to-PR skill via `team.profiles`) |
+| `researcher` / `coder` / `tester` / `docs-writer` | thinking level only |
+| `manager` / `batch-orchestrator` | sub-orchestrator role |
 
 Skill names in a profile are resolved per-repo (the `agentOrchestrator.projectSkillRoots`
 directories, then global). A name that does not resolve in the current repo is skipped, not an error, so a
@@ -408,8 +463,6 @@ redefine one:
     "profiles": {
       "security-review": {
         "role": "worker",
-        "model": "openai/gpt-5.5-pro",
-        "provider": "vercel-ai-gateway",
         "thinkingLevel": "high",
         "skills": ["pr-approval-review"],
         "contextFiles": true,
@@ -419,6 +472,9 @@ redefine one:
   }
 }
 ```
+
+Give it a model with `pi-models set-persona security-review <alias>`; a `model` in the settings
+profile still works as an override, but `pi-doctor` warns about it.
 
 Profiles are read at tool registration, so new ones need a `/reload`.
 

@@ -21,8 +21,13 @@ import {
 	spawnAgent,
 } from "./backend.ts";
 import { activityLabel, readActivity } from "./digest.ts";
+import { answerBlock } from "./answer.ts";
+import { appendTrialLog, leadTrialArm, type TrialArm } from "./trial.ts";
+import { takeModelsWarning } from "./personas.ts";
+import { routeUnprofiled, type SpawnRouting } from "./route.ts";
 import {
 	allProfiles,
+	readSettings,
 	buildArgv,
 	spawnLimits,
 	maxTrackedAgents,
@@ -115,8 +120,21 @@ const ContractSchema = Type.Object({
 	),
 });
 
+const MAIL_BUDGET_CHARS = 3900;
+
 export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 	const canManage = rt.canSpawn;
+	let answerSent = false;
+	const withAnswer = (team: string, body: string): string => {
+		if (rt.isLead || answerSent) return body;
+		const status = readStatus(team, rt.me);
+		if (status?.state !== "done" || !status.output) return body;
+		answerSent = true;
+		const block = answerBlock(rt.me, status.output, rt.cwd);
+		const room = Math.max(200, MAIL_BUDGET_CHARS - block.length - 2);
+		const message = body.length > room ? `${body.slice(0, room)}…` : body;
+		return `${message}\n\n${block}`;
+	};
 
 	// ------------------------------------------------------------ spawn
 
@@ -128,6 +146,8 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				"Spawn a teammate agent in its own process (and pane, when a multiplexer is available). " +
 				"Returns as soon as the agent starts — it works in parallel while you stay responsive. " +
 				"Always give a self-contained task and a taskContract with an outputPath. " +
+				"Deliverables start with a '## Answer' section (up to ~25 lines); team_await and the worker's done message carry " +
+				"that section plus the path, not the whole file. " +
 				"Nothing is inherited: skills, extensions and contextFiles are off under slim unless passed, " +
 				"for every worker and grandchild. team_recycle replays the original spawn's channels.",
 			promptSnippet: "Spawn a teammate agent to work on a task in parallel",
@@ -251,7 +271,9 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				),
 			}),
 			async execute(_id, params) {
-				return text(spawnOne(rt, params as SpawnParams));
+				const spawn = params as SpawnParams;
+				const routing = await unprofiledRouting(rt, spawn);
+				return text(spawnOne(rt, routing ? { ...spawn, routing } : spawn));
 			},
 		});
 	}
@@ -362,13 +384,13 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 					from: rt.me,
 					to: parent,
 					kind: "message",
-					content: `(addressed to ${to}; delivered to you as ${rt.me}'s parent — summarise upward if it matters)\n\n${content}`,
+					content: `(addressed to ${to}; delivered to you as ${rt.me}'s parent — summarise upward if it matters)\n\n${withAnswer(team, content)}`,
 				});
 				return text(
 					`Rerouted to your parent ${parent}: reports go one level up, and ${parent} summarises for ${to}.`,
 				);
 			}
-			postMail(team, { from: rt.me, to, kind: "message", content });
+			postMail(team, { from: rt.me, to, kind: "message", content: to === parent ? withAnswer(team, content) : content });
 			return text(`Message queued for ${to}.`);
 		},
 	});
@@ -611,6 +633,8 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				cwd: old.cwd,
 				gate: old.gate,
 				gateExempt: old.gateExempt,
+				trial: old.trial,
+				routing: old.routing,
 				taskContract: readContract(config.team, name) ?? undefined,
 				handoff: handoffText,
 				extraContext: additionalContext,
@@ -727,16 +751,16 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 			};
 			if (!finding?.trim()) return text("Refusing to verify: empty finding.");
 
-			const profile = allProfiles().verifier;
+			const verifier = resolveRuntime({ role: "worker", profile: "verifier", slim: true });
 			const result = await runSkeptics({
 				finding,
 				sources,
 				context,
 				cwd: rt.cwd,
 				env: spawnEnv({}),
-				model: model ?? profile?.model,
-				provider: provider ?? profile?.provider,
-				thinkingLevel: profile?.thinkingLevel,
+				model: model ?? verifier.model,
+				provider: provider ?? verifier.provider,
+				thinkingLevel: verifier.thinkingLevel,
 				timeoutMs: Math.min(Math.max(timeoutSeconds ?? 180, 20), 600) * 1000,
 			});
 
@@ -930,7 +954,8 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 			"their outcomes and deliverable paths. This is how a manager waits: a headless agent exits when " +
 			"its turn ends, so parking inside this one tool call is what keeps it alive to collect results. " +
 			"Each done deliverable is checked against its contract's requiredFields; a miss, or an agent that exited " +
-			"without reporting, is shown as GAP, never as done.",
+			"without reporting, is shown as GAP, never as done. For each done deliverable it returns the file's " +
+			"'## Answer' section (up to 25 lines) and its path, or the first 20 lines with a note when there is no such section.",
 		promptGuidelines: [
 			"If you spawned children and must collect their results, call team_await instead of polling " +
 				"team_status in a loop — polling burns your context and a headless agent may exit first.",
@@ -1006,6 +1031,7 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 
 			const statuses = readAllStatuses(config.team);
 			const gaps: string[] = [];
+			const answers: string[] = [];
 			const rows = names.map((name) => {
 				let state = done.get(name) ?? (statuses[name]?.state === "queued" ? "still queued" : "still running");
 				const status = statuses[name];
@@ -1021,6 +1047,7 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 					contractCell = "no deliverable";
 				}
 				if (state.startsWith("GAP")) gaps.push(name);
+				if (done.get(name) === "done" && status?.output) answers.push(answerBlock(name, status.output, childCwd));
 				return `| ${name} | ${state} | ${status?.output ?? "—"} | ${contractCell.replace(/\|/g, "/")} | ${(status?.note ?? "").slice(0, 80)} |`;
 			});
 			const unfinished = names.filter((n) => !done.has(n));
@@ -1039,8 +1066,10 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 					"| agent | state | deliverable | contract | note |",
 					"|---|---|---|---|---|",
 					...rows,
+					...(answers.length > 0 ? ["", "## Answers", "", answers.join("\n\n")] : []),
 					"",
-					"Read each deliverable before reporting upward. Do not forward raw worker output —",
+					"Each done deliverable's '## Answer' section is above; read the full file only for the part you need. " +
+						"Do not forward raw worker output —",
 					"synthesise, and pass along verification verdicts and file paths.",
 				].join("\n"),
 			);
@@ -1126,6 +1155,8 @@ interface SpawnParams {
 	taskContract?: TaskContract;
 	gate?: GateReservation;
 	gateExempt?: string;
+	trial?: TrialArm;
+	routing?: SpawnRouting;
 	/** Internal: used by recycle/evaluate. */
 	roleOverride?: Role;
 	handoff?: string;
@@ -1152,6 +1183,42 @@ function decideRole(rt: Runtime, params: SpawnParams, siblings: number): Role {
 	if (level === "1-tier") return "worker";
 	if (level === "2-tier" && siblings >= promoteThreshold()) return "orchestrator";
 	return params.canSpawn ? "orchestrator" : "worker";
+}
+
+function resolveRole(
+	rt: Runtime,
+	params: SpawnParams,
+	config: TeamConfig | null,
+	parent: string,
+	maxDepth: number,
+): { role: Role; atDepthLimit: boolean } {
+	const siblings = config ? childrenOf(config, parent).filter((a) => !a.killedAt).length : 0;
+	const depth = (config ? depthOf(config, parent) : 0) + 1;
+	const decided = decideRole(rt, params, siblings);
+	const atDepthLimit = decided === "orchestrator" && depth >= maxDepth;
+	return { role: atDepthLimit ? "worker" : decided, atDepthLimit };
+}
+
+export function isUnprofiledWorker(rt: Runtime, params: SpawnParams): boolean {
+	if (params.profile || params.model || params.roleOverride || params.routing) return false;
+	if (!NAME_RE.test(params.name ?? "") || !params.task?.trim()) return false;
+	const config = rt.team ? readTeam(rt.team) : null;
+	return resolveRole(rt, params, config, params.parent ?? rt.me, spawnLimits().maxDepth).role === "worker";
+}
+
+export async function unprofiledRouting(rt: Runtime, params: SpawnParams): Promise<SpawnRouting | undefined> {
+	try {
+		return isUnprofiledWorker(rt, params) ? await routeUnprofiled(params.task) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function modelLine(model: string | undefined, thinkingLevel: string | undefined, routing?: SpawnRouting): string {
+	if (!model) return "";
+	const routed = routing && routing.model === model ? ` (${routing.label})` : "";
+	const thinking = thinkingLevel ? (routed ? `, thinking ${thinkingLevel}` : ` (${thinkingLevel})`) : "";
+	return `Model: ${model}${routed}${thinking}`;
 }
 
 export function spawnOne(rt: Runtime, params: SpawnParams): string {
@@ -1237,11 +1304,12 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		);
 	}
 
-	const siblings = childrenOf(config, parent).filter((a) => !a.killedAt).length;
-	let role = decideRole(rt, params, siblings);
-	const atDepthLimit = role === "orchestrator" && depth >= limits.maxDepth;
-	if (atDepthLimit) role = "worker";
+	const { role, atDepthLimit } = resolveRole(rt, params, config, parent, limits.maxDepth);
 	const canSpawn = role === "orchestrator";
+	const routing =
+		params.routing && role === "worker" && !params.profile && (!params.model || params.model === params.routing.model)
+			? params.routing
+			: undefined;
 	const slim = params.slim ?? true;
 	// Interactive panes idle after finishing a turn, so they can wait for their
 	// children. Headless agents run one agent loop and exit, which is right for
@@ -1256,10 +1324,33 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 
 	if (!existsSync(cwd)) return refuse(`Working directory does not exist: ${cwd}`);
 
-	const runtime = resolveRuntime({
+	const baseline = resolveRuntime({
 		role,
 		model: params.model,
 		provider: params.provider,
+		inherit: params.inherit ?? rt.ownModel,
+		thinkingLevel: params.thinkingLevel,
+		profile: params.profile,
+		extensions: params.extensions,
+		skills: [...new Set([...(params.skills ?? []), ...defaultSkills()])],
+		contextFiles: params.contextFiles,
+		slim,
+	});
+	const settingsNow = readSettings();
+	const trial = params.model
+		? params.trial
+		: leadTrialArm(team, params.name, {
+				role,
+				roleOverride: params.roleOverride,
+				profileModel: params.profile ? allProfiles()[params.profile]?.model : undefined,
+				baseModel: baseline.model ?? settingsNow.defaultModel,
+				baseProvider: baseline.model ? baseline.provider : settingsNow.defaultProvider,
+			});
+	const runtime = resolveRuntime({
+		role,
+		model: params.model ?? trial?.model,
+		provider: params.model ? params.provider : (trial?.provider ?? params.provider),
+		routed: routing ? { model: routing.model, provider: routing.provider } : undefined,
 		inherit: params.inherit ?? rt.ownModel,
 		thinkingLevel: params.thinkingLevel,
 		profile: params.profile,
@@ -1285,6 +1376,7 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 				"A resolved skill is not proof it was read: grep the agent's log for the skill path."
 			: "",
 		badFields.length > 0 ? `WARNING: requiredFields entries that will never match: ${badFields.join("; ")}.` : "",
+		takeModelsWarning() ?? "",
 	].filter(Boolean);
 
 	const record: AgentRecord = {
@@ -1308,6 +1400,8 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		createdAt: new Date().toISOString(),
 		...(params.gate ? { gate: { state: params.gate.state, spawnId: params.gate.spawnId.trim() } } : {}),
 		...(gateExempt ? { gateExempt } : {}),
+		...(trial ? { trial } : {}),
+		...(routing ? { routing } : {}),
 	};
 
 	// Count and reserve under one lock: two sub-orchestrators spawning at the
@@ -1491,6 +1585,10 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		return refuse(`Spawn failed for ${params.name}: ${(error as Error).message}`);
 	}
 	patchAgent(team, params.name, { backend: result.backend, paneId: result.paneId });
+	const trialLogError =
+		trial && !params.trial
+			? appendTrialLog({ team, agent: params.name, arm: trial.arm, model: trial.model, task: params.task })
+			: undefined;
 
 	// The check must land after the agent's stagger sleep, or a late-starting
 	// sibling is reported as a startup crash.
@@ -1516,7 +1614,11 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 		kind: "spawned",
 		message: [
 			`Spawned **${params.name}** (${role}, ${result.backend}${result.backend === "headless" ? "" : visible ? ", visible pane" : ", hidden window"}).`,
-			runtime.model ? `Model: ${runtime.model}${runtime.thinkingLevel ? ` (${runtime.thinkingLevel})` : ""}` : "",
+			modelLine(runtime.model, runtime.thinkingLevel, routing),
+			trial ? `Lead trial arm: ${trial.arm} (until ${trial.until}; pass an explicit model to opt out).` : "",
+			trialLogError
+				? `WARNING: the lead trial log could not be written (${trialLogError}); pi-cost-trial reports this agent from its record as UNLOGGED.`
+				: "",
 			gateLine,
 			...spawnWarnings,
 			conventionWarning,

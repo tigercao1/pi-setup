@@ -13,11 +13,13 @@
  * assertions then fail at random.
  */
 
+import "./throwaway-home.ts";
 import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import agentOrchestrator from "../index.ts";
+import { setJevEvaluate } from "../route.ts";
 import { isAlive, killAgent } from "../backend.ts";
 import { scheduleLivenessCheck } from "../tools.ts";
 import { buildResumeArgv, resumeEnv } from "../resume.ts";
@@ -129,6 +131,15 @@ process.env.PI_ORCH_RESUME_GRACE_MS = "300";
 process.env.PI_ORCH_WATCHDOG_POLL_MS = "500";
 // Nor wait 3s per queue-pump tick.
 process.env.PI_ORCH_QUEUE_POLL_MS = "300";
+const jevCalls: string[] = [];
+let jevAnswer: () => Promise<number> = async () => {
+	throw new Error("smoke tests never call the live jev");
+};
+setJevEvaluate(async (state) => {
+	jevCalls.push(state);
+	const probability = await jevAnswer();
+	return { answers: { implementation: { type: "boolean", probability } }, model: "stub", attempts: 1 };
+});
 
 let failures = 0;
 async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
@@ -853,6 +864,355 @@ await test("team_await resolves a relative deliverable against the child's cwd, 
 	assert.match(output, /\| rel-child \| done \| rel-out\.md \| ok \|/);
 	assert.match(output, /\| rel-parent-trap \| GAP \(done, fields missing\) \| [^|]+ \| missing: deliverable \(rel-out\.md unreadable\)/,
 		"a parent-side file with the same relative name must not pass for the child");
+});
+
+await test("extractAnswer: the Answer section capped at 25 lines, else the first 20 lines", async () => {
+	const { extractAnswer } = await import("../answer.ts");
+	const numbered = (n: number, prefix = "a") => Array.from({ length: n }, (_, i) => `${prefix}${i + 1}`);
+	const withSection = extractAnswer(["# Title", "", "## Answer", "", ...numbered(30), "", "## Details", "secret"].join("\n"));
+	assert.equal(withSection.found, true);
+	assert.deepEqual(withSection.lines, numbered(25));
+	assert.equal(withSection.more, 5);
+	const sub = extractAnswer(["## answer", "x", "### sub", "y", "# Next", "z"].join("\n"));
+	assert.deepEqual(sub.lines, ["x", "### sub", "y"], "a ### subheading stays inside; a # heading ends it");
+	const none = extractAnswer(numbered(30, "l").join("\n"));
+	assert.equal(none.found, false);
+	assert.deepEqual(none.lines, numbered(20, "l"));
+	assert.equal(none.more, 10);
+	assert.equal(extractAnswer("## Answers are elsewhere\n## Answer\nok").lines[0], "ok", "## Answers is not ## Answer");
+});
+
+await test("answerBlock: a huge one-line Answer is cut to a character budget with the path kept", async () => {
+	const { ANSWER_BLOCK_MAX_CHARS, answerBlock } = await import("../answer.ts");
+	const huge = join(cwd, "ans-huge.md");
+	writeFileSync(huge, ["# R", "", "## Answer", "", "z".repeat(1_000_000), "", "## Details", "x"].join("\n"));
+	const block = answerBlock("big", huge, cwd);
+	assert.ok(block.length <= ANSWER_BLOCK_MAX_CHARS, `block is ${block.length} chars`);
+	assert.ok(block.startsWith(`### big: ${huge}`));
+	assert.ok(block.includes(`Answer cut at`) && block.includes(`read ${huge} for the rest`));
+	const noSection = join(cwd, "ans-huge-raw.md");
+	writeFileSync(noSection, "q".repeat(2_000_000));
+	const raw = answerBlock("raw", noSection, cwd);
+	assert.ok(raw.length <= ANSWER_BLOCK_MAX_CHARS, `fallback block is ${raw.length} chars`);
+	assert.match(raw, /no '## Answer' section/);
+	assert.ok(raw.startsWith(`### raw: ${noSection}`));
+	const small = join(cwd, "ans-small.md");
+	writeFileSync(small, "## Answer\nshort\n");
+	assert.equal(answerBlock("s", small, cwd), `### s: ${small}\n\nshort`);
+});
+
+await test("team_await returns each done deliverable's Answer section and path, not the whole file", async () => {
+	const numbered = (n: number, prefix: string) => Array.from({ length: n }, (_, i) => `${prefix}${i + 1}`);
+	const yes = join(cwd, "ans-yes.md");
+	const no = join(cwd, "ans-no.md");
+	writeFileSync(yes, ["# Report", "", "## Answer", "", ...numbered(30, "ans"), "", "## Evidence", "SECRET-DETAIL"].join("\n"));
+	writeFileSync(no, numbered(30, "raw").join("\n"));
+	for (const [name, file] of [["ans-yes", yes], ["ans-no", no]] as const) {
+		addAgent(team, {
+			name, role: "worker", parent: "team_lead", task: "t", cwd,
+			canSpawn: false, backend: "headless", paneId: null, visible: false, createdAt: new Date().toISOString(),
+		});
+		writeStatus(team, { agent: name, state: "done", output: file });
+	}
+	addAgent(team, {
+		name: "ans-err", role: "worker", parent: "team_lead", task: "t", cwd,
+		canSpawn: false, backend: "headless", paneId: null, visible: false, createdAt: new Date().toISOString(),
+	});
+	writeStatus(team, { agent: "ans-err", state: "error", output: yes });
+	const output = await call("team_await", { agents: ["ans-yes", "ans-no", "ans-err"], timeoutSeconds: 10 });
+	assert.match(output, new RegExp(`### ans-yes: ${yes.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+	assert.match(output, /\nans1\n/);
+	assert.match(output, /\nans25\n/);
+	assert.ok(!output.includes("ans26"), "the Answer section is capped at 25 lines");
+	assert.match(output, /5 more line\(s\) in the Answer section/);
+	assert.ok(!output.includes("SECRET-DETAIL"), "later sections are not forwarded");
+	assert.match(output, /### ans-no: /);
+	assert.match(output, /\nraw20\n/);
+	assert.ok(!output.includes("raw21"));
+	assert.match(output, /no '## Answer' section; first 20 lines shown, 10 more in the file/);
+	assert.ok(!output.includes("### ans-err"), "only done deliverables get an excerpt");
+});
+
+await test("lead trial: pure arm assignment, eligibility, window and log", async () => {
+	const { appendTrialLog, inheritedModel, isTrialSpawn, leadTrialArm, parseLeadTrial, pickArm, trialActive } = await import("../trial.ts");
+	const { resolveRuntime } = await import("../config.ts");
+	const settings = parseLeadTrial({ enabled: true, until: "2099-01-01" });
+	assert.deepEqual(settings.models, ["anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"]);
+	assert.equal(settings.provider, "vercel-ai-gateway");
+	assert.equal(parseLeadTrial({}).enabled, false, "off unless enabled");
+	assert.equal(trialActive(parseLeadTrial({ enabled: true })), false, "no until, no trial");
+	assert.equal(trialActive(settings, new Date("2098-12-31T12:00:00")), true);
+	assert.equal(trialActive(parseLeadTrial({ enabled: true, until: "2020-01-01" })), false, "expired");
+	const a = pickArm("team-1", "mgr", settings);
+	assert.deepEqual(pickArm("team-1", "mgr", settings), a, "stable for the same team and agent");
+	const arms = new Set<string>();
+	for (let i = 0; i < 40; i++) arms.add(pickArm(`team-${i}`, "mgr", settings).model);
+	assert.equal(arms.size, 2, "both arms are used");
+	assert.equal(a.arm, a.model.split("/").pop());
+	const base = { baseModel: "anthropic/claude-opus-5.5", baseProvider: "vercel-ai-gateway" };
+	assert.equal(isTrialSpawn({ role: "orchestrator", ...base }), true);
+	assert.equal(isTrialSpawn({ role: "worker", ...base }), false, "a resolved worker is untouched, whatever it asked for");
+	assert.equal(isTrialSpawn({ role: "orchestrator", model: "x/y", ...base }), false, "an explicit model wins");
+	assert.equal(isTrialSpawn({ role: "orchestrator", profileModel: "openai/gpt-6.1-sol", ...base }), false, "a profile model wins");
+	assert.equal(isTrialSpawn({ role: "orchestrator", roleOverride: "evaluator", ...base }), false);
+	assert.equal(isTrialSpawn({ role: "orchestrator" }), false, "no pre-trial model to pin descendants to: fail closed");
+	assert.equal(leadTrialArm("t", "n", { role: "orchestrator", ...base }, parseLeadTrial({ enabled: false, until: "2099-01-01" })), undefined);
+	const on = parseLeadTrial({ enabled: true, until: "2099-01-01" });
+	assert.equal(leadTrialArm("t", "n", { role: "orchestrator", ...base }, on, new Date(), "/dev/null/nope/lead-trial.tsv"), undefined,
+		"an unwritable trial log assigns no arm");
+	assert.match(appendTrialLog({ team: "t", agent: "n", arm: "a", model: "m", task: "x" }, "/dev/null/nope/lead-trial.tsv") ?? "", /./,
+		"a failed log write is reported, not swallowed");
+	const arm = leadTrialArm("t", "n", { role: "orchestrator", ...base }, on, new Date(), join(cwd, "trial-writable.tsv"))!;
+	assert.equal(arm.baseModel, base.baseModel);
+	const sonnetOwn = { model: "anthropic/claude-sonnet-5.5", provider: "vercel-ai-gateway" };
+	const childInherit = inheritedModel({ ...arm, model: sonnetOwn.model }, sonnetOwn);
+	assert.deepEqual(childInherit, { model: base.baseModel, provider: base.baseProvider });
+	assert.equal(resolveRuntime({ role: "worker", inherit: childInherit, slim: true }).model, base.baseModel,
+		"a plain worker under a trial orchestrator resolves to the pre-trial model, not the arm");
+	assert.deepEqual(inheritedModel(undefined, sonnetOwn), sonnetOwn, "outside the trial inheritance is unchanged");
+	const log = join(cwd, "trial-unit.tsv");
+	appendTrialLog({ team: "t", agent: "n", arm: "claude-opus-5.5", model: "anthropic/claude-opus-5.5", task: "\n  Run\tthe mission\nsecond line" }, log);
+	appendTrialLog({ team: "t", agent: "m", arm: "x", model: "y", task: "z" }, log);
+	const rows = readFileSync(log, "utf8").trim().split("\n");
+	assert.equal(rows[0], "ts\tteam\tagent\tarm\tmodel\ttask");
+	assert.equal(rows.length, 3, "header once");
+	assert.deepEqual(rows[1]!.split("\t").slice(1), ["t", "n", "claude-opus-5.5", "anthropic/claude-opus-5.5", "Run the mission"]);
+});
+
+await test("lead trial: orchestrator spawns get an arm on the record and in the log; explicit models and workers do not", async () => {
+	const { pickArm, parseLeadTrial, trialLogPath } = await import("../trial.ts");
+	const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+	mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+	const hadSettings = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : null;
+	const trialSettings = {
+		defaultModel: "anthropic/claude-opus-5.5",
+		defaultProvider: "vercel-ai-gateway",
+		leadTrial: { enabled: true, until: "2099-01-01" },
+		team: { profiles: { "pinned-manager": { role: "orchestrator", model: "openai/gpt-6.1-sol", provider: "openai" } } },
+	};
+	writeFileSync(settingsPath, JSON.stringify(trialSettings));
+	rmSync(trialLogPath(), { force: true });
+	const names = ["trial-orch", "trial-mgr", "trial-mgr-flat", "trial-explicit", "trial-worker", "trial-pinned"];
+	try {
+		const spawned = await call("team_spawn", { name: "trial-orch", task: "Run the intake mission\nmore", canSpawn: true });
+		await call("team_spawn", { name: "trial-mgr", task: "Manage a batch", profile: "manager", canSpawn: true });
+		await call("team_spawn", { name: "trial-mgr-flat", task: "Manage a batch", profile: "manager" });
+		await call("team_spawn", { name: "trial-explicit", task: "Pinned", canSpawn: true, model: "openai/gpt-6.1-sol" });
+		await call("team_spawn", { name: "trial-worker", task: "Leaf work" });
+		await call("team_spawn", { name: "trial-pinned", task: "Pinned profile", profile: "pinned-manager", canSpawn: true });
+		const agents = readTeam(team)!.agents;
+		const find = (name: string) => agents.find((a) => a.name === name)!;
+		const expected = {
+			...pickArm(team, "trial-orch", parseLeadTrial({ enabled: true, until: "2099-01-01" }, "vercel-ai-gateway")),
+			baseModel: "anthropic/claude-opus-5.5",
+			baseProvider: "vercel-ai-gateway",
+		};
+		assert.deepEqual(find("trial-orch").trial, expected);
+		assert.equal(find("trial-orch").model, expected.model);
+		assert.equal(find("trial-orch").provider, "vercel-ai-gateway");
+		assert.match(spawned, new RegExp(`Lead trial arm: ${expected.arm.replace(/\./g, "\\.")}`));
+		assert.ok(find("trial-mgr").trial, "a manager that resolves to an orchestrator is a trial spawn");
+		assert.equal(find("trial-mgr-flat").role, "worker");
+		assert.equal(find("trial-mgr-flat").trial, undefined, "a manager profile that resolves to a worker is not");
+		assert.equal(find("trial-explicit").trial, undefined);
+		assert.equal(find("trial-explicit").model, "openai/gpt-6.1-sol");
+		assert.equal(find("trial-worker").trial, undefined);
+		assert.equal(find("trial-pinned").trial, undefined, "a profile that sets its own model is not overridden");
+		assert.equal(find("trial-pinned").model, "openai/gpt-6.1-sol");
+		const states = readAllStatuses(team);
+		const logged = readFileSync(trialLogPath(), "utf8").trim().split("\n").slice(1).map((l) => l.split("\t"));
+		const launched = ["trial-orch", "trial-mgr"].filter((n) => states[n]?.state !== "queued");
+		assert.deepEqual(logged.map((r) => r[2]).sort(), launched.sort(), `one log row per launched trial spawn (states ${JSON.stringify(states)})`);
+		assert.ok(launched.includes("trial-orch"), "trial-orch launched rather than queued");
+		const row = logged.find((r) => r[2] === "trial-orch")!;
+		assert.deepEqual(row.slice(1), [team, "trial-orch", expected.arm, expected.model, "Run the intake mission"]);
+		const before = logged.length;
+		await call("team_recycle", { name: "trial-orch" });
+		const recycled = readTeam(team)!.agents.find((a) => a.name === "trial-orch" && !a.killedAt)!;
+		assert.deepEqual(recycled.trial, expected, "recycle keeps the arm");
+		assert.equal(recycled.model, expected.model);
+		assert.equal(readFileSync(trialLogPath(), "utf8").trim().split("\n").length - 1, before, "recycle is not a new trial row");
+	} finally {
+		for (const name of names) await call("team_force_shutdown", { name });
+		if (hadSettings === null) rmSync(settingsPath, { force: true });
+		else writeFileSync(settingsPath, hadSettings);
+	}
+});
+
+await test("lead trial: eligibility follows the resolved role (1-tier, depth cap, 2-tier promotion)", async () => {
+	const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+	const hadSettings = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : null;
+	const write = (extra: Record<string, unknown>) =>
+		writeFileSync(settingsPath, JSON.stringify({
+			defaultModel: "anthropic/claude-opus-5.5",
+			defaultProvider: "vercel-ai-gateway",
+			leadTrial: { enabled: true, until: "2099-01-01" },
+			...extra,
+		}));
+	const spawned: string[] = [];
+	const spawn = async (name: string, args: Record<string, unknown>) => {
+		spawned.push(name);
+		await call("team_spawn", { name, task: "Coordinate", ...args });
+		return readTeam(team)!.agents.find((a) => a.name === name && !a.killedAt)!;
+	};
+	try {
+		write({ orchestrator: { level: "1-tier" } });
+		const flat = await spawn("trial-flat", { canSpawn: true });
+		assert.equal(flat.role, "worker");
+		assert.equal(flat.trial, undefined, "1-tier flattens the request to a worker, so no arm");
+		write({ team: { maxDepth: 1 } });
+		const capped = await spawn("trial-capped", { canSpawn: true });
+		assert.equal(capped.role, "worker");
+		assert.equal(capped.trial, undefined, "at the depth cap it runs as a worker, so no arm");
+		write({ orchestrator: { level: "2-tier" }, team: { promoteThreshold: 0, maxChildrenPerParent: 50, maxLiveAgents: 50 } });
+		const promoted = await spawn("trial-promoted", {});
+		assert.equal(promoted.role, "orchestrator");
+		assert.ok(promoted.trial, "an ordinary spawn promoted to orchestrator enters the trial");
+	} finally {
+		for (const name of spawned) await call("team_force_shutdown", { name });
+		if (hadSettings === null) rmSync(settingsPath, { force: true });
+		else writeFileSync(settingsPath, hadSettings);
+	}
+});
+
+await test("persona routing: unprofiled workers ask jev, orchestrator and profiled spawns never do", async () => {
+	const agentDir = join(cwd, "persona-agent-dir");
+	mkdirSync(agentDir, { recursive: true });
+	const gw = "vercel-ai-gateway";
+	writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+		aliases: {
+			opus: { model: "anthropic/claude-opus-5.5", provider: gw },
+			sonnet: { model: "anthropic/claude-sonnet-5.5", provider: gw },
+			gpt: { model: "openai/gpt-6.1-sol", provider: gw },
+		},
+		personas: { lead: "sonnet", coder: "opus", reviewer: "gpt", manager: "inherit", "batch-orchestrator": "inherit" },
+		unprofiled: { router: "jev", implementation: "opus", other: "sonnet", fallback: "opus", minConfidence: 0.8, timeoutMs: 3000 },
+		leadTrial: ["gpt"],
+	}));
+	const previousDir = process.env.PI_CODING_AGENT_DIR;
+	const previousAnswer = jevAnswer;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	const sandboxed = homedir().startsWith(tmpdir()) || homedir().startsWith("/tmp/");
+	const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+	const hadSettings = sandboxed && existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : null;
+	if (sandboxed) {
+		mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+		writeFileSync(settingsPath, JSON.stringify({
+			defaultModel: "anthropic/claude-sonnet-5.5",
+			defaultProvider: "vercel-ai-gateway",
+			leadTrial: { enabled: true, until: "2099-01-01" },
+		}));
+	}
+	const names: string[] = [];
+	const spawn = async (name: string, args: Record<string, unknown>, keep = false) => {
+		names.push(name);
+		const output = await call("team_spawn", { name, ...args });
+		const record = readTeam(team)!.agents.find((a) => a.name === name && !a.killedAt)!;
+		if (!keep) await call("team_force_shutdown", { name });
+		return { output, record };
+	};
+	try {
+		jevCalls.length = 0;
+		jevAnswer = async () => 0.02;
+		const other = await spawn("route-other", { task: "Summarise the design doc into a table" }, true);
+		assert.equal(jevCalls.length, 1, "one jev call per unprofiled worker spawn");
+		assert.match(jevCalls[0]!, /Summarise the design doc/, "jev judges the task text");
+		assert.equal(other.record.model, "anthropic/claude-sonnet-5.5", "confident other goes to sonnet");
+		assert.equal(other.record.provider, gw);
+		assert.equal(other.record.routing?.outcome, "other");
+		assert.match(other.output, /Model: anthropic\/claude-sonnet-5\.5 \(jev: other, 0\.98\)/, other.output);
+		assert.match(await call("team_recycle", { name: "route-other" }), /Recycled/);
+		const recycled = readTeam(team)!.agents.find((a) => a.name === "route-other" && !a.killedAt)!;
+		assert.equal(jevCalls.length, 1, "recycle replays the routed model without asking jev again");
+		assert.equal(recycled.model, "anthropic/claude-sonnet-5.5");
+		assert.equal(recycled.routing?.outcome, "other", "recycle keeps the routing on the record");
+		await call("team_force_shutdown", { name: "route-other" });
+
+		jevAnswer = async () => 0.93;
+		const impl = await spawn("route-impl", { task: "Fix the parser bug and open a PR" });
+		assert.equal(impl.record.model, "anthropic/claude-opus-5.5");
+		assert.match(impl.output, /Model: anthropic\/claude-opus-5\.5 \(jev: implementation, 0\.93\)/, impl.output);
+
+		jevAnswer = async () => {
+			throw new Error("Jev: HTTP 503");
+		};
+		const failed = await spawn("route-error", { task: "Look into the flaky test" });
+		assert.equal(failed.record.model, "anthropic/claude-opus-5.5", "a jev error falls back to opus");
+		assert.equal(failed.record.routing?.reason, "error");
+		assert.match(failed.output, /\(jev fallback: error\)/, failed.output);
+
+		jevCalls.length = 0;
+		jevAnswer = async () => 0.02;
+		const orch = await spawn("route-orch", { task: "Coordinate a batch of researchers", canSpawn: true });
+		const mgr = await spawn("route-mgr", { task: "Manage the batch", profile: "manager", canSpawn: true });
+		const coder = await spawn("route-coder", { task: "Summarise the notes", profile: "coder" });
+		const pinned = await spawn("route-pinned", { task: "Summarise", model: "openai/gpt-6.1-sol", provider: gw });
+		assert.equal(jevCalls.length, 0, `orchestrator, profiled and explicit-model spawns never call jev (${jevCalls.length})`);
+		assert.equal(orch.record.role, "orchestrator");
+		assert.equal(orch.record.routing, undefined);
+		assert.equal(mgr.record.routing, undefined);
+		if (sandboxed) {
+			assert.ok(mgr.record.trial, "a manager on an inherit persona still gets a lead trial arm");
+			assert.equal(mgr.record.trial!.model, "openai/gpt-6.1-sol", "the arm comes from models.json leadTrial");
+			assert.equal(coder.record.trial, undefined);
+		}
+		assert.equal(coder.record.model, "anthropic/claude-opus-5.5", "a profiled worker takes its persona");
+		assert.equal(pinned.record.model, "openai/gpt-6.1-sol");
+
+		for (const [name, breakConfig] of [
+			["route-missing", () => rmSync(join(agentDir, "models.json"))],
+			["route-invalid", () => writeFileSync(join(agentDir, "models.json"), "{ invalid")],
+		] as const) {
+			breakConfig();
+			jevCalls.length = 0;
+			const noConfig = await spawn(name, { task: "Implement parser" });
+			assert.equal(jevCalls.length, 0, `${name}: no routing config means no jev call`);
+			assert.equal(noConfig.record.model, "anthropic/claude-opus-5.5", `${name}: an unprofiled worker goes to opus, not the parent's model`);
+			assert.equal(noConfig.record.provider, gw);
+			assert.equal(noConfig.record.routing?.router, "none");
+			assert.equal(noConfig.record.routing?.reason, "no routing config");
+			assert.match(noConfig.output, /Model: anthropic\/claude-opus-5\.5 \(fallback: no routing config\)/, noConfig.output);
+		}
+
+	} finally {
+		for (const name of names) await call("team_force_shutdown", { name });
+		jevAnswer = previousAnswer;
+		if (sandboxed) {
+			if (hadSettings === null) rmSync(settingsPath, { force: true });
+			else writeFileSync(settingsPath, hadSettings);
+		}
+		if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousDir;
+	}
+});
+
+await test("team_verify takes the verifier persona from models.json", async () => {
+	const agentDir = join(cwd, "verify-persona-dir");
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+		aliases: { probe: { model: "probe/verifier-model", provider: "probe-provider" } },
+		personas: { verifier: "probe" },
+	}));
+	const argvLog = join(cwd, "verify-persona-argv.txt");
+	const stub = join(cwd, "verify-persona-stub.sh");
+	writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$@" >> '${argvLog}'\necho '{"verdict":"pass","reason":"ok"}'\n`);
+	chmodSync(stub, 0o755);
+	rmSync(argvLog, { force: true });
+	const previousDir = process.env.PI_CODING_AGENT_DIR;
+	const previousBin = process.env.PI_ORCH_PI_BIN;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_ORCH_PI_BIN = stub;
+	try {
+		await call("team_verify", { finding: "The sky is blue on a clear day.", timeoutSeconds: 20 });
+		const lines = readFileSync(argvLog, "utf8").split("\n");
+		assert.equal(lines[lines.indexOf("--model") + 1], "probe/verifier-model");
+		assert.equal(lines[lines.indexOf("--provider") + 1], "probe-provider");
+		assert.equal(lines[lines.indexOf("--thinking") + 1], "high", "the profile's thinking level still applies");
+	} finally {
+		if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousDir;
+		process.env.PI_ORCH_PI_BIN = previousBin;
+	}
 });
 
 await test("checkDone and absoluteContract: regular files only, controlled errors, paths pinned to the worker cwd", async () => {
@@ -2251,6 +2611,23 @@ await test("write_status records the deliverable", async () => {
 	assert.equal(status.output, out);
 	await call("team_write_status", { state: "done", output: "out.md", note: "relative" });
 	assert.equal(readAllStatuses("smoke-worker-team")["w1"]!.output, out, "a relative output is stored against the worker's cwd");
+});
+
+await test("the first message to the parent after done carries the Answer section and path, once", async () => {
+	const out = join(cwd, "w1-answer.md");
+	writeFileSync(out, ["## Answer", "", "Verdict: ship it.", "Cost: $3.", "", "## Method", "long method text"].join("\n"));
+	drainMailbox("smoke-worker-team", "team_lead");
+	await call("team_write_status", { state: "done", output: out });
+	await call("team_message", { to: "team_lead", content: "Done, see caveats." });
+	const first = drainMailbox("smoke-worker-team", "team_lead");
+	assert.equal(first.length, 1);
+	assert.match(first[0]!.content, /^Done, see caveats\.\n\n### w1: /);
+	assert.ok(first[0]!.content.includes(out));
+	assert.match(first[0]!.content, /Verdict: ship it\.\nCost: \$3\./);
+	assert.ok(!first[0]!.content.includes("long method text"));
+	await call("team_message", { to: "team_lead", content: "one more thing" });
+	const second = drainMailbox("smoke-worker-team", "team_lead");
+	assert.equal(second[0]!.content, "one more thing", "the answer rides along once");
 });
 
 await test("clean exit stays silent, failed exit reports", async () => {

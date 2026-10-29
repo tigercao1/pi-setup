@@ -24,6 +24,7 @@ import {
 	teamRetentionMs,
 } from "./config.ts";
 import { sweepTeams } from "./reap.ts";
+import { inheritedModel } from "./trial.ts";
 import { createRuntime, type Runtime } from "./session.ts";
 import {
 	type Mail,
@@ -32,6 +33,7 @@ import {
 	postMail,
 	readAttention,
 	readStatus,
+	readTeam,
 	watchMailbox,
 	writeStatus,
 } from "./state.ts";
@@ -74,6 +76,10 @@ export default function agentOrchestrator(pi: ExtensionAPI): void {
 		disposeAll();
 		rt.attach(ctx.cwd, { hasUI: ctx.hasUI });
 		if (ctx.model) rt.ownModel = { model: ctx.model.id, provider: ctx.model.provider };
+		if (rt.team && !rt.isLead) {
+			const own = readTeam(rt.team)?.agents.find((a) => a.name === rt.me && !a.killedAt);
+			rt.ownModel = inheritedModel(own?.trial, rt.ownModel);
+		}
 		rt.ownSessionId = ctx.sessionManager?.getSessionId?.() ?? undefined;
 		startMailbox(rt);
 		if (rt.canSpawn) {

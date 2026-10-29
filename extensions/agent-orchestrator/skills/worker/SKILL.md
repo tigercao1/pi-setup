@@ -26,9 +26,13 @@ Call `team_write_status` at meaningful checkpoints only:
 
 ## 4. Completion protocol — all three steps, in order
 
-1. Write the deliverable to `outputPath`.
+1. Write the deliverable to `outputPath`. It starts with a `## Answer` section: the result in at
+   most ~25 lines (verdict, numbers, decisions, paths), written so your parent can act on it without
+   opening the rest. Details, evidence and method go in later sections.
 2. `team_write_status(state: "done", output: "<path>")`.
-3. `team_message` your parent: what you did, what you produced, any caveats.
+3. `team_message` your parent: what you did, any caveats. Keep it short: your `## Answer` section
+   and the path are attached to this first message after `done` automatically, and `team_await`
+   returns the same section. A deliverable without one reaches your parent as its first 20 lines.
 
 Never skip step 3. Your parent cannot act on work it does not know is finished.
 

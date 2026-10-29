@@ -31,6 +31,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ensureDir, readJson, sleepSync, writeAtomic } from "../_shared/fsjson.ts";
+import type { SpawnRouting } from "./route.ts";
 import {
 	drainEnvelopes,
 	postEnvelope,
@@ -80,6 +81,8 @@ export interface AgentRecord {
 	argv?: string[];
 	gate?: { state: string; spawnId: string };
 	gateExempt?: string;
+	trial?: { arm: string; model: string; provider: string; until?: string; baseModel?: string; baseProvider?: string };
+	routing?: SpawnRouting;
 }
 
 export interface TeamConfig {
