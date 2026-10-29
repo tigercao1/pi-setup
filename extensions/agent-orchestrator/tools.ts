@@ -57,7 +57,7 @@ import { runSkeptics, SKEPTIC_LABEL } from "./verify.ts";
 import { type CapHit, claim, countCapHit, countLive, enqueue, holdsSlot, listQueue, queuePosition } from "./caps.ts";
 import { ensureDir } from "../_shared/fsjson.ts";
 import { absoluteContract, checkDone, invalidRequiredFields, missingFields, normalisePath } from "./contract.ts";
-import { type GateReservation, gateShapeError, gateTrigger, runGate } from "./gate.ts";
+import { type GateReservation, gateInstalled, gateScript, gateShapeError, gateTrigger, runGate } from "./gate.ts";
 import { askLine, askWithRetry, dismissAsks, finishAsk, isOwed, runAsk, startAsk, visibleAsks } from "./ask.ts";
 import {
 	type AgentRecord,
@@ -253,7 +253,7 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 							description:
 								"PR review gate reservation. team_spawn runs `pr-gate-spawn.sh verify` (the reservation exists, is for the " +
 								"PR's recorded head, has no verdict and is not bound to another agent), then `bind` to record this agent " +
-								"on it, and refuses the spawn otherwise. Required, unless gateExempt is given, for a gate-lane spawn: " +
+								"on it, and refuses the spawn otherwise. Required, unless gateExempt is given or pr-gate-spawn.sh is not installed, for a gate-lane spawn: " +
 								"any profiled spawn whose effective skills (profile skills from the built-in profile and settings team.profiles, " +
 								"plus explicit skills and team.defaultSkills) include 'pr-approval-review', which covers every 'code-review' " +
 								"and 'reviewer' spawn; or a 'code-review'/'reviewer' task that mentions 'pr-review-gate' or 'gate lane'. " +
@@ -264,7 +264,7 @@ export function registerTools(pi: ExtensionAPI, rt: Runtime): void {
 				gateExempt: Type.Optional(
 					Type.String({
 						description:
-							"Reason a gate-shaped spawn (see gate) runs outside the PR review gate, e.g. 'review requested by Tiger' for a " +
+							"Reason a gate-shaped spawn (see gate) runs outside the PR review gate, e.g. 'review requested by the user' for a " +
 							"review the user asked for directly, or 'ledger trail review'. Stored on the agent record and replayed by " +
 							"team_recycle. Use gate instead for pr-review-gate lanes.",
 					}),
@@ -1243,9 +1243,15 @@ function trySpawn(rt: Runtime, params: SpawnParams): SpawnOutcome {
 	if (!params.task?.trim()) return refuse("Refusing to spawn: task is empty.");
 	const gateExempt = typeof params.gateExempt === "string" ? params.gateExempt.trim() : "";
 	if (params.gate) {
+		if (!gateInstalled()) {
+			return refuse(
+				`Refused to spawn '${params.name}': gate was given but the PR review gate is not installed ` +
+					`(${gateScript()} is missing). Drop gate, or pass gateExempt.`,
+			);
+		}
 		const shape = gateShapeError(params.gate);
 		if (shape) return refuse(`Refused to spawn '${params.name}': ${shape}.`);
-	} else if (!gateExempt) {
+	} else if (!gateExempt && gateInstalled()) {
 		const trigger = gateTrigger(params.profile, params.skills, params.task);
 		if (trigger) {
 			return refuse(

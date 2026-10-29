@@ -1308,6 +1308,32 @@ await test("gate: a gate-lane reviewer spawn without gate or gateExempt is refus
 	for (const name of ["gate-none-a", "gate-none-b", "gate-none-c"]) assert.ok(noRecord(name), `${name} left a record`);
 });
 
+await test("gate: without the gate script, gate-shaped spawns are not enforced and a gate param is refused cleanly", async () => {
+	const saved = process.env.PI_ORCH_GATE_SCRIPT;
+	process.env.PI_ORCH_GATE_SCRIPT = join(cwd, "no-such-gate.sh");
+	try {
+		const open = await call("team_spawn", {
+			name: "gate-absent-a",
+			task: "Review PR 12 at its head",
+			profile: "code-review",
+			skills: ["pr-approval-review"],
+		});
+		assert.ok(!/Refused to spawn/.test(open), open);
+		const withGate = await call("team_spawn", {
+			name: "gate-absent-b",
+			task: "pr-review-gate approval lane for PR 12",
+			profile: "code-review",
+			gate: { state: gateState, spawnId: "S1-approval" },
+		});
+		assert.match(withGate, /Refused to spawn 'gate-absent-b': gate was given but the PR review gate is not installed/);
+		assert.ok(noRecord("gate-absent-b"));
+	} finally {
+		if (saved === undefined) delete process.env.PI_ORCH_GATE_SCRIPT;
+		else process.env.PI_ORCH_GATE_SCRIPT = saved;
+	}
+	await call("team_force_shutdown", { name: "gate-absent-a" });
+});
+
 await test("gate: a bad, stale, consumed or reused reservation is refused", async () => {
 	const base = { task: "pr-review-gate approval lane for PR 12", profile: "code-review" };
 	assert.match(
