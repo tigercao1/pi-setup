@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -13,19 +13,23 @@ const execFileAsync = promisify(execFile);
 // WT_BIN wins, then the copy shipped alongside this extension, then PATH.
 // The bundled copy is what makes the extension work on a fresh checkout: a bare
 // PATH lookup only resolves for someone who installed the script by hand.
-function resolveWt(): string | undefined {
+type WtCommand = { file: string; args: string[] };
+
+function resolveWt(): WtCommand | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bundled = [join(here, "bin", "wt"), join(here, "..", "..", "bin", "wt")];
   const pathDirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
   const candidates = [
     process.env.WT_BIN,
-    join(dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "wt"),
+    ...bundled,
     ...pathDirs.map((dir) => join(dir, "wt")),
   ].filter((c): c is string => !!c);
   for (const candidate of candidates) {
     try {
       accessSync(candidate, constants.X_OK);
-      return candidate;
+      return { file: candidate, args: [] };
     } catch {
-      // next candidate
+      if (bundled.includes(candidate) && existsSync(candidate)) return { file: "bash", args: [candidate] };
     }
   }
   return undefined;
@@ -62,7 +66,7 @@ type RunResult = { ok: true; stdout: string } | { ok: false; error: string };
 async function run(args: string[], cwd: string, timeoutMs = 300_000): Promise<RunResult> {
   if (!WT) return { ok: false, error: "wt not found" };
   try {
-    const { stdout } = await execFileAsync(WT, args, {
+    const { stdout } = await execFileAsync(WT.file, [...WT.args, ...args], {
       cwd,
       timeout: timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
@@ -72,7 +76,7 @@ async function run(args: string[], cwd: string, timeoutMs = 300_000): Promise<Ru
   } catch (err) {
     const e = err as { stderr?: string; stdout?: string; message?: string; code?: string };
     if (e.code === "ENOENT") {
-      return { ok: false, error: `${WT} not found on PATH` };
+      return { ok: false, error: `${WT.args[0] ?? WT.file} not found on PATH` };
     }
     const detail = (e.stderr || e.stdout || e.message || "").trim();
     return { ok: false, error: detail || "wt failed" };
