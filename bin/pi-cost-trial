@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""pi-cost-trial: the Sonnet-vs-Opus lead orchestration trial, grouped by arm.
+
+Reads the trial log (~/.pi/agent/run/lead-trial.tsv, written by agent-orchestrator when settings
+`leadTrial` is on), the agent records in ~/.pi/orchestrator-teams/*/config.json and archive/agents.jsonl,
+and pi-cost's deduplicated call ledger. Read-only apart from --out.
+
+  pi-cost-trial [--since 14d | --since 2026-10-22] [--until ISO] [--log PATH] [--no-gh] [--json] [--out PATH]
+
+Per trial agent: its own cost, the cost of its whole subtree (itself plus every descendant in its team),
+the models its calls actually used, tickets its subtree touched, merged PRs attributable to it (a merged
+PR whose ticket the subtree touched, or whose number a subtree gate state file names), and gate rounds
+and reviewer spawns read from the gate state files the subtree's gate lanes were bound to.
+Per arm: totals, means, and subtree cost per attributable merged PR.
+
+Cohort: the trial agents enrolled (log row, or an agent record carrying a `trial` arm whose log row is
+missing) inside [--since, --until). Their costs are their calls from enrollment up to --until. A subtree
+stops at any other trial agent inside it, so each call is charged to its nearest trial ancestor and the
+arm totals are disjoint; the cost including nested trial subtrees is shown separately.
+"""
+import argparse
+import collections
+import datetime as dt
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+_loader = importlib.machinery.SourceFileLoader("pi_cost_for_trial", os.path.join(HERE, "pi-cost"))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+pc = importlib.util.module_from_spec(_spec)
+_loader.exec_module(pc)
+
+TRIAL_LOG = os.environ.get("PI_LEAD_TRIAL_LOG") or os.path.join(pc.AGENT_DIR, "run", "lead-trial.tsv")
+
+
+def read_trial_log(path):
+    rows = []
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return rows
+    with fh:
+        header = None
+        for line in fh:
+            cells = line.rstrip("\n").split("\t")
+            if header is None:
+                header = cells
+                continue
+            if len(cells) < len(header):
+                continue
+            rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def load_records(teams_dir=None):
+    teams_dir = teams_dir or pc.TEAMS_DIR
+    records = {}
+    for path in sorted(glob.glob(os.path.join(teams_dir, "*", "archive", "agents.jsonl"))):
+        team = path.split(os.sep)[-3]
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    a = json.loads(line)
+                except ValueError:
+                    continue
+                if a.get("name"):
+                    records[(team, a["name"])] = a
+    for path in sorted(glob.glob(os.path.join(teams_dir, "*", "config.json"))):
+        team = path.split(os.sep)[-2]
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for a in cfg.get("agents") or []:
+            if a.get("name"):
+                merged = dict(records.get((team, a["name"])) or {})
+                merged.update({k: v for k, v in a.items() if v is not None})
+                records[(team, a["name"])] = merged
+    return records
+
+
+def subtree(team, root, records, stop=frozenset()):
+    children = collections.defaultdict(list)
+    for (t, name), rec in records.items():
+        if t == team and rec.get("parent"):
+            children[rec["parent"]].append(name)
+    out, stack = [], [root]
+    while stack:
+        name = stack.pop()
+        if name in out:
+            continue
+        if name != root and (team, name) in stop:
+            continue
+        out.append(name)
+        stack.extend(children.get(name, []))
+    return out
+
+
+def enrollments(rows, records):
+    out, seen = [], set()
+    for row in rows:
+        key = (row.get("team"), row.get("agent"))
+        if key in seen or not all(key):
+            continue
+        seen.add(key)
+        out.append(dict(row, logged=True))
+    for (team, name), rec in sorted(records.items()):
+        trial = rec.get("trial")
+        if not isinstance(trial, dict) or (team, name) in seen:
+            continue
+        seen.add((team, name))
+        out.append({"ts": rec.get("createdAt") or "", "team": team, "agent": name, "arm": trial.get("arm"),
+                    "model": trial.get("model"), "task": (rec.get("task") or "").strip().split("\n")[0][:200],
+                    "logged": False})
+    return out
+
+
+def _ts(value):
+    try:
+        return pc.parse_ts(value) if value else None
+    except (ValueError, TypeError):
+        return None
+
+
+def read_gate(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            g = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+    return {"path": path, "pr": str(g.get("pr")) if g.get("pr") is not None else None,
+            "rounds": g.get("rounds") or 0, "spawns": g.get("spawns") or 0}
+
+
+def trial_report(rows, calls, records, prs=None, since=None, until=None):
+    by_agent = collections.defaultdict(list)
+    for c in calls:
+        if c.get("team") and c.get("name"):
+            by_agent[(c["team"], c["name"])].append(c)
+    enrolled = enrollments(rows, records)
+    roots = frozenset((e["team"], e["agent"]) for e in enrolled)
+    cohort, excluded = [], {"before": 0, "after": 0}
+    for e in enrolled:
+        start = _ts(e.get("ts"))
+        if since is not None and (start is None or start < since):
+            excluded["before"] += 1
+        elif until is not None and start is not None and start >= until:
+            excluded["after"] += 1
+        else:
+            cohort.append((e, start))
+
+    def window(cs, start):
+        kept = []
+        for c in cs:
+            t = _ts(c.get("ts"))
+            if t is not None and ((start is not None and t < start) or (until is not None and t >= until)):
+                continue
+            kept.append(c)
+        return kept
+
+    pr_by_ticket = collections.defaultdict(set)
+    pr_numbers = set()
+    for p in prs or []:
+        pr_numbers.add(str(p.get("number")))
+        if p.get("ticket"):
+            pr_by_ticket[p["ticket"]].add(str(p.get("number")))
+    agents = []
+    for row, start in cohort:
+        key = (row.get("team"), row.get("agent"))
+        team, name = key
+        members = subtree(team, name, records, stop=roots)
+        inclusive = subtree(team, name, records)
+        nested = sorted(m for m in inclusive if m != name and (team, m) in roots)
+        own = window(by_agent.get(key, []), start)
+        sub = [c for m in members for c in window(by_agent.get((team, m), []), start)]
+        sub_inclusive = [c for m in inclusive for c in window(by_agent.get((team, m), []), start)]
+        tickets = sorted({c["ticket"] for c in sub if c.get("ticket")})
+        gates = {}
+        for m in members:
+            gate = (records.get((team, m)) or {}).get("gate") or {}
+            if gate.get("state") and gate["state"] not in gates:
+                g = read_gate(gate["state"])
+                if g:
+                    gates[gate["state"]] = g
+        merged = set()
+        if prs is not None:
+            for t in tickets:
+                merged |= pr_by_ticket.get(t, set())
+            merged |= {g["pr"] for g in gates.values() if g["pr"] in pr_numbers}
+        agents.append({
+            "team": team, "agent": name, "arm": row.get("arm"), "model": row.get("model"),
+            "task": row.get("task"), "ts": row.get("ts"), "logged": row.get("logged", True),
+            "own_cost": sum(c["cost"] for c in own), "own_calls": len(own),
+            "subtree_cost": sum(c["cost"] for c in sub), "subtree_agents": len(members),
+            "subtree_cost_inclusive": sum(c["cost"] for c in sub_inclusive), "nested_trial_agents": nested,
+            "models_used": sorted({c.get("model") for c in own if c.get("model")}),
+            "tickets": tickets, "merged_prs": sorted(merged) if prs is not None else None,
+            "gate_prs": sorted({g["pr"] for g in gates.values() if g["pr"]}),
+            "gate_rounds": sum(g["rounds"] for g in gates.values()),
+            "gate_spawns": sum(g["spawns"] for g in gates.values()),
+            "arm_mismatch": bool(own) and row.get("model") not in {c.get("model") for c in own},
+        })
+    arms = {}
+    for a in agents:
+        s = arms.setdefault(a["arm"], {"arm": a["arm"], "model": a["model"], "agents": 0, "own_cost": 0.0,
+                                       "subtree_cost": 0.0, "merged_prs": set(), "gate_rounds": 0, "gate_prs": set()})
+        s["agents"] += 1
+        s["own_cost"] += a["own_cost"]
+        s["subtree_cost"] += a["subtree_cost"]
+        s["merged_prs"] |= set(a["merged_prs"] or [])
+        s["gate_rounds"] += a["gate_rounds"]
+        s["gate_prs"] |= set(a["gate_prs"])
+    for s in arms.values():
+        n = s["agents"]
+        s["mean_own_cost"] = s["own_cost"] / n if n else 0.0
+        s["mean_subtree_cost"] = s["subtree_cost"] / n if n else 0.0
+        s["merged_prs"] = sorted(s["merged_prs"])
+        s["cost_per_merged_pr"] = s["subtree_cost"] / len(s["merged_prs"]) if s["merged_prs"] else None
+        s["gate_prs"] = sorted(s["gate_prs"])
+        s["rounds_per_gated_pr"] = s["gate_rounds"] / len(s["gate_prs"]) if s["gate_prs"] else None
+    return {"agents": agents, "arms": sorted(arms.values(), key=lambda s: s["arm"] or ""),
+            "excluded": excluded, "unlogged": [a["agent"] for a in agents if not a["logged"]]}
+
+
+def render(report, since, until, log_path, pr_source):
+    m = pc.money
+    out = ["# Lead orchestration trial, %s to %s" % (since.date().isoformat(), until.date().isoformat()), "",
+           "Trial log: `%s`. Merged PRs: %s." % (log_path, pr_source), "",
+           "Cohort: trial agents enrolled in this window; costs are their calls from enrollment to the window end. "
+           "Subtree cost stops at nested trial agents, so arm totals are disjoint.", ""]
+    excluded = report.get("excluded") or {}
+    if excluded.get("before") or excluded.get("after"):
+        out += ["Outside the window and not counted: %d enrolled before, %d after." % (
+            excluded.get("before", 0), excluded.get("after", 0)), ""]
+    if report.get("unlogged"):
+        out += ["WARNING: %d trial agent(s) have an arm on their record but no trial log row: %s." % (
+            len(report["unlogged"]), ", ".join(report["unlogged"])), ""]
+    out += ["## By arm", ""]
+    out.append(pc.table(
+        ["arm", "model", "agents", "own cost", "mean own", "subtree cost", "mean subtree", "merged PRs",
+         "cost / merged PR", "gate rounds / gated PR"],
+        [[s["arm"], s["model"], s["agents"], m(s["own_cost"]), m(s["mean_own_cost"]), m(s["subtree_cost"]),
+          m(s["mean_subtree_cost"]), len(s["merged_prs"]),
+          m(s["cost_per_merged_pr"]) if s["cost_per_merged_pr"] is not None else "n/a",
+          "%.1f" % s["rounds_per_gated_pr"] if s["rounds_per_gated_pr"] is not None else "n/a"]
+         for s in report["arms"]]))
+    out += ["", "## By agent", ""]
+    out.append(pc.table(
+        ["team", "agent", "arm", "own cost", "subtree cost", "incl. nested trials", "agents", "models used",
+         "merged PRs", "gate rounds", "task"],
+        [[a["team"], a["agent"], (a["arm"] or "") + (" (MISMATCH)" if a["arm_mismatch"] else "") + ("" if a["logged"] else " (UNLOGGED)"),
+          m(a["own_cost"]), m(a["subtree_cost"]),
+          m(a["subtree_cost_inclusive"]) + (" (%s)" % ", ".join(a["nested_trial_agents"]) if a["nested_trial_agents"] else ""),
+          a["subtree_agents"], ", ".join(a["models_used"]) or "-",
+          ", ".join(a["merged_prs"]) if a["merged_prs"] else ("-" if a["merged_prs"] is not None else "n/a"),
+          a["gate_rounds"], (a["task"] or "")[:60]]
+         for a in report["agents"]]))
+    out.append("")
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="pi-cost-trial", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--since", default=None)
+    ap.add_argument("--until", default=None)
+    ap.add_argument("--log", default=TRIAL_LOG)
+    ap.add_argument("--no-gh", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args(argv)
+    rows = read_trial_log(args.log)
+    now = dt.datetime.now(dt.timezone.utc)
+    until = pc.parse_since(args.until, now) if args.until else now
+    records = load_records()
+    starts = [t for t in (_ts(e.get("ts")) for e in enrollments(rows, records)) if t is not None]
+    if args.since:
+        since = pc.parse_since(args.since, until)
+    elif starts:
+        since = min(starts)
+    else:
+        since = pc.parse_since("14d", until)
+    if not rows:
+        sys.stderr.write("no trial rows in %s\n" % args.log)
+    ledger = pc.build_ledger(since, until, router=None, pricing=None)
+    prs, pr_source = (None, "skipped (--no-gh)") if args.no_gh else pc.gh_merged_prs(since, until)
+    report = trial_report(rows, ledger["calls"], records, prs, since=since, until=until)
+    text = json.dumps(report, indent=1, default=str) if args.json else render(report, since, until, args.log, pr_source)
+    if args.out:
+        pc.write_text(args.out, text)
+        print("wrote %s" % args.out)
+    else:
+        sys.stdout.write(text + ("\n" if not text.endswith("\n") else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

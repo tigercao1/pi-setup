@@ -25,8 +25,33 @@ from contextlib import contextmanager
 LANES = ("approval", "convention", "necessity", "blast-radius")
 OPUS_LANE = "approval-opus"
 ALL_LANES = LANES + (OPUS_LANE,)
-PRIMARY_MODEL = "openai/gpt-6.1-sol"
-OPUS_MODEL = "anthropic/claude-opus-5.5"
+
+
+def load_pi_models():
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "pi_models", os.path.join(os.path.dirname(os.path.realpath(__file__)), "pi_models.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:
+        print(f"warning: persona models unavailable ({exc}); using the built-in gate models", file=sys.stderr)
+        return None
+
+
+PI_MODELS = load_pi_models()
+
+
+def persona_model(persona, fallback):
+    try:
+        return PI_MODELS.persona_model(persona, fallback) if PI_MODELS else fallback
+    except Exception as exc:
+        print(f"warning: persona {persona} unreadable ({exc}); using {fallback}", file=sys.stderr)
+        return fallback
+
+
+PRIMARY_MODEL = persona_model("code-review", "openai/gpt-6.1-sol")
+OPUS_MODEL = persona_model("gate-approval-second", "anthropic/claude-opus-5.5")
 DEFAULT_BUDGET = {"rounds": 3, "spawns": 12}
 JEV_SKIP_MASS = 0.8
 D8_ADDED_LINES = 40
@@ -560,13 +585,35 @@ def close_pending(state):
     pend["closed"] = now()
 
 
+SELF_LOGINS = set(filter(None, os.environ.get("PI_GATE_SELF_LOGINS", "tigercao1").split(",")))
+
+
+def author_mode(args):
+    mode = getattr(args, "author_mode", "auto")
+    if mode != "auto":
+        return mode
+    if not args.pr:
+        return "self"
+    proc = subprocess.run(["gh", "pr", "view", str(args.pr), "--json", "author", "-q", ".author.login"],
+                          cwd=args.repo, capture_output=True, text=True)
+    login = proc.stdout.strip()
+    if proc.returncode != 0 or not login:
+        return "self"
+    return "self" if login in SELF_LOGINS else "peer"
+
+
 def run_step0(cfg, args, head):
+    args.mode = author_mode(args)
     results = cfg.step0(args.repo, args.base, head, args.pr, args.body_file, args.no_ci)
     for r in results:
         print(f"── step 0: {r['name']} → {'ok' if r['rc'] == 0 else 'FAIL'}", file=sys.stderr)
         if r["rc"] != 0:
             print(r["output"].rstrip(), file=sys.stderr)
     failed = [r["name"] for r in results if r["rc"] != 0]
+    args.advisory = failed if args.mode == "peer" else []
+    if failed and args.mode == "peer":
+        print(f"step 0 is advisory on someone else's PR: {failed}", file=sys.stderr)
+        return True
     if failed:
         print(json.dumps({"step0": "FAIL", "failed": failed,
                           "action": "back to the author; no reviewer is spawned"}, indent=2))
@@ -667,7 +714,8 @@ def cmd_lanes(args):
             open_pending(state, head, snap, fp, selected, "lanes")
         box["dirty"] = True
         counters = {"rounds": state["rounds"], "spawns": state["spawns"]}
-    print(json.dumps({"step0": "skipped" if args.no_step0 else "ok", "lanes": selected,
+    print(json.dumps({"step0": "skipped" if args.no_step0 else ("advisory" if getattr(args, "advisory", None) else "ok"),
+                      "author_mode": getattr(args, "mode", "unknown"), "advisory_findings": getattr(args, "advisory", []), "lanes": selected,
                       "reasons": reasons, "reach": reach, "selection": action, "counters": counters,
                       "scope": "whole PR (base...head)", "state": path}, indent=2))
     return 0
@@ -934,6 +982,7 @@ def main(argv):
     common(delta)
     for p in (lanes, delta):
         p.add_argument("--no-step0", action="store_true")
+        p.add_argument("--author-mode", choices=["auto", "self", "peer"], default="auto")
         p.add_argument("--no-ci", action="store_true")
     spawn = sub.add_parser("spawn")
     spawn.add_argument("action", choices=["check", "record", "verify", "bind", "grant", "resolve", "status"])
