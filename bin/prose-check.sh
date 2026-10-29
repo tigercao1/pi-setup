@@ -73,7 +73,7 @@ def score(key: str, batch: list[str]) -> dict[str, float]:
         f"S{i}: {s}" for i, s in enumerate(batch)
     )
     payload = {
-        "model": "typesafe-ai/jev",
+        "model": "typesafe-ai/jev-1.14.0",
         "state": state,
         "questions": {f"S{i}": {"type": "boolean", "instructions": f"S{i}: {QUESTION}"} for i in range(len(batch))},
     }

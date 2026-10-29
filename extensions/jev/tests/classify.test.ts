@@ -150,7 +150,7 @@ console.log("\nledger entry");
 		thresholds: DEFAULT_THRESHOLDS,
 		rubricVersion: RUBRIC_VERSION,
 		rubricDigest: RUBRIC_DIGEST,
-		model: "typesafe-ai/jev",
+		model: "typesafe-ai/jev-1.14.0",
 		usage: { inputTokens: 600, outputTokens: 40 },
 	};
 	const entry = ledgerEntry(sample, "ABC-1");

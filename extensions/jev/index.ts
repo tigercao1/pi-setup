@@ -54,7 +54,7 @@ const JevParams = Type.Object({
 	}),
 	model: Type.Optional(
 		Type.String({
-			description: "Override the evaluation model, as a vercel-ai-gateway model id. Default typesafe-ai/jev.",
+			description: "Override the evaluation model, as a vercel-ai-gateway model id. Default typesafe-ai/jev-1.14.0.",
 		}),
 	),
 });

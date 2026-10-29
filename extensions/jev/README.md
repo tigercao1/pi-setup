@@ -122,7 +122,7 @@ pins the digest, so an accidental rung edit fails loudly; when the rubric change
 
 | | |
 |---|---|
-| Model | `typesafe-ai/jev` |
+| Model | `typesafe-ai/jev-1.14.0` |
 | Endpoint | `POST https://ai-gateway.vercel.sh/v1/evaluate` (`client.ts`; the built-in API uses the registry's own gateway transport) |
 | Context | 32000 tokens (`MAX_STATE_CHARS` refuses at 100k chars first) |
 | Pricing | input `$0.042/M`, **output free** |
