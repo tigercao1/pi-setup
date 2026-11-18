@@ -432,13 +432,13 @@ export function settingsDirs(key: "skills" | "extensions"): string[] {
 	}
 }
 
-/** `name` -> path under the agent dir's extensions or a settings `extensions` directory, or an absolute path as-is. */
+/** `name` -> path under the agent dir's extensions, a settings `extensions` directory or this extension's siblings, or an absolute path as-is. */
 export function resolveExtensionPath(name: string): string | null {
 	if (isAbsolute(name) || name.startsWith(".")) {
 		const path = resolve(name);
 		return existsSync(path) ? path : null;
 	}
-	for (const root of [join(agentDir(), "extensions"), ...settingsDirs("extensions")]) {
+	for (const root of [join(agentDir(), "extensions"), ...settingsDirs("extensions"), dirname(EXT_DIR)]) {
 		const base = join(root, name);
 		for (const candidate of [join(base, "index.ts"), `${base}.ts`, base]) {
 			if (existsSync(candidate)) return candidate;
@@ -461,6 +461,7 @@ export function resolveSkillPath(name: string, cwd: string): string | null {
 		...projectSkillRoots(cwd),
 		join(agentDir(), "skills"),
 		...settingsDirs("skills"),
+		resolve(EXT_DIR, "..", "..", "skills"),
 		join(homedir(), ".agents", "skills"),
 		join(homedir(), ".claude", "skills"),
 	];

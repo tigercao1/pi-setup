@@ -19,7 +19,7 @@ orchestrator workers (`PI_ORCH_AGENT_NAME`, `PI_ORCH_TEAM_NAME`, `PI_ORCH_AGENT_
 
 ## /fresh
 
-1. Waits for any running turn, then runs `pi-pause-facts` (`~/.pi/agent/bin/pi-pause-facts`) with
+1. Waits for any running turn, then runs `pi-pause-facts` (see "Where it finds its helpers") with
    this session's id, file, pid and context size.
 2. Sends the agent one message: finish the current step, follow recall's Pause section with these
    facts copied verbatim, and end with `RESUME: <absolute path>`.
@@ -54,8 +54,17 @@ stderr.
 }
 ```
 
-All keys are optional; the values above are the defaults. `suggestTokens` below `warnTokens` is
+All keys are optional; the values above are the defaults, except that `factsScript` defaults to the
+first helper found as described below. `suggestTokens` below `warnTokens` is
 raised to `warnTokens`.
+
+## Where it finds its helpers
+
+`pi-pause-facts` is looked up at `bin/pi-pause-facts` two levels above this extension (inside the
+package when installed as one), then at `~/.pi/agent/bin/pi-pause-facts`; `factsScript` overrides
+both. The recall skill it points the agent at is found the same way: `skills/recall/SKILL.md` in the
+package, then `~/.pi/agent/skills/recall/SKILL.md`. A script that lost its exec bit is run through
+the interpreter on its shebang line.
 
 ## Tests
 

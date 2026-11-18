@@ -44,8 +44,14 @@ export function gateTrigger(profile: string | undefined, skills: string[] | unde
 }
 
 export function gateScript(): string {
+	if (process.env.PI_ORCH_GATE_SCRIPT) return process.env.PI_ORCH_GATE_SCRIPT;
 	const local = join(EXT_DIR, "..", "..", "bin", "pr-gate-spawn.sh");
 	return existsSync(local) ? local : join(homedir(), ".pi", "agent", "bin", "pr-gate-spawn.sh");
+}
+
+/** The gate is optional: without its script, gate-shaped spawns are not enforced. */
+export function gateInstalled(): boolean {
+	return existsSync(gateScript());
 }
 
 export function gateShapeError(gate: unknown): string | null {

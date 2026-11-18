@@ -1,0 +1,617 @@
+#!/usr/bin/env node
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { spawn, execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const HERE = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const ROOT = path.resolve(process.env.SHOW_ME_LIVE_ROOT || path.join(os.homedir(), "Documents/knowledge-base-remote"));
+const PAGE_PORT = Number(process.env.SHOW_ME_LIVE_PORT || 4848);
+const AG_PORT = Number(process.env.AGENTATION_PORT || 4747);
+const AG = `http://localhost:${AG_PORT}`;
+const PAGES = `http://localhost:${PAGE_PORT}`;
+const RUN = path.resolve(process.env.SHOW_ME_LIVE_RUN || path.join(os.homedir(), ".pi/agent/run/show-me-live"));
+const HIST = path.join(RUN, "history");
+const REVIEW = path.join(HERE, "src/review.html");
+const MAX_SNAP = 5 * 1024 * 1024;
+const TOOLBAR = path.join(HERE, "dist/toolbar.js");
+const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".json": "application/json", ".md": "text/plain; charset=utf-8", ".txt": "text/plain; charset=utf-8" };
+
+const die = (msg) => { console.error(`show-me-live: ${msg}`); process.exit(1); };
+const out = (v) => console.log(typeof v === "string" ? v : JSON.stringify(v, null, 2));
+
+async function up(url) {
+  try { const r = await fetch(url, { signal: AbortSignal.timeout(800) }); return r.ok; } catch { return false; }
+}
+
+function launch(name, cmd, args) {
+  fs.mkdirSync(RUN, { recursive: true });
+  const log = fs.openSync(path.join(RUN, `${name}.log`), "a");
+  const child = spawn(cmd, args, { detached: true, stdio: ["ignore", log, log], cwd: HERE });
+  fs.writeFileSync(path.join(RUN, `${name}.pid`), String(child.pid));
+  child.unref();
+}
+
+async function waitUp(url, label) {
+  for (let i = 0; i < 40; i++) { if (await up(url)) return; await new Promise((r) => setTimeout(r, 250)); }
+  die(`${label} did not start; see ${RUN}`);
+}
+
+async function start() {
+  if (!fs.existsSync(TOOLBAR)) die(`missing ${TOOLBAR}; run 'npm run build' in ${HERE}`);
+  if (!(await up(`${AG}/health`))) {
+    launch("agentation", process.execPath, [path.join(HERE, "node_modules/agentation-mcp/dist/cli.js"), "server", "--port", String(AG_PORT)]);
+    await waitUp(`${AG}/health`, "agentation server");
+  }
+  if (!(await up(`${PAGES}/__live/health`))) {
+    launch("pages", process.execPath, [fileURLToPath(import.meta.url), "serve"]);
+    await waitUp(`${PAGES}/__live/health`, "page server");
+  }
+}
+
+function stop() {
+  for (const name of ["pages", "agentation"]) {
+    const f = path.join(RUN, `${name}.pid`);
+    if (!fs.existsSync(f)) continue;
+    try { process.kill(Number(fs.readFileSync(f, "utf8")), "SIGTERM"); console.log(`stopped ${name}`); } catch { console.log(`${name} was not running`); }
+    fs.rmSync(f);
+  }
+}
+
+function fileToUrl(file) {
+  const abs = path.resolve(file);
+  if (!fs.existsSync(abs)) die(`no such file: ${abs}`);
+  const rel = path.relative(ROOT, abs);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) die(`${abs} is outside ${ROOT} (set SHOW_ME_LIVE_ROOT)`);
+  return `${PAGES}/${rel.split(path.sep).map(encodeURIComponent).join("/")}`;
+}
+
+function urlToFile(url) {
+  try {
+    const u = new URL(url);
+    if (u.port !== String(PAGE_PORT)) return null;
+    return path.join(ROOT, decodeURIComponent(u.pathname));
+  } catch { return null; }
+}
+
+function inject(html, relPath) {
+  const cfg = { endpoint: AG, file: relPath, reload: `/__live/events?path=${encodeURIComponent(relPath)}`, history: `/__live/review?path=${encodeURIComponent(relPath)}` };
+  const tag = `<script>window.__SHOW_ME_LIVE__=${JSON.stringify(cfg)}</script><script src="/__live/toolbar.js" defer></script>`;
+  const i = html.toLowerCase().lastIndexOf("</body>");
+  return i === -1 ? html + tag : html.slice(0, i) + tag + html.slice(i);
+}
+
+const keyFor = (rel) => rel.split(path.sep).join("__");
+const histDir = (rel) => path.join(HIST, keyFor(rel));
+const sha1 = (buf) => crypto.createHash("sha1").update(buf).digest("hex");
+const unescapeHtml = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+
+function relOf(abs) {
+  const rel = path.relative(ROOT, abs);
+  return !rel || rel.startsWith("..") || path.isAbsolute(rel) ? null : rel;
+}
+
+function relForUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.port !== String(PAGE_PORT)) return null;
+    let abs = path.join(ROOT, decodeURIComponent(u.pathname));
+    if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) abs = path.join(abs, "index.html");
+    const rel = relOf(abs);
+    return rel && rel.toLowerCase().endsWith(".html") ? rel : null;
+  } catch { return null; }
+}
+
+function loadIndex(rel) {
+  const f = path.join(histDir(rel), "index.json");
+  return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : { file: rel, versions: [], comments: {} };
+}
+
+function saveIndex(rel, idx) {
+  const dir = histDir(rel);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `index.json.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(idx, null, 2));
+  fs.renameSync(tmp, path.join(dir, "index.json"));
+}
+
+function trackedPages() {
+  if (!fs.existsSync(HIST)) return [];
+  return fs.readdirSync(HIST).flatMap((k) => {
+    const f = path.join(HIST, k, "index.json");
+    try { return [JSON.parse(fs.readFileSync(f, "utf8")).file]; } catch { return []; }
+  });
+}
+
+function pageMeta(html) {
+  let summary = null, iteration = null;
+  for (const m of html.matchAll(/<meta\b[^>]*>/gi)) {
+    if (!/name\s*=\s*["']show-me:summary["']/i.test(m[0])) continue;
+    const c = m[0].match(/content\s*=\s*("([^"]*)"|'([^']*)')/i);
+    if (c) summary = unescapeHtml(c[2] ?? c[3]);
+  }
+  for (const m of html.matchAll(/data-iteration\s*=\s*["']?(\d+)/gi)) iteration = Math.max(iteration ?? 0, Number(m[1]));
+  return { summary, iteration };
+}
+
+const statSeen = new Map();
+
+function snapshot(rel, buf) {
+  const abs = path.join(ROOT, rel);
+  let st;
+  try { st = fs.statSync(abs); } catch { return null; }
+  if (!st.isFile() || st.size > MAX_SNAP) return null;
+  statSeen.set(rel, `${st.mtimeMs}:${st.size}`);
+  buf ??= fs.readFileSync(abs);
+  if (buf.length > MAX_SNAP) return null;
+  const hash = sha1(buf);
+  const idx = loadIndex(rel);
+  const last = idx.versions.at(-1);
+  if (last?.hash === hash) return last.n;
+  const n = (last?.n || 0) + 1;
+  const now = Date.now();
+  const firstSeen = last ? Math.max(last.firstSeen + 1, Math.min(now, Math.floor(st.mtimeMs))) : 0;
+  fs.mkdirSync(histDir(rel), { recursive: true });
+  fs.writeFileSync(path.join(histDir(rel), `v${n}.html`), buf);
+  idx.versions.push({ n, hash, firstSeen, capturedAt: now, bytes: buf.length, ...pageMeta(buf.toString("utf8")) });
+  saveIndex(rel, idx);
+  return n;
+}
+
+function pollSnapshots() {
+  for (const rel of trackedPages()) {
+    try {
+      const st = fs.statSync(path.join(ROOT, rel));
+      if (statSeen.get(rel) !== `${st.mtimeMs}:${st.size}`) snapshot(rel);
+    } catch {}
+  }
+}
+
+function storedComment(a) {
+  return {
+    id: a.id, sessionId: a.sessionId, url: a.url, kind: a.kind, status: a.status, comment: a.comment, element: a.element,
+    elementPath: a.elementPath, nearbyText: a.nearbyText, selectedText: a.selectedText, boundingBox: a.boundingBox, x: a.x, y: a.y,
+    intent: a.intent, severity: a.severity, timestamp: a.timestamp, createdAt: a.createdAt, updatedAt: a.updatedAt,
+    resolvedAt: a.resolvedAt, resolvedBy: a.resolvedBy, thread: a.thread ?? [],
+  };
+}
+
+async function fetchJson(url) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(3000) });
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return r.json();
+}
+
+async function syncComments(onlyRel) {
+  if (!(await up(`${AG}/health`))) return false;
+  let sessions;
+  try { sessions = await fetchJson(`${AG}/sessions`); } catch { return false; }
+  const tracked = new Set(trackedPages());
+  const byRel = new Map();
+  for (const s of sessions) {
+    const rel = relForUrl(s.url);
+    if (!rel || (onlyRel && rel !== onlyRel)) continue;
+    if (!tracked.has(rel) && !snapshot(rel)) continue;
+    if (!byRel.has(rel)) byRel.set(rel, []);
+    byRel.get(rel).push(s.id);
+  }
+  const now = Date.now();
+  for (const [rel, ids] of byRel) {
+    const fetched = await Promise.all(ids.map((id) => fetchJson(`${AG}/sessions/${id}`).catch(() => null)));
+    const idx = loadIndex(rel);
+    let dirty = false;
+    const present = new Set();
+    for (const a of fetched.flatMap((s) => s?.annotations || [])) {
+      present.add(a.id);
+      if (!a.id || isRemoteId(a.id)) continue;
+      const rec = storedComment(a);
+      const prev = idx.comments[a.id];
+      const { lastSeen, ...prevRec } = prev || {};
+      if (prev && JSON.stringify(prevRec) === JSON.stringify(rec) && now - lastSeen < 300000) continue;
+      idx.comments[a.id] = { ...rec, lastSeen: now };
+      dirty = true;
+    }
+    if (fetched.every(Boolean)) {
+      for (const c of Object.values(idx.comments)) {
+        if (present.has(c.id) || c.goneSince) continue;
+        c.goneSince = now;
+        dirty = true;
+      }
+    }
+    if (dirty) saveIndex(rel, idx);
+  }
+  return true;
+}
+
+const commentTime = (c) => c.timestamp ?? Date.parse(c.createdAt);
+
+function versionAt(versions, t) {
+  if (!versions.length || !Number.isFinite(t)) return null;
+  let n = versions[0].n;
+  for (const v of versions) if (v.firstSeen <= t) n = v.n;
+  return n;
+}
+
+function historyView(rel, live) {
+  const idx = loadIndex(rel);
+  const comments = Object.values(idx.comments).map((c) => {
+    const closed = c.status === "resolved" || c.status === "dismissed";
+    return { ...c, version: versionAt(idx.versions, commentTime(c)), resolvedInVersion: closed ? versionAt(idx.versions, Date.parse(c.resolvedAt || c.updatedAt || "")) : null };
+  }).sort((a, b) => commentTime(a) - commentTime(b));
+  const latest = idx.versions.at(-1)?.n ?? null;
+  return { file: rel, key: keyFor(rel), latest, live, snapBase: `/__live/snap/${encodeURIComponent(keyFor(rel))}/`, versions: idx.versions, comments };
+}
+
+function pageSummary(rel) {
+  const idx = loadIndex(rel);
+  const counts = { pending: 0, acknowledged: 0, resolved: 0, dismissed: 0, total: 0 };
+  let lastActivity = 0;
+  for (const v of idx.versions) lastActivity = Math.max(lastActivity, v.capturedAt || 0, v.firstSeen || 0);
+  for (const c of Object.values(idx.comments)) {
+    counts[c.status] = (counts[c.status] || 0) + 1;
+    counts.total++;
+    for (const t of [commentTime(c), Date.parse(c.updatedAt || ""), Date.parse(c.resolvedAt || "")]) if (Number.isFinite(t)) lastActivity = Math.max(lastActivity, t);
+  }
+  const last = idx.versions.at(-1);
+  return { file: rel, key: keyFor(rel), latest: last?.n ?? null, latestSummary: last?.summary ?? null, counts, lastActivity, review: `/__live/review?path=${encodeURIComponent(rel)}` };
+}
+
+const LOCATE = path.join(HERE, "src/locate.js");
+
+function snapPage(key, n) {
+  if (!key || key.includes("/") || key.includes("\\") || key.startsWith(".")) return null;
+  const dir = path.join(HIST, key);
+  const f = path.join(dir, `v${n}.html`);
+  if (!fs.existsSync(f) || !fs.existsSync(path.join(dir, "index.json"))) return null;
+  const rel = JSON.parse(fs.readFileSync(path.join(dir, "index.json"), "utf8")).file;
+  const d = path.dirname(rel);
+  const base = `<base href="/${d === "." ? "" : d.split(path.sep).map(encodeURIComponent).join("/") + "/"}">`;
+  let html = fs.readFileSync(f, "utf8");
+  const head = html.match(/<head\b[^>]*>/i) || html.match(/<html\b[^>]*>/i);
+  html = head ? html.slice(0, head.index + head[0].length) + base + html.slice(head.index + head[0].length) : base + html;
+  const tag = `<script id="show-me-live-locate">${fs.readFileSync(LOCATE, "utf8").replace(/<\/script/gi, "<\\/script")}</script>`;
+  const i = html.toLowerCase().lastIndexOf("</body>");
+  return i === -1 ? html + tag : html.slice(0, i) + tag + html.slice(i);
+}
+
+const sendJson = (res, v, code = 200) => { res.writeHead(code, { "Content-Type": MIME[".json"], "Cache-Control": "no-cache" }); res.end(JSON.stringify(v)); };
+
+async function liveApi(u, res) {
+  if (u.pathname === "/__live/api/pages") {
+    await syncComments().catch(() => false);
+    return sendJson(res, trackedPages().map(pageSummary).sort((a, b) => b.lastActivity - a.lastActivity));
+  }
+  if (u.pathname === "/__live/api/history") {
+    const rel = path.normalize(u.searchParams.get("path") || "");
+    if (!relOf(path.join(ROOT, rel))) return sendJson(res, { error: "bad path" }, 400);
+    if (fs.existsSync(path.join(ROOT, rel))) snapshot(rel);
+    const live = await syncComments(rel).catch(() => false);
+    if (!fs.existsSync(path.join(histDir(rel), "index.json"))) return sendJson(res, { error: "not tracked", file: rel }, 404);
+    return sendJson(res, historyView(rel, live));
+  }
+  return sendJson(res, { error: "not found" }, 404);
+}
+
+function serve() {
+  http.createServer((req, res) => {
+    const u = new URL(req.url, PAGES);
+    if (u.pathname === "/__live/health") return res.end("ok");
+    if (u.pathname.startsWith("/__live/api/")) return void liveApi(u, res).catch((e) => sendJson(res, { error: String(e) }, 500));
+    if (u.pathname === "/__live/review") {
+      res.writeHead(200, { "Content-Type": MIME[".html"], "Cache-Control": "no-cache" });
+      return fs.createReadStream(REVIEW).pipe(res);
+    }
+    const snap = u.pathname.match(/^\/__live\/snap\/([^/]+)\/(\d+)\.html$/);
+    if (snap) {
+      const html = snapPage(decodeURIComponent(snap[1]), Number(snap[2]));
+      if (html == null) { res.writeHead(404); return res.end("no such snapshot"); }
+      res.writeHead(200, { "Content-Type": MIME[".html"], "Cache-Control": "no-cache" });
+      return res.end(html);
+    }
+    if (u.pathname === "/__live/toolbar.js") {
+      res.writeHead(200, { "Content-Type": MIME[".js"], "Cache-Control": "no-cache" });
+      return fs.createReadStream(TOOLBAR).pipe(res);
+    }
+    if (u.pathname === "/__live/events") {
+      const file = path.join(ROOT, u.searchParams.get("path") || "");
+      if (!file.startsWith(ROOT + path.sep) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+      res.write(": connected\n\n");
+      let timer;
+      const watcher = fs.watch(path.dirname(file), (_e, name) => {
+        if (name && name !== path.basename(file)) return;
+        clearTimeout(timer);
+        timer = setTimeout(() => res.write("event: change\ndata: {}\n\n"), 300);
+      });
+      const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+      req.on("close", () => { watcher.close(); clearInterval(ping); clearTimeout(timer); });
+      return;
+    }
+    const rel = decodeURIComponent(u.pathname).replace(/^\/+/, "");
+    let file = path.join(ROOT, rel);
+    if (file !== ROOT && !file.startsWith(ROOT + path.sep)) { res.writeHead(403); return res.end(); }
+    if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, "index.html");
+    if (!fs.existsSync(file)) { res.writeHead(404); return res.end("not found"); }
+    const ext = path.extname(file).toLowerCase();
+    res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream", "Cache-Control": "no-cache" });
+    if (ext === ".html") {
+      const buf = fs.readFileSync(file);
+      const rel = path.relative(ROOT, file);
+      try { snapshot(rel, buf); } catch (e) { console.error(`snapshot ${rel}: ${e}`); }
+      return res.end(inject(buf.toString("utf8"), rel));
+    }
+    fs.createReadStream(file).pipe(res);
+  }).listen(PAGE_PORT, "127.0.0.1", () => console.log(`serving ${ROOT} on ${PAGES}`));
+  let syncing = false;
+  setInterval(async () => {
+    try { pollSnapshots(); } catch (e) { console.error(`poll: ${e}`); }
+    if (syncing) return;
+    syncing = true;
+    try { await syncComments(); } catch (e) { console.error(`sync: ${e}`); } finally { syncing = false; }
+  }, 2000);
+}
+
+
+function stripBlock(html, openRe, tag) {
+  let out = html, m;
+  while ((m = openRe.exec(out))) {
+    let i = m.index + m[0].length, depth = 1;
+    const re = new RegExp(`<${tag}[\\s>]|</${tag}>`, "gi");
+    re.lastIndex = i;
+    let t;
+    while (depth && (t = re.exec(out))) depth += t[0][1] === "/" ? -1 : 1;
+    if (depth) break;
+    out = out.slice(0, m.index) + out.slice(re.lastIndex);
+    openRe.lastIndex = 0;
+  }
+  return out;
+}
+
+const HINT = `<div class="sml-hint" style="font:13px/1.45 -apple-system,system-ui,sans-serif;background:#f3f0ff;border:1px solid #c9bdf5;border-radius:8px;padding:8px 12px;margin:0 0 14px;color:#2b2350">
+<b>To comment:</b> click the round button at the bottom right, then click any part of the page and type your note. When you are done, click the copy icon in the toolbar and paste the result into a reply.</div>
+<style>@media print{.sml-hint{display:none}}</style>`;
+
+function exportPage(file, outDir, opts = {}) {
+  const abs = path.resolve(file);
+  let html = fs.readFileSync(abs, "utf8");
+  html = stripBlock(html, /<details[^>]*class="smi-old[^"]*"[^>]*>/i, "details");
+  html = stripBlock(html, /<div class="smi-older">/i, "div");
+  html = html.replace(/<script id="smi-script">[\s\S]*?<\/script>/i, "");
+  html = html.replace(/<p class="vbar">[\s\S]*?<\/p>/i, "");
+  html = html.replace(/<meta name="show-me:[^>]*>/gi, "");
+  html = html.replace(/(<body[^>]*>)/i, `$1${opts.hint ?? HINT}`);
+  const cfg = opts.cfg ?? { endpoint: null, file: path.basename(abs), copyToClipboard: true };
+  const toolbar = fs.readFileSync(TOOLBAR, "utf8").replace(/<\/script/gi, "<\\/script");
+  const tag = `<script>window.__SHOW_ME_LIVE__=${JSON.stringify(cfg)}</script><script>${toolbar}</script>`;
+  const i = html.toLowerCase().lastIndexOf("</body>");
+  html = i === -1 ? html + tag : html.slice(0, i) + tag + html.slice(i);
+  fs.mkdirSync(outDir, { recursive: true });
+  const dest = path.join(outDir, "index.html");
+  fs.writeFileSync(dest, html);
+  return dest;
+}
+
+const SITE_SRC = path.join(HERE, "site");
+const SITE = path.join(RUN, "site");
+const SHARES = path.join(RUN, "shares.json");
+const SITE_PROJECT = process.env.SHOW_ME_SITE_PROJECT || "show-me-pages";
+const SITE_SCOPE = process.env.SHOW_ME_SITE_SCOPE || "ycao-3664";
+const loadShares = () => (fs.existsSync(SHARES) ? JSON.parse(fs.readFileSync(SHARES, "utf8")) : { siteUrl: null, pages: {} });
+const saveShares = (v) => fs.writeFileSync(SHARES, JSON.stringify(v, null, 2));
+
+const SHARE_HINT = `<div class="sml-hint" style="font:13px/1.45 -apple-system,system-ui,sans-serif;background:#f3f0ff;border:1px solid #c9bdf5;border-radius:8px;padding:8px 12px;margin:0 0 14px;color:#2b2350">
+<b>To comment:</b> click the round button at the bottom right, then click any part of the page and type your note. Notes save automatically, and everyone with this link sees them. Desktop browser only.</div>
+<style>@media print{.sml-hint{display:none}}</style>`;
+
+function slugFor(file) {
+  return path.basename(file, ".html").replace(/^show-me-/, "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 80);
+}
+
+function share(file, slug) {
+  const abs = path.resolve(file);
+  if (!fs.existsSync(abs)) die(`no such file: ${abs}`);
+  slug ||= slugFor(abs);
+  fs.mkdirSync(SITE, { recursive: true });
+  for (const f of ["package.json", "vercel.json", ".vercelignore"]) fs.copyFileSync(path.join(SITE_SRC, f), path.join(SITE, f));
+  fs.cpSync(path.join(SITE_SRC, "api"), path.join(SITE, "api"), { recursive: true });
+  exportPage(abs, path.join(SITE, slug), { hint: SHARE_HINT, cfg: { endpoint: "/api/n", sessionId: slug, file: path.basename(abs) } });
+  const shares = loadShares();
+  shares.pages[slug] = { file: abs, sharedAt: new Date().toISOString() };
+  const index = Object.keys(shares.pages).sort().map((k) => `<li><a href="/${k}/">${k}</a></li>`).join("");
+  fs.writeFileSync(path.join(SITE, "index.html"), `<!doctype html><meta charset="utf-8"><title>show-me pages</title><ul>${index}</ul>`);
+  if (!fs.existsSync(path.join(SITE, ".vercel/project.json"))) {
+    execFileSync("vercel", ["link", "--yes", "--project", SITE_PROJECT, "--scope", SITE_SCOPE], { cwd: SITE, stdio: "inherit" });
+  }
+  const raw = execFileSync("vercel", ["deploy", "--prod", "--yes", "--format", "json", "--scope", SITE_SCOPE], { cwd: SITE, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
+  shares.siteUrl = deployedUrl(raw) || shares.siteUrl;
+  saveShares(shares);
+  return { url: `${shares.siteUrl}/${slug}/`, slug, file: abs };
+}
+
+function deployedUrl(raw) {
+  const start = raw.indexOf("{");
+  if (start >= 0) {
+    try {
+      const json = JSON.parse(raw.slice(start));
+      const u = json.productionUrl || json.deployment?.productionUrl || json.url || json.deployment?.url;
+      if (u) return u.startsWith("http") ? u : `https://${u}`;
+    } catch {}
+  }
+  const line = raw.split("\n").map((l) => l.trim()).filter((l) => /^https:\/\//.test(l)).pop();
+  return line || null;
+}
+
+const isRemoteId = (id) => id.includes("~");
+const remoteBase = () => { const u = loadShares().siteUrl; if (!u) die("nothing shared yet; run 'show-me-live share <file>'"); return `${u}/api/n`; };
+const baseFor = (id) => (isRemoteId(id) ? remoteBase() : AG);
+
+async function api(method, p, body, base = AG) {
+  const r = await fetch(`${base}${p}`, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  if (!r.ok) die(`${method} ${p}: ${r.status} ${await r.text()}`);
+  return r.status === 204 ? null : r.json();
+}
+
+function slim(a, remoteFile) {
+  return {
+    id: a.id, status: a.status, kind: a.kind, comment: a.comment, file: remoteFile ?? urlToFile(a.url), via: remoteFile ? "shared" : "local", element: a.element,
+    elementPath: a.elementPath, selectedText: a.selectedText, nearbyText: a.nearbyText?.slice(0, 300),
+    attributes: a.attributes, intent: a.intent, severity: a.severity, thread: a.thread?.map((t) => `${t.role}: ${t.content}`),
+  };
+}
+
+async function pending(file) {
+  let list = [];
+  if (await up(`${AG}/health`)) list = ((await api("GET", "/pending")).annotations || []).map((a) => slim(a));
+  const shares = loadShares();
+  if (shares.siteUrl) {
+    const remote = await api("GET", "/pending", null, `${shares.siteUrl}/api/n`);
+    list.push(...(remote.annotations || []).map((a) => slim(a, shares.pages[a.sessionId]?.file ?? null)));
+  }
+  if (file) { const abs = path.resolve(file); list = list.filter((a) => a.file === abs); }
+  return list;
+}
+
+async function watch(file, timeoutSec, windowSec) {
+  const first = await pending(file);
+  if (first.length) return first;
+  const seen = new Set();
+  const deadline = Date.now() + timeoutSec * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const now = await pending(file);
+    if (now.some((a) => !seen.has(a.id))) {
+      await new Promise((r) => setTimeout(r, windowSec * 1000));
+      return pending(file);
+    }
+  }
+  return [];
+}
+
+function flag(args, name, dflt) {
+  const i = args.indexOf(name);
+  if (i === -1) return dflt;
+  const v = args[i + 1];
+  args.splice(i, 2);
+  return v;
+}
+
+async function historyFor(file) {
+  const abs = path.resolve(file);
+  const rel = relOf(abs);
+  if (!rel) die(`${abs} is outside ${ROOT} (set SHOW_ME_LIVE_ROOT)`);
+  let h;
+  if (await up(`${PAGES}/__live/health`)) {
+    const r = await fetch(`${PAGES}/__live/api/history?path=${encodeURIComponent(rel)}`);
+    h = await r.json();
+    if (!r.ok) die(`${abs}: ${h.error}`);
+  } else {
+    if (fs.existsSync(abs)) snapshot(rel);
+    const live = await syncComments(rel).catch(() => false);
+    if (!fs.existsSync(path.join(histDir(rel), "index.json"))) die(`no history for ${abs}`);
+    h = historyView(rel, live);
+  }
+  const resolution = (c) => (c.thread || []).filter((t) => t.role === "agent").map((t) => t.content).join("\n") || null;
+  return {
+    file: abs, latest: h.latest, agentation: h.live ? "live" : "cached", review: `${PAGES}/__live/review?path=${encodeURIComponent(rel)}`,
+    versions: h.versions.slice().reverse().map((v) => ({
+      n: v.n, firstSeen: v.firstSeen ? new Date(v.firstSeen).toISOString() : "before tracking", summary: v.summary, iteration: v.iteration,
+      comments: h.comments.filter((c) => c.version === v.n).map((c) => ({ id: c.id, status: c.status, comment: c.comment, element: c.element, raisedIn: c.version, resolvedInVersion: c.resolvedInVersion, resolution: resolution(c), ...(c.goneSince ? { deletedFromAgentation: true } : {}) })),
+    })),
+  };
+}
+
+function historyText(h) {
+  const lines = [`${h.file}`, `latest v${h.latest} · comments ${h.agentation} · ${h.review}`];
+  for (const v of h.versions) {
+    lines.push("", `v${v.n} · ${v.firstSeen}${v.iteration ? ` · iteration ${v.iteration}` : ""}${v.summary ? ` · ${v.summary}` : ""}`);
+    for (const c of v.comments) {
+      const end = c.resolvedInVersion ? ` -> ${c.status} in v${c.resolvedInVersion}` : "";
+      lines.push(`  [${c.status}${c.deletedFromAgentation ? ", deleted" : ""}] ${c.id} raised v${c.raisedIn}${end}: ${c.comment}`);
+      if (c.resolution) lines.push(...c.resolution.split("\n").map((l) => `      ${l}`));
+    }
+  }
+  return lines.join("\n");
+}
+
+const [cmd, ...args] = process.argv.slice(2);
+switch (cmd) {
+  case "serve": serve(); break;
+  case "start": await start(); out({ pages: PAGES, agentation: AG, root: ROOT }); break;
+  case "stop": stop(); break;
+  case "status": out({ pages: await up(`${PAGES}/__live/health`), agentation: await up(`${AG}/health`), root: ROOT }); break;
+  case "url": await start(); out(fileToUrl(args[0] || die("usage: url <file.html>"))); break;
+  case "open": {
+    await start();
+    const url = fileToUrl(args[0] || die("usage: open <file.html>"));
+    execFileSync("open", [url]);
+    out(url);
+    break;
+  }
+  case "export": {
+    const f = args[0] || die("usage: export <file.html> [out-dir]");
+    const dir = args[1] || path.join(RUN, "exports", path.basename(f, ".html"));
+    out(exportPage(f, dir));
+    break;
+  }
+  case "pending": out(await pending(args[0])); break;
+  case "history": {
+    const plain = args.includes("--plain");
+    const f = args.filter((a) => a !== "--plain")[0] || die("usage: history <file.html> [--plain]");
+    const h = await historyFor(f);
+    out(plain ? historyText(h) : h);
+    break;
+  }
+  case "review": {
+    await start();
+    const url = args[0] ? `${PAGES}/__live/review?path=${encodeURIComponent(relOf(path.resolve(args[0])) || die(`${path.resolve(args[0])} is outside ${ROOT}`))}` : `${PAGES}/__live/review`;
+    execFileSync("open", [url]);
+    out(url);
+    break;
+  }
+  case "watch": {
+    const timeout = Number(flag(args, "--timeout", 300));
+    const win = Number(flag(args, "--window", 10));
+    out(await watch(args[0], timeout, win));
+    break;
+  }
+  case "share": {
+    const slug = flag(args, "--slug");
+    out(share(args[0] || die("usage: share <file.html> [--slug name]"), slug));
+    break;
+  }
+  case "ack": await api("PATCH", `/annotations/${args[0]}`, { status: "acknowledged" }, baseFor(args[0])); out({ acknowledged: args[0] }); break;
+  case "resolve":
+    await api("PATCH", `/annotations/${args[0]}`, { status: "resolved", resolvedBy: "agent" }, baseFor(args[0]));
+    if (args[1]) await api("POST", `/annotations/${args[0]}/thread`, { role: "agent", content: `Resolved: ${args.slice(1).join(" ")}` }, baseFor(args[0]));
+    out({ resolved: args[0] });
+    break;
+  case "dismiss":
+    await api("PATCH", `/annotations/${args[0]}`, { status: "dismissed", resolvedBy: "agent" }, baseFor(args[0]));
+    await api("POST", `/annotations/${args[0]}/thread`, { role: "agent", content: `Dismissed: ${args.slice(1).join(" ") || "no reason given"}` }, baseFor(args[0]));
+    out({ dismissed: args[0] });
+    break;
+  case "reply": await api("POST", `/annotations/${args[0]}/thread`, { role: "agent", content: args.slice(1).join(" ") }, baseFor(args[0])); out({ replied: args[0] }); break;
+  default:
+    console.log(`show-me-live: serve show-me HTML pages with the Agentation toolbar injected
+
+  start | stop | status          manage the page server (:${PAGE_PORT}) and agentation server (:${AG_PORT})
+  open <file.html>               start servers, open the page in the browser, print its URL
+  url <file.html>                print the annotatable URL for a page
+  pending [file.html]            list pending annotations (optionally for one page)
+  history <file.html> [--plain]  versions of a page (one per content change) with the comments raised
+                                 on each: status, raised version, resolvedInVersion, resolution text
+  review [file.html]             start servers and open the review page (version list, comments,
+                                 compare with latest) in the browser; only when the user asks
+  watch [file.html] [--timeout s] [--window s]   block until new annotations arrive
+  export <file.html> [out-dir]   self-contained copy for sharing: toolbar inlined, no server,
+                                 old iterations removed; reviewers copy their notes back
+  share <file.html> [--slug s]   deploy the page to the shared Vercel site; notes persist for everyone
+                                 with the link and show up in 'pending' (ids with '~' are shared notes)
+  ack <id> | resolve <id> [summary] | dismiss <id> <reason> | reply <id> <message>
+
+Root: ${ROOT} (override with SHOW_ME_LIVE_ROOT). Run dir: ${RUN} (override with SHOW_ME_LIVE_RUN);
+version history lives in ${HIST}.`);
+}

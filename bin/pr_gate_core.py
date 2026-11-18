@@ -25,6 +25,28 @@ from contextlib import contextmanager
 LANES = ("approval", "convention", "necessity", "blast-radius")
 OPUS_LANE = "approval-opus"
 ALL_LANES = LANES + (OPUS_LANE,)
+LANE_ALIAS = {}
+LANE_ORDER = list(ALL_LANES)
+
+
+def set_merges(merges):
+    LANE_ALIAS.clear()
+    for new, olds in (merges or {}).items():
+        for old in olds:
+            LANE_ALIAS[old] = new
+    LANE_ORDER[:] = []
+    for lane in ALL_LANES:
+        name = LANE_ALIAS.get(lane, lane)
+        if name not in LANE_ORDER:
+            LANE_ORDER.append(name)
+
+
+def aliased(lanes):
+    return {LANE_ALIAS.get(lane, lane) for lane in lanes}
+
+
+def config_merges(cfg):
+    return {new: list(olds) for new, olds in (getattr(cfg, "MERGED_LANES", None) or {}).items()}
 
 
 def load_pi_models():
@@ -221,7 +243,76 @@ def now():
 
 
 def canonical(lanes):
-    return [lane for lane in ALL_LANES if lane in set(lanes)]
+    wanted = set(lanes)
+    return [lane for lane in LANE_ORDER if lane in wanted] + sorted(wanted - set(LANE_ORDER))
+
+
+def rule_text(rule, lanes=None):
+    if not LANE_ALIAS or rule not in ("D4", "D5", "D7"):
+        return RULE_TEXT[rule]
+    names = ", ".join(canonical(lanes or aliased(LANES)))
+    return {"D4": f"{RULE_TEXT['D4'].split(':', 1)[0]}: {names} re-runs, plus boundary checks",
+            "D5": f"test or docs only: {names} re-runs",
+            "D7": f"risk path touched: {names} re-run on the whole PR"}[rule]
+
+
+def combine_records(recs, olds, reviewed_head):
+    covers = [{r.get("head"), r.get("carried_to")} - {None} for r in recs]
+    common = set.intersection(*covers)
+    head = reviewed_head if reviewed_head in common else (sorted(common)[0] if common else recs[0]["head"])
+    failing = [r for r in recs if not verdict_passes(r)]
+    return {
+        "head": head, "patch_id": recs[0].get("patch_id"), "verdict": "FAIL" if failing else "PASS",
+        "flagged_paths": sorted({p for r in recs for p in r.get("flagged_paths") or []}),
+        "blockers": [f"{lane}: {b}" for lane, r in zip(olds, recs) for b in r.get("blockers") or []]
+        or [f"{lane}: verdict {r.get('verdict')}" for lane, r in zip(olds, recs) if not verdict_passes(r)],
+        "reviewer": ",".join(str(r.get("reviewer")) for r in recs),
+        "model": ",".join(sorted({str(r.get("model")) for r in recs})),
+        "spawn_id": None, "at": now(), "round": max(r.get("round") or 0 for r in recs),
+        "migrated_from": list(olds),
+    }
+
+
+def migrate_lanes(state, merges):
+    if not merges or not state:
+        return None
+    state["lane_merges"] = merges
+    pend = state.get("pending") or {}
+    names = set(state.get("lane_set") or []) | set(pend.get("lanes") or []) | set(state.get("lanes") or {})
+    if not names & set(LANE_ALIAS):
+        return None
+    reviewed_head = (state.get("reviewed") or {}).get("head")
+    lanes = state.get("lanes") or {}
+    reasons = state.get("lane_reasons") or {}
+    moved = {}
+    for new, olds in merges.items():
+        members = [o for o in olds if o in (state.get("lane_set") or [])]
+        recs = [lanes[o] for o in members if o in lanes]
+        if members and len(recs) == len(members) and new not in lanes:
+            lanes[new] = combine_records(recs, members, reviewed_head)
+        why = [reasons.pop(o) for o in olds if o in reasons]
+        if why and new not in reasons:
+            reasons[new] = f"merged from {', '.join(olds)}: {why[0]}"
+        if pend.get("lanes") and set(olds) & set(pend["lanes"]):
+            in_pend = [o for o in olds if o in pend["lanes"]]
+            done = all(o in (pend.get("recorded") or []) for o in in_pend) and new in lanes \
+                and lanes[new]["head"] == pend.get("head")
+            for key in ("recorded", "spawned"):
+                kept = [lane for lane in pend.get(key) or [] if lane not in olds]
+                pend[key] = kept + ([new] if done else [])
+        for o in olds:
+            if o in lanes:
+                moved[o] = lanes.pop(o)
+    if state.get("lane_set"):
+        state["lane_set"] = canonical(aliased(state["lane_set"]))
+    if pend.get("lanes"):
+        pend["lanes"] = canonical(aliased(pend["lanes"]))
+    state["lanes"] = lanes
+    state["lane_reasons"] = reasons
+    state.setdefault("migrated_lanes", {}).update(moved)
+    entry = {"at": now(), "aliases": dict(LANE_ALIAS), "records_moved": sorted(moved)}
+    state.setdefault("lane_migrations", []).append(entry)
+    return entry
 
 
 def verdict_passes(record):
@@ -451,7 +542,7 @@ def jev_decide(repo, old, new, touched, state, signals, lane_set, questions):
     masses = {qid: round(1 - p, 4) for qid, p in probs.items()}
     for qid, false_mass in masses.items():
         if false_mass < JEV_SKIP_MASS:
-            lanes.update(JEV_LANES[qid])
+            lanes.update(aliased(JEV_LANES[qid]))
     if "blast-radius" in lanes:
         lanes.add("approval")
     lanes &= set(lane_set) | {"approval"}
@@ -519,16 +610,16 @@ def classify(repo, cfg, state, base_ref, head, body):
     elif flags["D2"]:
         rule, lanes = "D2", {"approval"}
     elif flags["D7"]:
-        rule, lanes = "D7", set(LANES)
-        lane_set = canonical(set(lane_set) | set(LANES))
+        rule, lanes = "D7", aliased(LANES)
+        lane_set = canonical(set(lane_set) | aliased(LANES))
     elif flags["D8"]:
         rule, lanes = "D8", set(lane_set)
     elif flags["D3"]:
         rule, lanes = "D3", set()
     elif flags["D4"]:
-        rule, lanes = "D4", {"convention"}
+        rule, lanes = "D4", aliased({"convention"})
     elif flags["D5"]:
-        rule, lanes = "D5", {"convention", "necessity"}
+        rule, lanes = "D5", aliased({"convention", "necessity"})
     elif flags["D6"]:
         rule, lanes = "D6", set()
     else:
@@ -546,7 +637,7 @@ def classify(repo, cfg, state, base_ref, head, body):
         if lane in lane_set and paths & set(touched):
             additions.setdefault(lane, []).append("A2 flagged file touched")
     if summary_changed:
-        additions.setdefault("convention", []).append("A3 PR Summary changed")
+        additions.setdefault(LANE_ALIAS.get("convention", "convention"), []).append("A3 PR Summary changed")
     if content_changed:
         for lane in lane_set:
             if lane in (state.get("lanes") or {}) and not verdict_passes(state["lanes"][lane]):
@@ -627,8 +718,11 @@ def cmd_delta(args):
     body = read_body(args)
     if not args.no_step0 and not run_step0(cfg, args, head):
         return 2
+    merges = config_merges(cfg)
+    set_merges(merges)
     with locked_state(path) as box:
         state = box["state"]
+        migration = migrate_lanes(state, merges)
         rule, lanes, lane_set, signals, jev_entry, snap = classify(args.repo, cfg, state, args.base, head, body)
         if rule == "D0":
             snap = pr_snapshot(args.repo, args.base, head)
@@ -641,8 +735,11 @@ def cmd_delta(args):
         checks = list(cfg.STEP0_CHECKS)
         if rule in ("D4", "D7"):
             checks += list(cfg.BOUNDARY_CHECKS)
-        decision = {"at": now(), "rule": rule, "why": RULE_TEXT[rule], "lanes": lanes, "checks": checks,
+        decision = {"at": now(), "rule": rule, "why": rule_text(rule, lanes if rule != "D7" else None),
+                    "lanes": lanes, "checks": checks,
                     "scope": "whole PR (base...head) for every lane that runs", "signals": signals}
+        if migration:
+            decision["lane_migration"] = migration
         if jev_entry:
             state.setdefault("jev_log", []).append(jev_entry)
             decision["jev"] = {k: jev_entry.get(k) for k in ("decision", "false_mass", "error")}
@@ -667,11 +764,14 @@ def cmd_lanes(args):
     reach["risk_paths"] = risk
     reach["risk_kinds"] = risk_names(cfg, risk)
     code = bool(app or tests) and not all(matches(cfg.NON_REVIEW_PATTERNS, p) for p in app + tests)
+    merges = config_merges(cfg)
+    set_merges(merges)
     lanes = ["approval"]
     reasons = {"approval": "always"}
     if code:
-        lanes += ["convention", "necessity"]
-        reasons["convention"] = reasons["necessity"] = "app or spec code touched"
+        for lane in canonical(aliased(["convention", "necessity"])):
+            lanes.append(lane)
+            reasons[lane] = "app or spec code touched"
     if reach["reach"] in ("cross-pack", "external") or risk or reach.get("shared_helpers"):
         lanes.append("blast-radius")
         reasons["blast-radius"] = "reach=%s risk=%s shared_helpers=%s" % (
@@ -682,6 +782,7 @@ def cmd_lanes(args):
     fp = body_fingerprint(body)
     with locked_state(path, create=True) as box:
         state = box["state"]
+        migration = migrate_lanes(state, merges)
         if state and args.reset:
             resets = state.get("resets") or []
             resets.append({"at": now(), "by": args.by, "reason": args.reason, "head": head,
@@ -698,6 +799,10 @@ def cmd_lanes(args):
                 "lane_set": [], "lane_reasons": {}, "lanes": {}, "history": [], "jev_log": [],
                 "escalations": [], "spawn_log": [],
             })
+        if merges:
+            state["lane_merges"] = merges
+        if getattr(cfg, "LANE_PROFILES", None):
+            state["lane_profiles"] = dict(cfg.LANE_PROFILES)
         pend = state.get("pending")
         selected = canonical(set(state["lane_set"]) | set(lanes))
         state["lane_set"] = selected
@@ -714,10 +819,13 @@ def cmd_lanes(args):
             open_pending(state, head, snap, fp, selected, "lanes")
         box["dirty"] = True
         counters = {"rounds": state["rounds"], "spawns": state["spawns"]}
-    print(json.dumps({"step0": "skipped" if args.no_step0 else ("advisory" if getattr(args, "advisory", None) else "ok"),
-                      "author_mode": getattr(args, "mode", "unknown"), "advisory_findings": getattr(args, "advisory", []), "lanes": selected,
-                      "reasons": reasons, "reach": reach, "selection": action, "counters": counters,
-                      "scope": "whole PR (base...head)", "state": path}, indent=2))
+    out = {"step0": "skipped" if args.no_step0 else ("advisory" if getattr(args, "advisory", None) else "ok"),
+           "author_mode": getattr(args, "mode", "unknown"), "advisory_findings": getattr(args, "advisory", []),
+           "lanes": selected, "reasons": reasons, "reach": reach, "selection": action, "counters": counters,
+           "scope": "whole PR (base...head)", "state": path}
+    if migration:
+        out["lane_migration"] = migration
+    print(json.dumps(out, indent=2))
     return 0
 
 
@@ -796,10 +904,14 @@ def spawn_check(args, state):
     spawn_id = f"S{len(log) + 1}-{lane}"
     log.append({"at": now(), "id": spawn_id, "lane": lane, "head": pend["head"], "model": lane_model(lane),
                 "round": state["rounds"], "retry": bool(args.retry), "consumed": None})
-    return 0, {"go": lane, "spawn_id": spawn_id, "model": lane_model(lane), "head": pend["head"],
-               "round": state["rounds"],
-               "spawns": f"{state['spawns']}/{max_spawns}", "rounds": f"{state['rounds']}/{max_rounds}",
-               "scope": "whole PR (base...head)"}
+    out = {"go": lane, "spawn_id": spawn_id, "model": lane_model(lane), "head": pend["head"],
+           "round": state["rounds"],
+           "spawns": f"{state['spawns']}/{max_spawns}", "rounds": f"{state['rounds']}/{max_rounds}",
+           "scope": "whole PR (base...head)"}
+    profile = (state.get("lane_profiles") or {}).get(lane)
+    if profile:
+        out["profile"] = profile
+    return 0, out
 
 
 def find_ticket(state, spawn_id):
@@ -924,6 +1036,18 @@ def cmd_spawn(args):
     path = state_path(args)
     with locked_state(path) as box:
         state = box["state"]
+        merges = state.get("lane_merges") or {}
+        set_merges(merges)
+        if args.action in ("check", "record"):
+            if args.lane in LANE_ALIAS:
+                new = LANE_ALIAS[args.lane]
+                print(json.dumps({"refused": f"lane {args.lane} was merged into lane {new} in this gate; "
+                                             f"use --lane {new}", "use": new}, indent=2))
+                return 4
+            if args.lane not in set(ALL_LANES) | set(merges):
+                print(f"pr-gate: unknown lane {args.lane}; known lanes: "
+                      f"{', '.join(canonical(set(ALL_LANES) | set(merges)))}", file=sys.stderr)
+                return 2
         if args.action == "check":
             code, out = spawn_check(args, state)
             box["dirty"] = True
@@ -987,7 +1111,7 @@ def main(argv):
     spawn = sub.add_parser("spawn")
     spawn.add_argument("action", choices=["check", "record", "verify", "bind", "grant", "resolve", "status"])
     common(spawn, config=False)
-    spawn.add_argument("--lane", choices=ALL_LANES)
+    spawn.add_argument("--lane")
     spawn.add_argument("--head")
     spawn.add_argument("--retry", action="store_true")
     spawn.add_argument("--verdict")

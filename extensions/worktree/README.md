@@ -21,16 +21,17 @@ bucket is advice; the `worktree-cleanup` skill owns the procedure and the approv
 
 ## How it finds the CLI
 
-The extension is a thin wrapper around the `wt` bash script (`../../bin/wt`). It resolves, in
-order:
+The extension is a thin wrapper around the `wt` bash script. It resolves, in order:
 
 1. `$WT_BIN`
-2. `bin/wt` in the agent dir
-3. `wt` on `$PATH`
+2. `bin/wt` inside this extension's folder (where the pi-starter package ships it)
+3. `bin/wt` two levels up (the agent dir's `bin/wt` in a personal setup)
+4. `wt` on `$PATH`
 
 Each candidate must exist and be executable; a candidate that is not is skipped rather than
-treated as fatal. Step 2 means a fresh checkout works with no installation. To get `wt` in your
-own shell too:
+treated as fatal, except that a bundled copy (2 or 3) that lost its exec bit is run as
+`bash <path>`. Steps 2 and 3 mean a fresh checkout or install works with no installation. To get
+`wt` in your own shell too, link whichever copy you have onto your `PATH`, e.g.
 
 ```sh
 ln -sfn ~/.pi/agent/bin/wt ~/.local/bin/wt

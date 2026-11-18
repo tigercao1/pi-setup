@@ -69,7 +69,7 @@ Availability is gated by role, so a worker literally cannot spawn or kill anythi
 
 | Tool | Roles | Purpose |
 |---|---|---|
-| `team_spawn` | lead, sub-orch | Spawn a teammate. `name`, `task`, `canSpawn`, `model`, `provider`, `thinkingLevel`, `profile`, `extensions`, `slim`, `visible`, `cwd`, `taskContract`, `gate` / `gateExempt` (PR review gate reservation, see `gate.ts`; required on any profiled spawn whose effective skills, profile plus settings plus explicit, include `pr-approval-review`, i.e. every `code-review` and `reviewer` spawn; `gateExempt` is stored on the agent record and replayed by recycle) |
+| `team_spawn` | lead, sub-orch | Spawn a teammate. `name`, `task`, `canSpawn`, `model`, `provider`, `thinkingLevel`, `profile`, `extensions`, `slim`, `visible`, `cwd`, `taskContract`, `gate` / `gateExempt` (PR review gate reservation, see `gate.ts`; required on any profiled spawn whose effective skills, profile plus settings plus explicit, include `pr-approval-review`, i.e. every `code-review` and `reviewer` spawn; `gateExempt` is stored on the agent record and replayed by recycle; the gate is optional, and when `pr-gate-spawn.sh` is not installed gate-shaped spawns are not enforced and a `gate` argument is refused with a clear message) |
 | `team_status` | lead, sub-orch | Agent tree with live process state, staleness (>10 min), attention requests, and ready deliverables |
 | `team_diagnose` | lead, sub-orch | Last N lines of an agent's pane/log output |
 | `team_message` | all | Message one agent by name |
@@ -387,6 +387,9 @@ Model resolution order, first match wins:
 6. **inherit the spawning agent's own model and provider** (default)
 
 Thinking level: explicit, then the profile's, then `team.modelDefaults[role]`, then the role default.
+`models.example.json` beside this README shows every key: copy its `aliases`, `personas` and
+`unprofiled` into your `models.json` (keep pi's own `providers` key) and change the aliases to
+models your providers serve.
 A missing or invalid `models.json` falls back to the built-in persona table and the next spawn
 result carries one `WARNING`; a spawn never fails on it.
 

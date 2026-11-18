@@ -530,27 +530,28 @@ export function formatMessage(message: BusMessage, index?: number): string {
 
 /**
  * The instruction handed to this session's agent after the human picks a
- * target and describes what to send.
+ * target and says what the summary should focus on.
  *
  * The point of routing through the agent rather than posting the raw text: the
- * human says "send them the rounding decision", and the session that HAS that
+ * human says "focus on the rounding decision", and the session that HAS that
  * context is the one that should work out which files and findings that means.
  */
-export function buildSendPrompt(target: SessionEntry, request: string): string {
+export function buildSendPrompt(target: SessionEntry, focus: string): string {
 	return [
 		`Send context to another pi session using the session_send tool.`,
 		"",
 		`Target: to="${target.address}" (${target.alias} — ${target.cwd}, currently ${isLive(target) ? "live" : "offline; it will receive this when it next starts"}).`,
 		"",
-		`What I want them to have: ${request}`,
+		`Summary focus: ${focus}`,
 		"",
-		"Work out what that actually means from THIS session's context:",
+		"That focus is not the message itself. Summarize THIS session's context for them around it, emphasizing the points it names:",
 		"- Which concrete files should they read? Pass those as `paths` (absolute, and only ones that exist).",
-		"- What do they need to know that lives only in this conversation? Put that in `note`, in your own words.",
+		"- What do they need to know that lives only in this conversation? Put that summary in `note`, in your own words.",
 		"- Set `shareSession: true` if they may need to ask this session follow-up questions.",
 		"",
 		"Keep `note` short and specific — conclusions, decisions and gotchas, not a transcript.",
-		"Send references over pasted content. Then tell me in one line what you sent.",
+		"Send references over pasted content. Do not write a message from me: session_send asks me for my own message before it sends.",
+		"Then tell me in one line what you sent.",
 	].join("\n");
 }
 

@@ -18,7 +18,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const JEV_MODEL = "typesafe-ai/jev";
+export const JEV_MODEL = "typesafe-ai/jev-1.14.0";
 export const GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/evaluate";
 
 /** 32k context; refuse well before the gateway does, with a message that says why. */

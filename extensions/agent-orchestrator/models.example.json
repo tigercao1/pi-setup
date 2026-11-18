@@ -1,0 +1,28 @@
+{
+  "aliases": {
+    "opus": { "model": "anthropic/claude-opus-5.5", "provider": "vercel-ai-gateway" },
+    "sonnet": { "model": "anthropic/claude-sonnet-5.5", "provider": "vercel-ai-gateway" },
+    "gpt": { "model": "openai/gpt-6.1-sol", "provider": "vercel-ai-gateway" }
+  },
+  "personas": {
+    "researcher": "sonnet",
+    "coder": "opus",
+    "reviewer": "gpt",
+    "code-review": "gpt",
+    "verifier": "gpt",
+    "verifier-mcp": "gpt",
+    "manager": "inherit",
+    "pr-author": "opus",
+    "tester": "opus",
+    "docs-writer": "sonnet",
+    "batch-orchestrator": "inherit"
+  },
+  "unprofiled": {
+    "router": "jev",
+    "implementation": "opus",
+    "other": "sonnet",
+    "fallback": "opus",
+    "minConfidence": 0.8,
+    "timeoutMs": 3000
+  }
+}

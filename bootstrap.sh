@@ -119,7 +119,7 @@ else
   npm install -g "$QMD_PACKAGE@$QMD_WANTED" --no-audit --no-fund
 fi
 
-step "extension dependencies"
+step "extension and skill dependencies"
 has_dependencies() {
   jq -e '((.dependencies // {}) + (.devDependencies // {}) + (.peerDependencies // {})) | length > 0' "$1/package.json" >/dev/null
 }
@@ -139,6 +139,18 @@ for ext in "$AGENT_DIR"/extensions/*/; do
   else
     note "$name: no dependencies; linking $SHARED_NODE_MODULES"
     ln -sfn "$SHARED_NODE_MODULES" "$ext/node_modules"
+  fi
+done
+for pkg in "$AGENT_DIR"/skills/*/*/package.json; do
+  [ -f "$pkg" ] || continue
+  dir="$(dirname "$pkg")"
+  name="${dir#"$AGENT_DIR"/skills/}"
+  has_dependencies "$dir" || continue
+  if [ -d "$dir/node_modules" ] && (cd "$dir" && npm ls --depth=0 >/dev/null 2>&1); then
+    note "skill $name: node_modules up to date"
+  else
+    note "skill $name: npm install"
+    (cd "$dir" && npm install --no-audit --no-fund)
   fi
 done
 EXT_MANAGER="$AGENT_DIR/extensions/ext-manager"

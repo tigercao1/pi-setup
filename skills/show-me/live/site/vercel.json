@@ -1,0 +1,4 @@
+{
+  "rewrites": [{ "source": "/api/n/:path*", "destination": "/api/notes?p=:path*" }],
+  "headers": [{ "source": "/api/(.*)", "headers": [{ "key": "Cache-Control", "value": "no-store" }] }]
+}

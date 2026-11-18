@@ -294,7 +294,7 @@ await test("never pauses or sends anything on its own", async () => {
 
 const dir = mkdtempSync(join(tmpdir(), "ctxw-"));
 const factsScript = join(dir, "pi-pause-facts");
-writeFileSync(factsScript, "#!/bin/sh\n");
+writeFileSync(factsScript, "#!/bin/sh\n", { mode: 0o755 });
 const mission = join(dir, "ABC-1234");
 mkdirSync(mission);
 const resume = join(mission, "RESUME.md");
@@ -372,6 +372,16 @@ await test("/fresh stops when the facts script fails or is missing", async () =>
 	await h1.run("fresh");
 	assert.equal(h1.userMessages.length, 0);
 	assert.match(h1.notices.at(-1)?.message ?? "", /pi-pause-facts exited 2: boom/);
+
+	const plain = join(dir, "plain-facts");
+	writeFileSync(plain, "#!/usr/bin/env python3\n", { mode: 0o644 });
+	assert.deepEqual(mod.scriptCommand(plain, ["--cwd", "/x"]), { command: "/usr/bin/env", args: ["python3", plain, "--cwd", "/x"] });
+	assert.deepEqual(mod.scriptCommand(factsScript, ["--cwd", "/x"]), { command: factsScript, args: ["--cwd", "/x"] });
+	const hp = harness({ settings: { contextWatcher: { factsScript: plain, startTimeoutMs: 500 } }, factsCode: 2 });
+	await hp.fire("session_start");
+	await hp.run("fresh");
+	assert.equal(hp.execCalls[0]!.command, "/usr/bin/env");
+	assert.deepEqual(hp.execCalls[0]!.args.slice(0, 2), ["python3", plain]);
 
 	const h2 = harness({ settings: { contextWatcher: { factsScript: join(dir, "absent") } } });
 	await h2.fire("session_start");

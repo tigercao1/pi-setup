@@ -274,3 +274,14 @@ Never convert a pull request that is open for review back to draft — not durin
 while repairing a stack, not "temporarily". Reviewers lose it from their queue. This applies to
 side effects too: if a tool flips state, report it rather than toggling it back. Marking a draft
 *ready* is fine when the human has asked for review.
+
+## Implementation goes to an Opus worker
+
+Never write or edit application code, specs or migrations inline in the lead session, whatever the
+size of the change, a CI fix or a one-line change included. Spawn a worker with `profile: "coder"`
+(`anthropic/claude-opus-5.5`; pass `model: "anthropic/claude-opus-5.5"` explicitly if a profile
+override ever changes it) and give it a self-contained brief, a `taskContract` and the skills the
+work needs (`contextFiles: true`, plus the repo's ticket-to-PR skill and `pr-review-gate` when it
+opens or changes a PR). The lead reads, reviews, verifies, runs the gate and reports; it does not
+implement. A `team_recycle` keeps the model. If the gateway rejects the model, say so and ask
+before using another one.
