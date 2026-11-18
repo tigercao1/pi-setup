@@ -37,7 +37,7 @@ single hedges. `clear-message/bin/slop-lint.py --voice tiger` skips the same pat
 
 ## Review comments on someone else's PR
 
-- **[confirmed 2026-10-15]** One or two sentences. Most are a single sentence.
+- **[confirmed 2026-11-10]** One to three sentences. Most are a single sentence. A second or third sentence names the mechanism ("`empty_response?` is private, so these specs still pass if `call` stops using it").
 - **[confirmed 2026-10-15]** Point at what you see and let the author draw the conclusion: "seems redundant",
   "intended?", "Which one is the truth?". Do not prescribe the fix or write "Please …".
 - **[confirmed 2026-10-15]** Often phrased as a question: "Do we need this file still?", "Do we need to add the
@@ -53,20 +53,27 @@ single hedges. `clear-message/bin/slop-lint.py --voice tiger` skips the same pat
   run-ons in the curated examples (the `TextScrubber` comment, for one). Copy their wording, not their
   sentence length.
 - **[confirmed 2026-10-15]** Identifiers go in backticks.
+- **[confirmed 2026-11-10]** When he cannot find something, say where he looked: "I could not find it in the PR or the ticket.", "The description says the worker gets it."
 
 ## Replies on his own PRs
 
 Every reply is in his voice, whoever the reviewer is.
 
-- **[confirmed 2026-10-15]** To a person: open with a short acknowledgement ("Good callout,", "Great
-  question,", "Great callout,"), then answer in one or two plain sentences. No SHA unless the
-  reviewer needs it to find the change, no numbering.
+- **[confirmed 2026-11-05]** Most replies just say the thing: "Added both to the read tools.",
+  "Confirmed on staging.", "eve's Linear activity only has `updatedAt`." An acknowledgement ("Good
+  callout,", "Great question,") is occasional, for a point that changed his mind or caught a real bug.
+  Never open every reply in a review with one, and never reuse the same opener twice in one review:
+  five "Good callout," replies on PRs #176 and #188 read as a template. When replying to several
+  comments, draft them together and check the openers side by side before posting.
+- **[confirmed 2026-10-15]** Answer in one or two plain sentences. No SHA unless the reviewer needs it
+  to find the change, no numbering.
 - **[confirmed 2026-10-15]** The existing "Addressed in <sha>: …" replies on his PRs are agent drafts and are
   not evidence of his voice.
 - **[confirmed 2026-10-21]** Answer only the question asked, often as a fragment ("Primary key is UUID").
   Leave out supporting detail and side points unless the reviewer asked for them.
-- **[confirmed 2026-10-21]** When agreeing to a change, write the acknowledgement plus the action and nothing
-  else: "Good callout, agreed it reads better. Updating." Don't restate the plan or the reasoning.
+- **[confirmed 2026-10-21]** When agreeing to a change, write the action and nothing else ("Updating.",
+  "Added."), with an acknowledgement in front only when the rule above allows one: "Good callout,
+  agreed it reads better. Updating." Don't restate the plan or the reasoning.
 - **[confirmed 2026-10-21]** When disagreeing about a name or design, say what the thing is or does ("This is
   recording the user's decision…"), then how the alternative reads to him ("I find X feels more like…").
   Don't write "I'd keep X". The posted original is in the curated examples (PR #79300 rename reply).
@@ -101,6 +108,8 @@ Every reply is in his voice, whoever the reviewer is.
 - **[confirmed 2026-10-26]** A list of PRs: a one-line opener ("Hey team I have a few PRs for the <project>
   work ready for some :eyes:"), then one PR per line in merge order: the link, " - ", and a short
   lowercase description ("consolidate different ways to close a job through Close").
+- **[confirmed 2026-11-10]** A status or update message skips what is already merged or done. It says what matters and links the tickets that need action.
+- **[confirmed 2026-11-10]** Sharing a single PR in a channel: the link, then one plain sentence on what it is and why it needs eyes ("The column we are adding to allow us to extend a job to up to 3 times for the keep jobs open work could use some :eyes:"). A list of PRs follows the list rule above.
 - **[confirmed 2026-10-15]** Cut what the reader did not ask for: summary lines ("I have 12 PRs open"),
   asides, rationale paragraphs and supporting stats.
 
