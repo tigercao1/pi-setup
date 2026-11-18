@@ -1,0 +1,1 @@
+- Start a review comment with "Blocking," for blockers (2026-11-10). He adds it deliberately, only when he sees external blockers; not a default.
