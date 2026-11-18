@@ -436,7 +436,7 @@ function deployedUrl(raw) {
   if (start >= 0) {
     try {
       const json = JSON.parse(raw.slice(start));
-      const u = json.deployment?.productionUrl || json.deployment?.url || json.url;
+      const u = json.productionUrl || json.deployment?.productionUrl || json.url || json.deployment?.url;
       if (u) return u.startsWith("http") ? u : `https://${u}`;
     } catch {}
   }
