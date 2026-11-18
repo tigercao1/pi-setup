@@ -425,11 +425,23 @@ function share(file, slug) {
   if (!fs.existsSync(path.join(SITE, ".vercel/project.json"))) {
     execFileSync("vercel", ["link", "--yes", "--project", SITE_PROJECT, "--scope", SITE_SCOPE], { cwd: SITE, stdio: "inherit" });
   }
-  const raw = execFileSync("vercel", ["deploy", "--prod", "--yes", "--scope", SITE_SCOPE], { cwd: SITE, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
-  const json = JSON.parse(raw.slice(raw.indexOf("{")));
-  shares.siteUrl = json.deployment?.productionUrl || shares.siteUrl;
+  const raw = execFileSync("vercel", ["deploy", "--prod", "--yes", "--format", "json", "--scope", SITE_SCOPE], { cwd: SITE, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
+  shares.siteUrl = deployedUrl(raw) || shares.siteUrl;
   saveShares(shares);
   return { url: `${shares.siteUrl}/${slug}/`, slug, file: abs };
+}
+
+function deployedUrl(raw) {
+  const start = raw.indexOf("{");
+  if (start >= 0) {
+    try {
+      const json = JSON.parse(raw.slice(start));
+      const u = json.deployment?.productionUrl || json.deployment?.url || json.url;
+      if (u) return u.startsWith("http") ? u : `https://${u}`;
+    } catch {}
+  }
+  const line = raw.split("\n").map((l) => l.trim()).filter((l) => /^https:\/\//.test(l)).pop();
+  return line || null;
 }
 
 const isRemoteId = (id) => id.includes("~");
