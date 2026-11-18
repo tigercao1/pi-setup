@@ -22,6 +22,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { basename } from "node:path";
 import { formatRow, splitName } from "./labels.ts";
 import { Picker, type PickerRow } from "./picker.ts";
+import { ConfirmInput, confirmWaitMs } from "./confirm-input.ts";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -62,16 +63,20 @@ const MAIL_TYPE = "session-mail";
 
 type LiveContext = { isIdle?: () => boolean; hasUI?: boolean; ui?: { notify?: (m: string, t?: "info" | "warning" | "error") => void } };
 
+type CustomDialog = <T>(
+	factory: (
+		tui: { requestRender: () => void },
+		theme: { fg: (color: "accent" | "dim", text: string) => string },
+		keybindings: unknown,
+		done: (result: T) => void,
+	) => ConfirmInput,
+) => Promise<T>;
+
 type InputDialog = (
 	title: string,
 	placeholder?: string,
-	opts?: { timeout?: number; signal?: AbortSignal },
+	opts?: { signal?: AbortSignal },
 ) => Promise<string | undefined>;
-
-const confirmWaitMs = (): number => {
-	const fromEnv = Number.parseInt(process.env.PI_BUS_CONFIRM_WAIT_MS ?? "", 10);
-	return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 120_000;
-};
 
 const ackWaitMs = (): number => {
 	const fromEnv = Number.parseInt(process.env.PI_BUS_ACK_WAIT_MS ?? "", 10);
@@ -470,15 +475,28 @@ export default function sessionBus(pi: ExtensionAPI): void {
 			const missing = (paths ?? []).filter((p) => !pathExists(p));
 			const target = resolved.entry;
 			let note = (params as { note: string }).note;
-			const ui = (ctx as { hasUI?: boolean; ui?: LiveContext["ui"] & { input?: InputDialog } } | undefined);
+			const ui = (ctx as
+				| { hasUI?: boolean; mode?: string; ui?: LiveContext["ui"] & { input?: InputDialog; custom?: CustomDialog } }
+				| undefined);
 			if (ui?.hasUI && ui.ui?.input && process.env.PI_BUS_CONFIRM !== "0") {
 				const name = target.kind === "session" ? splitName(target.alias).name : basename(target.cwd);
 				const preview = note.replace(/\s+/g, " ").slice(0, 160);
-				const extra = await ui.ui.input(
-					`Sending to ${name}${paths?.length ? ` with ${paths.length} file(s)` : ""}: "${preview}${note.length > 160 ? "…" : ""}". Anything else they should know? (Enter: send as is · type cancel: don't send)`,
-					"optional: decisions, gotchas, what you want back",
-					{ timeout: confirmWaitMs(), signal },
-				);
+				const title = `Summary for ${name}${paths?.length ? ` with ${paths.length} file(s)` : ""}: "${preview}${note.length > 160 ? "…" : ""}". Your message to ${name}, shown with the summary (Enter: send summary only · type cancel: don't send)`;
+				const placeholder = "optional: your own words to them";
+				const custom = ui.mode === "tui" ? ui.ui.custom : undefined;
+				const extra = custom
+					? await custom<string | undefined>((tui, theme, _kb, done) =>
+							new ConfirmInput({
+								title,
+								placeholder,
+								waitMs: confirmWaitMs(),
+								onDone: done,
+								requestRender: () => tui.requestRender(),
+								theme: { accent: (t) => theme.fg("accent", t), dim: (t) => theme.fg("dim", t) },
+								signal,
+							}),
+						)
+					: await ui.ui.input(title, placeholder, { signal });
 				const added = extra?.trim() ?? "";
 				if (added.toLowerCase() === "cancel") {
 					return {
@@ -486,7 +504,7 @@ export default function sessionBus(pi: ExtensionAPI): void {
 						details: { cancelled: true } as Record<string, unknown>,
 					};
 				}
-				if (added) note = `${note}\n\nFrom the user, added before sending: ${added}`;
+				if (added) note = `${note}\n\nMessage from the user: ${added}`;
 			}
 			const message = send(target, self, {
 				note,
@@ -621,7 +639,7 @@ export default function sessionBus(pi: ExtensionAPI): void {
 			}
 
 			const request = await ctx.ui.input(
-				`What should ${chosen.kind === "session" ? splitName(chosen.alias).name : basename(chosen.cwd)} know?`,
+				`What should the summary for ${chosen.kind === "session" ? splitName(chosen.alias).name : basename(chosen.cwd)} focus on?`,
 				"e.g. the currency formatting decision and the files it touches",
 			);
 			if (!request || request.trim() === "") return;

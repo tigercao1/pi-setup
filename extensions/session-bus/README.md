@@ -47,10 +47,19 @@ turn and acknowledges it, and a busy one picks it up after its current step.
 
 ## Before sending, and long notes
 
-In an interactive session `session_send` first shows the human the target and the start of the note,
-and asks "Anything else they should know?". Text typed there is appended to the note, Enter (or Esc,
-or the 2-minute timeout) sends it as is, and `cancel` stops the send. Headless sessions are never
-asked. `PI_BUS_CONFIRM=0` turns the question off; `PI_BUS_CONFIRM_WAIT_MS` changes the timeout.
+`/send` without a message asks what the summary should focus on. That text is not sent: the agent
+summarizes this session's context around it, emphasizing the points it names, and calls
+`session_send` with the summary.
+
+In an interactive session `session_send` first shows the human the target and the start of the
+summary, and asks for their own message to the other session. Text typed there is delivered after
+the summary as a separate `Message from the user: …` section, Enter (or Esc) sends the summary
+only, and `cancel` stops the send. In the TUI the box shows a countdown (*"auto-sends in 42s"*) and,
+if it is left untouched, sends the summary as is after 60 s (`PI_BUS_CONFIRM_WAIT_MS`; `0` or an
+invalid value means 60000). The first key of any kind, typing, backspace or an arrow, stops the
+countdown for good, and the box then waits until Enter or Esc. Outside the TUI (RPC) the question
+falls back to a plain input with no timeout.
+Headless sessions are never asked. `PI_BUS_CONFIRM=0` turns the question off.
 
 A note longer than 4000 characters is never cut. The full text is written to
 `~/.pi/agent/session-bus/notes/<id>.md` and attached as the first path, and the message carries a

@@ -157,13 +157,15 @@ await test("a running session without the bus is offered, but flagged", () => {
 });
 
 await test("the interactive flow hands the agent enough to gather context itself", () => {
-	// The human picks a session and says what to send; the session that HAS the
+	// The human picks a session and names the summary focus; the session that HAS the
 	// context decides which files and findings that means.
 	const target = mk("t-1", "payments api", "/repo/payments-api");
 	const prompt = bus.buildSendPrompt(target, "the currency formatting decision and what it touches");
 	assert.match(prompt, /session_send/, "names the tool to call");
 	assert.match(prompt, /to="repo-payments-api"/, "pins the resolved address, not a guess");
-	assert.match(prompt, /the currency formatting decision and what it touches/, "carries the human's intent");
+	assert.match(prompt, /Summary focus: the currency formatting decision and what it touches/, "carries the human's focus");
+	assert.match(prompt, /not the message itself/, "the focus is not sent as the message");
+	assert.match(prompt, /asks me for my own message/, "leaves the user's message to the confirm dialog");
 	assert.match(prompt, /paths/, "asks for file references");
 	assert.match(prompt, /only in this conversation/, "asks it to surface context that has no file");
 	assert.match(prompt, /shareSession/, "offers follow-up questioning");
@@ -448,7 +450,7 @@ await test("the extension watches its own session inbox as well as its directory
 });
 
 
-await test("session_send asks the human first: additions travel, cancel stops it, no UI skips it", async () => {
+await test("session_send asks the human first: their message travels, cancel stops it, no UI skips it", async () => {
 	process.env.PI_BUS_ACK_WAIT_MS = "2000";
 	const sender = fakeSession({ name: "asker", cwd: "/repo/ask-sender", key: "01ab0000-asker" });
 	const recv = fakeSession({ name: "ask-recv", cwd: "/repo/ask-recv", key: "01ac0000-recv", idle: true });
@@ -456,30 +458,171 @@ await test("session_send asks the human first: additions travel, cancel stops it
 	await recv.start();
 	const tool = sender.tools.get("session_send")!;
 	const asked: string[] = [];
+	const askedWith: Array<Record<string, unknown> | undefined> = [];
 	const ctxSaying = (answer: string | undefined) => ({
 		hasUI: true,
-		ui: { input: async (title: string) => (asked.push(title), answer) },
+		ui: {
+			input: async (title: string, _placeholder?: string, opts?: Record<string, unknown>) => (
+				asked.push(title), askedWith.push(opts), answer
+			),
+		},
 	});
 
 	const cancelled = await tool.execute("t", { to: "01ac0000-recv", note: "do not send me" }, undefined, undefined, ctxSaying("cancel"));
 	assert.match(cancelled.content[0]!.text, /Not sent: the user cancelled/);
 	assert.equal(recv.user.length, 0, "nothing delivered");
-	assert.match(asked[0]!, /Sending to ask-recv: "do not send me"\. Anything else they should know\?/);
+	assert.equal(askedWith[0]?.timeout, undefined, "the question waits for the human, no countdown");
+	assert.match(asked[0]!, /Summary for ask-recv: "do not send me"\. Your message to ask-recv, shown with the summary \(Enter: send summary only · type cancel: don't send\)/);
 
 	await tool.execute("t", { to: "01ac0000-recv", note: "the plan" }, undefined, undefined, ctxSaying("  also check ABC-5643  "));
 	await until(() => recv.user.length > 0);
 	assert.match(recv.user[0]!.content, /the plan/);
-	assert.match(recv.user[0]!.content, /From the user, added before sending: also check ABC-5643/);
+	assert.match(recv.user[0]!.content, /the plan\n\nMessage from the user: also check ABC-5643/);
 
 	await tool.execute("t", { to: "01ac0000-recv", note: "as is" }, undefined, undefined, ctxSaying(undefined));
 	await until(() => recv.user.length > 1);
-	assert.doesNotMatch(recv.user[1]!.content, /added before sending/, "Enter, Esc or timeout sends as is");
+	assert.doesNotMatch(recv.user[1]!.content, /Message from the user/, "Enter or Esc sends the summary only");
 
 	const before = asked.length;
 	await tool.execute("t", { to: "01ac0000-recv", note: "headless" }, undefined, undefined, { hasUI: false });
 	assert.equal(asked.length, before, "a headless session is never asked");
 	delete process.env.PI_BUS_ACK_WAIT_MS;
 	for (const s of [sender, recv]) await s.stop();
+});
+
+await test("session_send in the TUI auto-sends the summary when the box is left alone", async () => {
+	process.env.PI_BUS_ACK_WAIT_MS = "2000";
+	process.env.PI_BUS_CONFIRM_WAIT_MS = "50";
+	const sender = fakeSession({ name: "idler", cwd: "/repo/idle-sender", key: "01ad0000-idler" });
+	const recv = fakeSession({ name: "idle-recv", cwd: "/repo/idle-recv", key: "01ae0000-recv", idle: true });
+	await sender.start();
+	await recv.start();
+	const tool = sender.tools.get("session_send")!;
+	let shown: string[] = [];
+	let renders = 0;
+	const tuiCtx = (keys: string[]) => ({
+		hasUI: true,
+		mode: "tui",
+		ui: {
+			input: async () => assert.fail("the TUI path must not fall back to ui.input"),
+			custom: (factory: (...args: unknown[]) => { render: (w: number) => string[]; handleInput: (d: string) => void }) =>
+				new Promise((resolve) => {
+					const component = factory({ requestRender: () => renders++ }, { fg: (_c: string, t: string) => t }, {}, resolve);
+					shown = component.render(100);
+					for (const key of keys) component.handleInput(key);
+				}),
+		},
+	});
+
+	const started = Date.now();
+	await tool.execute("t", { to: "01ae0000-recv", note: "left alone" }, undefined, undefined, tuiCtx([]));
+	assert.ok(Date.now() - started >= 40, "waited for the idle timer");
+	assert.ok(shown.some((l) => /auto-sends in 1s/.test(l)), shown.join("\n"));
+	await until(() => recv.user.length > 0);
+	assert.match(recv.user[0]!.content, /left alone/);
+	assert.doesNotMatch(recv.user[0]!.content, /Message from the user/);
+
+	const abort = new AbortController();
+	const typed = tool.execute("t", { to: "01ae0000-recv", note: "touched" }, abort.signal, undefined, tuiCtx(["h", "i"]));
+	await new Promise((r) => setTimeout(r, 120));
+	assert.equal(recv.user.length, 1, "a keypress stops the auto-send");
+	assert.ok(renders > 0);
+	abort.abort();
+	await typed;
+	delete process.env.PI_BUS_CONFIRM_WAIT_MS;
+	delete process.env.PI_BUS_ACK_WAIT_MS;
+	for (const s of [sender, recv]) await s.stop();
+});
+
+const confirmMod = await import("../confirm-input.ts");
+
+function fakeClock() {
+	let now = 0;
+	let timers: Array<{ at: number; fn: () => void; id: number }> = [];
+	let next = 0;
+	return {
+		clock: {
+			now: () => now,
+			setTimeout: (fn: () => void, ms: number) => (timers.push({ at: now + ms, fn, id: ++next }), next),
+			clearTimeout: (id: unknown) => (timers = timers.filter((t) => t.id !== id)),
+		},
+		pending: () => timers.length,
+		advance(ms: number) {
+			const end = now + ms;
+			for (;;) {
+				const due = timers.filter((t) => t.at <= end).sort((a, b) => a.at - b.at)[0];
+				if (!due) break;
+				timers = timers.filter((t) => t !== due);
+				now = due.at;
+				due.fn();
+			}
+			now = end;
+		},
+	};
+}
+
+await test("the confirm box counts down each second and sends the summary as is at the deadline", () => {
+	const time = fakeClock();
+	const results: Array<string | undefined> = [];
+	let renders = 0;
+	const box = new confirmMod.ConfirmInput({
+		title: "Your message",
+		waitMs: 60_000,
+		onDone: (v) => results.push(v),
+		requestRender: () => renders++,
+		clock: time.clock,
+	});
+	assert.ok(box.render(80).some((l) => l.includes("auto-sends in 60s")));
+	time.advance(18_000);
+	assert.ok(box.render(80).some((l) => l.includes("auto-sends in 42s")));
+	assert.equal(renders, 18, "one render per second");
+	time.advance(41_999);
+	assert.deepEqual(results, []);
+	time.advance(1);
+	assert.deepEqual(results, [""], "Enter-on-empty result: summary only");
+	assert.equal(time.pending(), 0, "no timers left");
+});
+
+await test("any first key stops the confirm timer for good; Enter then sends, typed cancel survives", () => {
+	for (const key of ["x", "\x7f", "\x1b[D"]) {
+		const time = fakeClock();
+		const results: Array<string | undefined> = [];
+		const box = new confirmMod.ConfirmInput({ title: "t", waitMs: 60_000, onDone: (v) => results.push(v), clock: time.clock });
+		box.handleInput(key);
+		assert.equal(box.counting, false, `key ${JSON.stringify(key)} stops the timer`);
+		assert.equal(time.pending(), 0);
+		assert.ok(!box.render(80).some((l) => l.includes("auto-sends")), "countdown text is gone");
+		time.advance(120_000);
+		assert.deepEqual(results, [], "waits indefinitely");
+	}
+	const time = fakeClock();
+	const results: Array<string | undefined> = [];
+	const box = new confirmMod.ConfirmInput({ title: "t", waitMs: 60_000, onDone: (v) => results.push(v), clock: time.clock });
+	for (const ch of "cancel") box.handleInput(ch);
+	box.handleInput("\r");
+	assert.deepEqual(results, ["cancel"]);
+	const esc: Array<string | undefined> = [];
+	new confirmMod.ConfirmInput({ title: "t", waitMs: 60_000, onDone: (v) => esc.push(v), clock: fakeClock().clock }).handleInput("\x1b");
+	assert.deepEqual(esc, [undefined]);
+});
+
+await test("aborting the confirm box closes it and clears its timer", () => {
+	const time = fakeClock();
+	const abort = new AbortController();
+	const results: Array<string | undefined> = [];
+	new confirmMod.ConfirmInput({ title: "t", waitMs: 60_000, onDone: (v) => results.push(v), clock: time.clock, signal: abort.signal });
+	abort.abort();
+	assert.deepEqual(results, [undefined]);
+	assert.equal(time.pending(), 0);
+	time.advance(60_000);
+	assert.deepEqual(results, [undefined], "no late auto-send");
+});
+
+await test("PI_BUS_CONFIRM_WAIT_MS sets the wait; 0 or junk falls back to 60s", () => {
+	assert.equal(confirmMod.confirmWaitMs("5000"), 5000);
+	assert.equal(confirmMod.confirmWaitMs("0"), 60_000);
+	assert.equal(confirmMod.confirmWaitMs("soon"), 60_000);
+	assert.equal(confirmMod.confirmWaitMs(undefined), 60_000);
 });
 
 const labels = await import("../labels.ts");
