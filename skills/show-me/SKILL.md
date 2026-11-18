@@ -168,6 +168,9 @@ visual; it is code the user has to render in their head.
 - After writing it, reply with the absolute path on its own line, plus one or two lines saying
   what the page shows — and, when you updated an existing file, which iteration you added and
   what changed. Do not also paste the Mermaid source or the table inline.
+- Then run `show-me-live url <absolute path>` and print the URL it returns on its own line, labelled
+  "Annotate:". When the page has earlier versions or notes, add a "Review:" line with
+  `http://localhost:4848/__live/review?path=<path relative to the knowledge base>`. See **annotations** below.
 
 ### one topic, one file
 
@@ -254,3 +257,58 @@ pattern — copy the loader from the page you are updating rather than writing a
 
 If a script generates the page (for example a `build_*.py` beside the diagrams), change the
 script and rerun it rather than hand-editing its output.
+
+### annotations: the user marks up the page, you revise it
+
+Every HTML page is annotatable through `show-me-live` (`~/.pi/agent/bin/show-me-live`, source in
+`~/.pi/agent/skills/show-me/live/`). It serves the knowledge-base folder on
+`http://localhost:4848`, injects the Agentation toolbar into each page at serve time (the file on
+disk is never changed), runs the Agentation server on `:4747`, and reloads the open page when its
+file changes. Annotations persist in `~/.agentation/` across restarts.
+
+- `show-me-live url <file>` starts both servers if needed and prints the page URL. It does not open
+  a browser; the "never open it yourself" rule still holds. Use `open <file>` only when the user asks.
+- When the user says "check my notes", "I annotated it", or similar, run
+  `show-me-live pending <file>` (omit the file for all pages). Each note has `id`, `comment`,
+  `element`, `elementPath`, `nearbyText` and `file`. Use `elementPath` and `nearbyText` to find the
+  spot in the HTML, or in the `build_*.py` script when one generates the page.
+- For each note: `show-me-live ack <id>`, make the change, then
+  `show-me-live resolve <id> "<what changed>"`. A note you will not act on gets
+  `dismiss <id> "<reason>"`. A note that needs a decision from the user gets `reply <id> "<question>"`
+  and stays pending.
+- Apply one round of notes as one `revision` iteration (see **one topic, one file**), not one
+  iteration per note. List the resolved note ids in that iteration's summary line.
+- Watch mode, only when the user asks for it: loop `show-me-live watch <file> --timeout 300`, which
+  blocks until new notes arrive and returns them as a batch. Stop when it returns `[]` twice or the
+  user says stop.
+- Notes on an older iteration (inside its `<iframe srcdoc>`) refer to history. Reply asking whether
+  the change belongs in the current iteration instead of editing the archived copy.
+- To annotate a page together with other people, run `show-me-live share <file>`. It deploys the page
+  to `https://show-me-pages.vercel.app/<slug>/` (Tiger's personal Vercel, project `show-me-pages`,
+  private Blob store `show-me-notes`). Everyone with the link joins one session and sees each
+  other's notes, and notes survive redeploys. `pending` lists shared notes next to local ones
+  (`"via": "shared"`, ids contain `~`), and `ack`, `resolve`, `dismiss` and `reply` route to the right
+  server by id. After revising the page, run `share` again so the link shows the new version.
+  The local `localhost:4848` view and the shared link keep separate notes. The page and its notes
+  API are public to anyone with the URL, so share only pages fit for that.
+- For a single file with no server, run `show-me-live export <file>`. It writes one self-contained
+  `index.html` under `~/.pi/agent/run/show-me-live/exports/<name>/`, with the toolbar inlined, no
+  server, and old iterations and show-me meta removed. The reviewer annotates, clicks the copy icon
+  and pastes the markdown back; apply it like `pending` output, matching on `Location`.
+- show-me-live keeps the version history of each page with its comments. Every content change to
+  the file (a new sha1 when the page is served, or within 2s by polling) is a new version, stored in
+  `~/.pi/agent/run/show-me-live/history/`. Each comment is filed under the version that was current
+  when it was made, and gets the version in which it was resolved. Notes made before tracking began
+  all sit on v1. Comments are cached there too, so they survive if Agentation loses them.
+- Before revising a page that has notes, run `show-me-live history <file> --plain` (or without
+  `--plain` for JSON) to see each version, the notes raised on it, their status and resolution text.
+  Use it to check whether the latest version addressed earlier feedback.
+- `show-me-live review [file]` opens the review page: a version list, the notes on the selected
+  version in a sidebar, and a compare view of that version next to the latest, where clicking a note
+  shows whether its element still exists. Run it only when the user asks; otherwise give the URL
+  `http://localhost:4848/__live/review?path=<path relative to the knowledge base>`. Each live page
+  also shows a "History" pill at the bottom left that links there.
+- To check feedback after you revise a page, the user opens the older version in the review page,
+  compares it with the latest, and annotates the live page again where something is still wrong.
+- `show-me-live status` and `stop` manage the servers. Logs are in `~/.pi/agent/run/show-me-live/`.
+  Pages outside `~/Documents/knowledge-base-remote` are not served unless `SHOW_ME_LIVE_ROOT` is set.

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>show-me review</title>
+<style>
+  :root { --bg: #f3f0ff; --line: #c9bdf5; --ink: #2b2350; --accent: #7c3aed; --muted: #6b6390; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { font: 13px/1.45 -apple-system, system-ui, sans-serif; color: var(--ink); background: #fff; }
+  a { color: var(--accent); }
+  button { font: inherit; color: inherit; }
+  .app { display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+  aside { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; background: #fcfbff; }
+  .head { padding: 12px 14px; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .head .crumb { font-size: 12px; }
+  .head h1 { font-size: 15px; margin: 6px 0 2px; word-break: break-word; }
+  .head .path { font-size: 11px; color: var(--muted); word-break: break-all; }
+  .head .links { margin-top: 6px; font-size: 12px; display: flex; gap: 10px; }
+  .agstate { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 14px 6px; }
+  .versions { list-style: none; margin: 0; padding: 0 8px; max-height: 32vh; overflow: auto; flex: none; }
+  .versions li { padding: 7px 8px; border: 1px solid transparent; border-radius: 6px; cursor: pointer; margin-bottom: 2px; }
+  .versions li:hover { background: var(--bg); }
+  .versions li.sel { background: var(--bg); border-color: var(--line); }
+  .vrow { display: flex; align-items: baseline; gap: 6px; }
+  .vn { font-weight: 600; }
+  .vdate { color: var(--muted); font-size: 11px; flex: 1; }
+  .vsum { font-size: 12px; color: var(--ink); opacity: .85; margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .badge { font-size: 11px; border-radius: 999px; padding: 1px 7px; border: 1px solid var(--line); background: #fff; white-space: nowrap; }
+  .badge.hot { background: #fff4e0; border-color: #f0c36d; color: #7a4b00; font-weight: 600; }
+  .chips { display: flex; gap: 4px; padding: 0 14px 8px; flex-wrap: wrap; }
+  .chip { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
+  .chip.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .comments { flex: 1; overflow: auto; padding: 0 10px 14px; min-height: 0; }
+  .empty { color: var(--muted); padding: 10px 6px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; background: #fff; cursor: pointer; }
+  .card:hover { border-color: var(--accent); }
+  .card.active { border-color: var(--accent); box-shadow: 0 0 0 2px #e4dafd; }
+  .card .top { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+  .st { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; border-radius: 4px; padding: 1px 6px; font-weight: 600; }
+  .st.pending { background: #fff4e0; color: #7a4b00; }
+  .st.acknowledged { background: #e6efff; color: #1d4296; }
+  .st.resolved { background: #e3f6e8; color: #17602f; }
+  .st.dismissed { background: #eeeef2; color: #555; }
+  .card .when { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .card .text { white-space: pre-wrap; word-break: break-word; }
+  .card .el { font-size: 11px; color: var(--muted); margin-top: 4px; word-break: break-word; }
+  .card .life { font-size: 12px; margin-top: 4px; }
+  .card .verdict { font-size: 12px; margin-top: 6px; padding: 5px 7px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); }
+  .card details { margin-top: 6px; font-size: 12px; }
+  .card summary { cursor: pointer; color: var(--muted); }
+  .card .msg { margin: 4px 0 0 0; padding-left: 8px; border-left: 2px solid var(--line); white-space: pre-wrap; word-break: break-word; }
+  .card .msg b { font-weight: 600; }
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--bg); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg button { border: 0; background: #fff; padding: 4px 12px; cursor: pointer; }
+  .seg button.on { background: var(--ink); color: #fff; }
+  .bar label { display: inline-flex; gap: 5px; align-items: center; }
+  .bar .spacer { flex: 1; }
+  .bar .info { color: var(--muted); font-size: 12px; }
+  .viewer { flex: 1; display: grid; min-height: 0; }
+  .viewer.two { grid-template-columns: 1fr 1fr; }
+  .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--line); }
+  .pane:last-child { border-right: 0; }
+  .pane .lbl { padding: 4px 10px; font-size: 12px; font-weight: 600; background: #fcfbff; border-bottom: 1px solid var(--line); }
+  .pane iframe { flex: 1; border: 0; width: 100%; background: #fff; }
+  .note { margin: 40px auto; max-width: 460px; text-align: center; color: var(--muted); padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: #fcfbff; }
+  .index { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .index h1 { font-size: 18px; margin: 0 0 4px; }
+  .index p { color: var(--muted); margin: 0 0 16px; }
+  .index table { border-collapse: collapse; width: 100%; }
+  .index th, .index td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .index th { background: var(--bg); font-size: 12px; }
+  .index td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .index .file { font-size: 11px; color: var(--muted); word-break: break-all; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const $ = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k instanceof Node ? k : String(k));
+  return e;
+};
+const fmt = (ms) => new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const OPEN = new Set(["pending", "acknowledged"]);
+const params = new URLSearchParams(location.search);
+const state = { path: params.get("path"), v: Number(params.get("v")) || null, mode: params.get("mode") === "compare" ? "compare" : "single", filter: params.get("filter") || "all", sync: params.get("sync") !== "0", active: null, verdicts: {} };
+let data = null;
+let frames = [];
+let reqId = 0;
+const waiting = new Map();
+let syncPausedUntil = 0;
+
+addEventListener("message", (ev) => {
+  const d = ev.data || {};
+  if (d.type === "located" && waiting.has(d.id)) { waiting.get(d.id)(d); waiting.delete(d.id); }
+});
+
+function saveUrl() {
+  const p = new URLSearchParams();
+  if (state.path) p.set("path", state.path);
+  if (state.v) p.set("v", state.v);
+  if (state.mode !== "single") p.set("mode", state.mode);
+  if (state.filter !== "all") p.set("filter", state.filter);
+  if (!state.sync) p.set("sync", "0");
+  history.replaceState(null, "", `${location.pathname}?${p}`);
+}
+
+async function main() {
+  if (!state.path) return renderIndex();
+  const r = await fetch(`/__live/api/history?path=${encodeURIComponent(state.path)}`);
+  data = await r.json();
+  if (!r.ok) {
+    document.getElementById("root").replaceChildren($("div", { class: "index" }, $("h1", {}, state.path), $("p", {}, data.error || "error"), $("a", { href: "/__live/review" }, "All tracked pages")));
+    return;
+  }
+  if (!data.versions.some((v) => v.n === state.v)) state.v = data.latest;
+  render();
+}
+
+async function renderIndex() {
+  document.title = "show-me review · all pages";
+  const pages = await (await fetch("/__live/api/pages")).json();
+  const rows = pages.map((p) => $("tr", {},
+    $("td", {}, $("a", { href: p.review }, p.file.split("/").pop()), $("div", { class: "file" }, p.file), p.latestSummary ? $("div", { class: "file" }, p.latestSummary) : null),
+    $("td", { class: "num" }, p.latest ? `v${p.latest}` : ""),
+    $("td", { class: "num" }, p.counts.pending ? $("span", { class: "badge hot" }, p.counts.pending) : "0"),
+    $("td", { class: "num" }, p.counts.acknowledged || 0),
+    $("td", { class: "num" }, p.counts.resolved || 0),
+    $("td", { class: "num" }, p.counts.dismissed || 0),
+    $("td", {}, p.lastActivity ? fmt(p.lastActivity) : ""),
+  ));
+  document.getElementById("root").replaceChildren($("div", { class: "index" },
+    $("h1", {}, "Tracked pages"),
+    $("p", {}, "Every page served by show-me-live keeps a version per content change, with the comments raised on it. Newest activity first."),
+    pages.length ? $("table", {}, $("thead", {}, $("tr", {}, ["Page", "Latest", "Pending", "Acked", "Resolved", "Dismissed", "Last activity"].map((h) => $("th", {}, h)))), $("tbody", {}, rows)) : $("div", { class: "note" }, "No pages tracked yet. Open a page through show-me-live to start its history."),
+  ));
+}
+
+const raisedOn = (n) => data.comments.filter((c) => c.version === n);
+const matches = (c) => state.filter === "all" || (state.filter === "pending" ? OPEN.has(c.status) : c.status === state.filter);
+const versionOf = (n) => data.versions.find((v) => v.n === n);
+const vLabel = (v) => (v.firstSeen ? fmt(v.firstSeen) : `tracked ${fmt(v.capturedAt || Date.now())}`);
+
+function lifeLine(c) {
+  const raised = `raised v${c.version}`;
+  if (c.status === "resolved") return `${raised} → resolved in v${c.resolvedInVersion ?? "?"}`;
+  if (c.status === "dismissed") return `${raised} → dismissed in v${c.resolvedInVersion ?? "?"}`;
+  if (c.status === "acknowledged") return `${raised} → acknowledged, not resolved yet (latest v${data.latest})`;
+  return `${raised} → still pending (latest v${data.latest})`;
+}
+
+function render() {
+  document.title = `review · ${data.file.split("/").pop()}`;
+  saveUrl();
+  frames = [];
+  const sel = versionOf(state.v);
+  const isLatest = state.v === data.latest;
+  const versions = data.versions.slice().reverse().map((v) => {
+    const raised = raisedOn(v.n);
+    const pend = raised.filter((c) => OPEN.has(c.status)).length;
+    return $("li", { class: v.n === state.v ? "sel" : "", onclick: () => { state.v = v.n; state.active = null; state.verdicts = {}; render(); } },
+      $("div", { class: "vrow" },
+        $("span", { class: "vn" }, `v${v.n}`),
+        $("span", { class: "vdate" }, vLabel(v), v.n === data.latest ? " · latest" : ""),
+        raised.length ? $("span", { class: `badge${pend ? " hot" : ""}`, title: `${raised.length} comments raised on v${v.n}, ${pend} open` }, pend ? `${pend} pending / ${raised.length}` : `${raised.length} note${raised.length === 1 ? "" : "s"}`) : null,
+      ),
+      v.summary ? $("div", { class: "vsum", title: v.summary }, v.summary) : null,
+    );
+  });
+  const list = raisedOn(state.v).filter(matches);
+  const chips = [["all", "All"], ["pending", "Pending"], ["resolved", "Resolved"], ["dismissed", "Dismissed"]].map(([k, label]) => {
+    const n = raisedOn(state.v).filter((c) => k === "all" || (k === "pending" ? OPEN.has(c.status) : c.status === k)).length;
+    return $("button", { class: `chip${state.filter === k ? " on" : ""}`, onclick: () => { state.filter = k; render(); } }, `${label} ${n}`);
+  });
+  const cards = list.length ? list.map(card) : [$("div", { class: "empty" }, raisedOn(state.v).length ? "No comments match this filter." : `No comments were raised on v${state.v}.`)];
+  const livePath = "/" + data.file.split("/").map(encodeURIComponent).join("/");
+  const aside = $("aside", {},
+    $("div", { class: "head" },
+      $("div", { class: "crumb" }, $("a", { href: "/__live/review" }, "← All pages")),
+      $("h1", { id: "title" }, data.file.split("/").pop()),
+      $("div", { class: "path" }, data.file),
+      $("div", { class: "links" }, $("a", { href: livePath, target: "_blank" }, "Open live page"), $("a", { href: snapUrl(state.v), target: "_blank" }, `Open v${state.v} alone`)),
+      $("div", { class: "agstate" }, data.live ? "Comments synced from Agentation just now." : "Agentation is not reachable: showing cached comments."),
+    ),
+    $("h2", {}, `Versions (${data.versions.length})`),
+    $("ol", { class: "versions" }, versions),
+    $("h2", {}, `Comments raised on v${state.v}`),
+    $("div", { class: "chips" }, chips),
+    $("div", { class: "comments" }, cards),
+  );
+  const seg = $("span", { class: "seg" },
+    $("button", { class: state.mode === "single" ? "on" : "", onclick: () => setMode("single") }, "Single"),
+    $("button", { class: state.mode === "compare" ? "on" : "", onclick: () => setMode("compare") }, "Compare with latest"),
+  );
+  const bar = $("div", { class: "bar" }, seg,
+    state.mode === "compare" && !isLatest ? $("label", {}, $("input", { type: "checkbox", checked: state.sync, onchange: (e) => { state.sync = e.target.checked; saveUrl(); } }), "Sync scroll") : null,
+    $("span", { class: "spacer" }),
+    $("span", { class: "info" }, `v${sel.n} · ${vLabel(sel)}${sel.iteration ? ` · page iteration ${sel.iteration}` : ""}`),
+  );
+  let viewer;
+  if (state.mode === "single") viewer = $("div", { class: "viewer" }, pane(state.v, `v${state.v}${isLatest ? " (latest)" : ""}`));
+  else if (isLatest) viewer = $("div", { class: "viewer" }, $("div", { class: "note" }, `v${state.v} is the latest version, so there is nothing newer to compare with. Pick an older version in the sidebar.`));
+  else viewer = $("div", { class: "viewer two" }, pane(state.v, `v${state.v} (selected)`), pane(data.latest, `v${data.latest} (latest)`));
+  document.getElementById("root").replaceChildren($("div", { class: "app" }, aside, $("main", {}, bar, viewer)));
+  if (state.mode === "compare" && frames.length === 2) wireSync();
+}
+
+const snapUrl = (n) => `${data.snapBase}${n}.html`;
+
+function pane(n, label) {
+  const iframe = $("iframe", { src: snapUrl(n), title: label });
+  const ready = new Promise((r) => iframe.addEventListener("load", r, { once: true }));
+  if (frames.length === 0) ready.then(() => { try { const t = iframe.contentDocument.title; if (t) document.getElementById("title").textContent = t; } catch {} });
+  frames.push({ iframe, ready, n });
+  return $("div", { class: "pane" }, $("div", { class: "lbl" }, label), iframe);
+}
+
+function setMode(m) { state.mode = m; state.verdicts = {}; render(); }
+
+function wireSync() {
+  const [a, b] = frames;
+  Promise.all([a.ready, b.ready]).then(() => {
+    let leader = null, release = 0;
+    const link = (src, dst) => src.iframe.contentWindow.addEventListener("scroll", () => {
+      if (!state.sync || Date.now() < syncPausedUntil) return;
+      if (leader && leader !== src && Date.now() < release) return;
+      leader = src; release = Date.now() + 120;
+      const w = src.iframe.contentWindow;
+      dst.iframe.contentWindow.scrollTo(w.scrollX, w.scrollY);
+    }, { passive: true });
+    try { link(a, b); link(b, a); } catch {}
+  });
+}
+
+function card(c) {
+  const verdict = state.verdicts[c.id];
+  const thread = (c.thread || []).filter((t) => t.content);
+  return $("div", { class: `card${state.active === c.id ? " active" : ""}`, "data-id": c.id, onclick: (e) => { if (e.target.closest("details")) return; onCard(c); } },
+    $("div", { class: "top" }, $("span", { class: `st ${c.status}` }, c.status), c.severity ? $("span", { class: "badge" }, c.severity) : null, c.goneSince ? $("span", { class: "badge", title: `Deleted from Agentation ${fmt(c.goneSince)}; kept from the local cache` }, "deleted") : null, $("span", { class: "when" }, fmt(c.timestamp || Date.parse(c.createdAt)))),
+    $("div", { class: "text" }, c.comment || "(no text)"),
+    c.element ? $("div", { class: "el", title: c.elementPath || "" }, `on ${c.element}`) : null,
+    $("div", { class: "life" }, lifeLine(c)),
+    verdict ? $("div", { class: "verdict" }, verdict) : null,
+    thread.length ? $("details", {}, $("summary", {}, `Thread (${thread.length})`), thread.map((t) => $("div", { class: "msg" }, $("b", {}, `${t.role}: `), t.content))) : null,
+  );
+}
+
+function ask(frame, c) {
+  return frame.ready.then(() => new Promise((resolve) => {
+    const id = `q${++reqId}`;
+    waiting.set(id, resolve);
+    setTimeout(() => { if (waiting.has(id)) { waiting.delete(id); resolve({ found: false, how: "timeout" }); } }, 2500);
+    frame.iframe.contentWindow.postMessage({ type: "locate", id, elementPath: c.elementPath, nearbyText: c.nearbyText, selectedText: c.selectedText, y: typeof c.y === "number" ? c.y : c.boundingBox?.y }, "*");
+  }));
+}
+
+function statusNote(c) {
+  if (c.status === "resolved") return `The note is marked resolved in v${c.resolvedInVersion ?? "?"}.`;
+  if (c.status === "dismissed") return `The note was dismissed in v${c.resolvedInVersion ?? "?"}.`;
+  return `The note is still ${c.status}.`;
+}
+
+function describe(left, right, c) {
+  const here = left.found ? "" : "Not found in the selected version either (position only). ";
+  let there;
+  if (!right.found) there = "Element or text no longer found in latest (likely changed).";
+  else if (right.how === "text") there = "Text still in latest, at a different element.";
+  else if (right.textMatch === false) there = "Element still in latest, but its text changed (likely edited).";
+  else there = "Still at the same element in latest.";
+  return `${here}${there} ${statusNote(c)}`;
+}
+
+async function onCard(c) {
+  state.active = c.id;
+  document.querySelectorAll(".card").forEach((e) => e.classList.toggle("active", e.dataset.id === c.id));
+  if (!frames.length) return;
+  syncPausedUntil = Date.now() + 1500;
+  const replies = await Promise.all(frames.map((f) => ask(f, c)));
+  syncPausedUntil = Date.now() + 400;
+  if (state.active !== c.id) return;
+  const el = document.querySelector(`.card[data-id="${CSS.escape(c.id)}"]`);
+  let text;
+  if (replies.length === 2) text = describe(replies[0], replies[1], c);
+  else text = replies[0].found ? `Located by ${replies[0].how}${replies[0].textMatch === false ? " (text differs)" : ""}.` : "Not found in this version; scrolled to the original position.";
+  state.verdicts[c.id] = text;
+  if (!el) return;
+  let v = el.querySelector(".verdict");
+  if (!v) { v = $("div", { class: "verdict" }); el.querySelector(".life").after(v); }
+  v.textContent = text;
+}
+
+main().catch((e) => document.getElementById("root").replaceChildren($("div", { class: "note" }, `Failed to load: ${e}`)));
+</script>
+</body>
+</html>
