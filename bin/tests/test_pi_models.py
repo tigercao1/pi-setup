@@ -14,7 +14,8 @@ BIN = os.path.abspath(os.path.join(HERE, ".."))
 AGENT = os.path.abspath(os.path.join(BIN, ".."))
 CLI = os.path.join(BIN, "pi-models")
 DOCTOR = os.path.join(BIN, "pi-doctor")
-GATE = os.path.join(BIN, "pr_gate_core.py")
+LAYER = os.environ.get("PI_LAYER_DIR") or os.path.normpath(os.path.join(AGENT, "..", "homebase"))
+GATE = os.path.join(LAYER, "bin", "pr_gate_core.py")
 SKIM = os.path.join(AGENT, "skills", "clear-message", "bin", "skim-test.py")
 
 GW = "vercel-ai-gateway"
@@ -229,12 +230,18 @@ class CheckTest(AgentDirCase):
 
 
 class PersonaReadersTest(AgentDirCase):
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.dir, "bin"))
+        os.symlink(os.path.join(BIN, "pi_models.py"), os.path.join(self.dir, "bin", "pi_models.py"))
+
     def module_value(self, path, expr):
         code = (f"import importlib.util; spec = importlib.util.spec_from_file_location('m', {path!r}); "
                 f"m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); print({expr})")
         return subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True,
                               env=self.env, timeout=60)
 
+    @unittest.skipUnless(os.path.isfile(GATE), f"no gate engine at {GATE}; set PI_LAYER_DIR")
     def test_gate_models_come_from_personas(self):
         data = read(self.models)
         data["aliases"]["gpt5"] = {"model": "openai/gpt-5", "provider": GW}
@@ -245,6 +252,7 @@ class PersonaReadersTest(AgentDirCase):
         self.assertEqual(out.stdout.strip(), f"openai/gpt-5 {SONNET} {SONNET}", out.stderr)
         self.assertEqual(out.stderr, "")
 
+    @unittest.skipUnless(os.path.isfile(GATE), f"no gate engine at {GATE}; set PI_LAYER_DIR")
     def test_gate_models_fall_back_with_one_warning(self):
         os.unlink(self.models)
         out = self.module_value(GATE, "m.PRIMARY_MODEL, m.OPUS_MODEL")
